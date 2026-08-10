@@ -9,6 +9,7 @@ from EMsim.EM import UTA2D
 from EMsim.EM import UTA0D
 from EMsim.EM import UTA1D
 import os
+import shutil
 from scipy.stats import norm
 import copy
 import h5py
@@ -21,11 +22,12 @@ import matplotlib.pyplot as plt
 from pipt.update_schemes.update_methods_ns.approx_update import approx_update
 from pipt.misc_tools.cov_regularization import localization
 
-## setup the model
-for folder in os.listdir('.'):
-    if folder.startswith('En_') and os.path.isdir(folder):
-        import shutil
-        shutil.rmtree(folder)
+def cleanup_en_folders():
+    for folder in os.listdir('.'):
+        if folder.startswith('En_') and os.path.isdir(folder):
+            shutil.rmtree(folder)
+
+
 
 meter_to_feet = 3.28084
 
@@ -618,50 +620,57 @@ def map_update_data_space_LM(theta, f_theta, theta_mean, J, y, Cd_diag, C_theta,
 
 
 
-#reference_model_path = '/home/AD.NORCERESEARCH.NO/krfo/CodeProjects/DISTINGUISH/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
-reference_model_path = '/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
-Ne = 250
-#pr, c_theta, mean_theta = sample_prior(Ne)
-pr, c_theta, mean_theta = sample_prior_0D(Ne)
-setup_simulators(reference_model_path='/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3', data_type='Bfield')
 
-# Load reference model for plotting
-with h5py.File(reference_model_path, "r") as f:
-    ref_model = h5_to_dict(f)
+def _esmda_0d1d_and_stage_inputs(args):
+    """Run 0D + 1D ESMDA, then build the 2D prior + perturbed obs.
 
-# initalize the parameter vector for optimization
-param_vec = copy.deepcopy(pr)
+    Returns a dict with everything the 2D gradient phase needs. If
+    args.save_stage is true, also writes it to args.stage_file (npz).
+    """
+    np.random.seed(args.seed)
+    #reference_model_path = '/home/AD.NORCERESEARCH.NO/krfo/CodeProjects/DISTINGUISH/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
+    ref_h5 = os.path.join(args.reference_model_path, 'globalmodel.h5')
+    Ne = args.ne
+    #pr, c_theta, mean_theta = sample_prior(Ne)
+    pr, c_theta, mean_theta = sample_prior_0D(Ne)
+    setup_simulators(reference_model_path=args.reference_model_path, data_type='Bfield')
 
-tot_assim_index = [180]
-datatype = 'Bfield'
+    # Load reference model for plotting
+    with h5py.File(ref_h5, "r") as f:
+        ref_model = h5_to_dict(f)
 
-data = pd.read_pickle('data.pkl')
-Cd = pd.read_pickle('var.pkl')
+    # initalize the parameter vector for optimization
+    param_vec = copy.deepcopy(pr)
 
-# setup ESMDA update
-at = approx_update()
-at.proj = (np.eye(Ne) - np.ones((Ne, Ne))/Ne) / np.sqrt(Ne - 1)
-at.trunc_energy = 0.95
-at.keys_da = {}
-#{'localization':{"autoadaloc":0.5,
-#                              "type": "sigm",
-#                              "field": [dims[0], dims[2]]}
-#        }
-#at.localization = localization(
-#                    at.keys_da['localization'],
-#                    [],
-#                    [],
-#                    [],
-#                    Ne
-#                )
-at.list_states = ['rh', 'rv']
-at.prior_info = {'rh':{"active": np.prod([dims[0], dims[2]])},
-                 'rv':{"active": np.prod([dims[0], dims[2]])}
-        }
-at.state_scaling = np.ones(param_vec.shape[0]) # No scaling for now, but could be tuned for better performance
-at.lam = 0
+    tot_assim_index = [args.assim_index]
+    datatype = 'Bfield'
 
-for el,assim_index in enumerate([tot_assim_index[0]]):
+    data = pd.read_pickle(os.path.join(args.data_dir, 'data.pkl'))
+    Cd = pd.read_pickle(os.path.join(args.data_dir, 'var.pkl'))
+
+    # setup ESMDA update
+    at = approx_update()
+    at.proj = (np.eye(Ne) - np.ones((Ne, Ne))/Ne) / np.sqrt(Ne - 1)
+    at.trunc_energy = 0.95
+    at.keys_da = {}
+    #{'localization':{"autoadaloc":0.5,
+    #                              "type": "sigm",
+    #                              "field": [dims[0], dims[2]]}
+    #        }
+    #at.localization = localization(
+    #                    at.keys_da['localization'],
+    #                    [],
+    #                    [],
+    #                    [],
+    #                    Ne
+    #                )
+    at.list_states = ['rh', 'rv']
+    at.prior_info = {'rh':{"active": np.prod([dims[0], dims[2]])},
+                     'rv':{"active": np.prod([dims[0], dims[2]])}
+            }
+    at.state_scaling = np.ones(param_vec.shape[0]) # No scaling for now, but could be tuned for better performance
+    at.lam = 0
+    assim_index = tot_assim_index[0]
     Cd_row = Cd.iloc[assim_index]
     Cd_vec = np.concatenate([np.array(Cd_row[ast.literal_eval(tool)][1])[selected_data_indices] for tool in tools])
     data_vec = np.concatenate([data.iloc[assim_index][ast.literal_eval(tool)][selected_data_indices] for tool in tools])
@@ -756,7 +765,7 @@ for el,assim_index in enumerate([tot_assim_index[0]]):
     # Resample the prior again, conditioned on the 1D posterior
     pr, c_theta, mean_theta = resample_prior_1D_to_2D(Ne, param_vec) # Resample prior, conditioned on the 1D posterior
 
-    opt_NE = 10
+    opt_NE = args.ne_2d
     Ne = min(Ne, opt_NE)
     post_1D = copy.deepcopy(param_vec) # Keep the last 1D MDA ensemble for comparison
     param_vec = copy.deepcopy(pr[:, :Ne]) # Take only the first Ne samples in case resampling returns more
@@ -773,96 +782,225 @@ for el,assim_index in enumerate([tot_assim_index[0]]):
                                     scale=np.sqrt(Cd_inflated)[:, np.newaxis], 
                                     size=(len(data_vec), Ne))
 
-    for ne in range(Ne):
-        print(f"Optimizing ensemble member {ne+1}/{Ne} with gradient-based method")
 
-        # Ensure that the MDA conditon still applies for this member before optimization
-        param_current = param_vec[:, ne]
-        data_current = data_real[:, ne]
-    
-        tot_loss = []
-        lambda_down = 10.0
-        lambda_up = 5.0
-        lambda_min = 1e-6
-        lambda_max = 1e16
-        max_lm_trials = 2
-        max_iterations = 5
-        # Initial evaluation
-        pred_curr, jac_curr = simulate_and_grad(
-            param_current, logging_point_idx=assim_index
-        )
-        curr_loss = custom_loss(pred_curr, data_current, param_current, mean_theta, c_theta, Cd_vec)
-        print(f"Initial Loss: {curr_loss}")
-        step_lambda = 10**np.floor(np.log10(curr_loss))  # Initial lambda based on loss magnitude      
-        for iter in range(max_iterations):
-            accepted = False
+    stage = {
+        'param_vec': param_vec,
+        'mean_theta': mean_theta,
+        'c_theta': c_theta,
+        'data_real': data_real,
+        'data_vec': data_vec,
+        'Cd_vec': Cd_vec,
+        'Cd_inflated': Cd_inflated,
+        'assim_index': assim_index,
+        'tot_assim_index': np.array(tot_assim_index),
+        'Ne': Ne,
+        'pr': pr,
+        'post_1D': post_1D,
+        'MDA_inflation_factor': np.array(MDA_inflation_factor),
+    }
+    if getattr(args, 'save_stage', False) and args.stage_file:
+        stage_dir = os.path.dirname(os.path.abspath(args.stage_file))
+        os.makedirs(stage_dir, exist_ok=True)
+        np.savez(args.stage_file, **stage)
+        print(f"Stage written to {args.stage_file}")
+    return stage
+
+def run_member_lm(param_current, data_current, mean_theta, c_theta, Cd_vec, Cd_inflated, assim_index):
+    """2D Levenberg-Marquardt optimization for ONE ensemble member.
+
+    Uses the module-global UTA2D_sim (caller must have run setup_simulators).
+    Returns dict with 'param', 'pred', 'loss'.
+    """
+    tot_loss = []
+    lambda_down = 10.0
+    lambda_up = 5.0
+    lambda_min = 1e-6
+    lambda_max = 1e16
+    max_lm_trials = 2
+    max_iterations = 5
+    pred_curr, jac_curr = simulate_and_grad(param_current, logging_point_idx=assim_index)
+    curr_loss = custom_loss(pred_curr, data_current, param_current, mean_theta, c_theta, Cd_vec)
+    print(f"Initial Loss: {curr_loss}")
+    step_lambda = 10**np.floor(np.log10(curr_loss))
+    pred_trial = pred_curr
+    trial_loss = curr_loss
+    for iter in range(max_iterations):
+        accepted = False
+        used_lambda = step_lambda
+        for _ in range(max_lm_trials):
             used_lambda = step_lambda
-
-            for _ in range(max_lm_trials):
-                used_lambda = step_lambda
-                search_dir = map_update_data_space_LM(
-                    param_current, pred_curr, mean_theta, jac_curr, data_current, Cd_inflated, c_theta, used_lambda
-                )
-                trial_param = param_current + search_dir
-
-                try:              
-                    pred_trial, jac_trial = simulate_and_grad(
-                        trial_param, logging_point_idx=assim_index
-                    )
-                    #pred_trial = simulate_pred_only(trial_param, logging_point_idx=assim_index[0])
-                    trial_loss = custom_loss(pred_trial, data_current, trial_param, mean_theta, c_theta, Cd_inflated)
-                except Exception:
-                    trial_loss = np.inf
-                    pred_trial = None
-
-                if np.isfinite(trial_loss) and trial_loss < curr_loss:
-                    accepted = True
-                    param_current = trial_param
-                    # Re-evaluate with Jacobian for consistency in next iteration
-                    # pred_curr, jac_curr = simulate_and_grad(
-                    #     param_current, data_real, Cd_inflated, logging_point_idx=assim_index[0]
-                    # )
-                    # curr_loss_reeval = custom_loss(pred_curr, data_real, param_current, mean_theta, c_theta, Cd_inflated)
-                    
-                    # # Check for simulator inconsistency
-                    # if abs(curr_loss_reeval - trial_loss) > 1e-6:
-                    #     print(f"  WARNING: Simulator gives different results with/without Jacobian!")
-                    #     print(f"    Trial loss (no Jac): {trial_loss:.6f}")
-                    #     print(f"    Re-eval loss (w/ Jac): {curr_loss_reeval:.6f}")
-                    #     print(f"    Difference: {abs(curr_loss_reeval - trial_loss):.6f}")
-                    
-                    #curr_loss = curr_loss_reeval
-                    curr_loss = trial_loss
-                    jac_curr = jac_trial
-                    step_lambda = max(step_lambda / lambda_down, lambda_min)
-                    break
-
-                step_lambda = min(step_lambda * lambda_up, lambda_max)
-
-            tot_loss.append(curr_loss)
-            if accepted:
-                print(f"Iteration {iter}, Loss: {curr_loss} (accepted, lambda={used_lambda:.3g})")
-            else:
-                print(f"Iteration {iter}, Loss: {curr_loss} (LM step rejected, lambda={used_lambda:.3g})")
+            search_dir = map_update_data_space_LM(
+                param_current, pred_curr, mean_theta, jac_curr, data_current, Cd_inflated, c_theta, used_lambda
+            )
+            trial_param = param_current + search_dir
+            try:
+                pred_trial, jac_trial = simulate_and_grad(trial_param, logging_point_idx=assim_index)
+                trial_loss = custom_loss(pred_trial, data_current, trial_param, mean_theta, c_theta, Cd_inflated)
+            except Exception:
+                trial_loss = np.inf
+                pred_trial = None
+            if np.isfinite(trial_loss) and trial_loss < curr_loss:
+                accepted = True
+                param_current = trial_param
+                curr_loss = trial_loss
+                jac_curr = jac_trial
+                step_lambda = max(step_lambda / lambda_down, lambda_min)
                 break
-        post_param.append(param_current)
-        post_pred.append(pred_trial)
-        post_loss.append(trial_loss)
-    
+            step_lambda = min(step_lambda * lambda_up, lambda_max)
+        tot_loss.append(curr_loss)
+        if accepted:
+            print(f"Iteration {iter}, Loss: {curr_loss} (accepted, lambda={used_lambda:.3g})")
+        else:
+            print(f"Iteration {iter}, Loss: {curr_loss} (LM step rejected, lambda={used_lambda:.3g})")
+            break
+    return {'param': param_current, 'pred': pred_trial, 'loss': trial_loss}
 
+def run_prep(args):
+    """Phase 1 (0D) + Phase 2 (1D) ESMDA, then stage 2D inputs to disk."""
+    cleanup_en_folders()
+    args.save_stage = True
+    _esmda_0d1d_and_stage_inputs(args)
+
+def run_worker(args):
+    """Run the 2D LM optimization for one ensemble member (Slurm array task)."""
+    s = np.load(args.stage_file, allow_pickle=True)
+    member = args.member
+    param_current = s['param_vec'][:, member]
+    data_current = s['data_real'][:, member]
+    mean_theta = s['mean_theta']
+    c_theta = s['c_theta']
+    Cd_vec = s['Cd_vec']
+    Cd_inflated = s['Cd_inflated']
+    assim_index = int(s['assim_index'])
+
+    work_dir = os.path.join(args.work_root, f'work_member_{member}')
+    os.makedirs(work_dir, exist_ok=True)
+    os.chdir(work_dir)
+    cleanup_en_folders()
+
+    setup_simulators(reference_model_path=args.reference_model_path, data_type='Bfield')
+
+    # Internal MPI for the Fortran forward binary. Under a Slurm allocation
+    # `srun <binary>` uses the task's allocated ranks. Override via env var.
+    # NOTE: EMsim's call_sim command format is private; if options['mpi'] is
+    # not honored, fall back to OpenMP-only (unset EMSIM_MPI_PREFIX, rely on
+    # OMP_NUM_THREADS). Confirm behavior on the HPC.
+    mpi_prefix = os.environ.get('EMSIM_MPI_PREFIX')
+    if mpi_prefix:
+        UTA2D_sim.options['mpi'] = mpi_prefix
+
+    print(f"Worker member {member}: optimizing (assim_index={assim_index})")
+    result = run_member_lm(param_current, data_current, mean_theta, c_theta,
+                           Cd_vec, Cd_inflated, assim_index)
+
+    os.makedirs(args.results_dir, exist_ok=True)
+    out_path = os.path.join(args.results_dir, f'member_{member}.pkl')
+    with open(out_path, 'wb') as f:
+        pickle.dump(result, f)
+    print(f"Worker member {member} done: loss={result['loss']} -> {out_path}")
+
+def run_collect(args):
+    """Gather per-member results, plot, and save the final results dict."""
+    s = np.load(args.stage_file, allow_pickle=True)
+    Ne = int(s['Ne'])
+    data_real = s['data_real']
+    data_vec = s['data_vec']
+    tot_assim_index = s['tot_assim_index'].tolist()
+    pr = s['pr']
+    param_vec = s['param_vec']
+
+    post_param, post_pred, post_loss = [], [], []
+    for member in range(Ne):
+        with open(os.path.join(args.results_dir, f'member_{member}.pkl'), 'rb') as f:
+            r = pickle.load(f)
+        post_param.append(r['param'])
+        post_pred.append(r['pred'])
+        post_loss.append(r['loss'])
+
+    os.makedirs(args.results_dir, exist_ok=True)
     plot_ensemble_predictions(
         np.array(post_pred).T, data_real, data_vec,
-        title_suffix=f'After Gradient Iterations',
-        filename=f'ensemble_posterior_predictions.png'
-        )
-    # save results
+        title_suffix='After Gradient Iterations',
+        filename=os.path.join(args.results_dir, 'ensemble_posterior_predictions.png')
+    )
     results_dict = {
         'prior_params': pr,
         'post_mda_params': param_vec,
         'posterior_params': post_param,
         'posterior_predictions': post_pred,
-        'posterior_losses': post_loss
+        'posterior_losses': post_loss,
     }
-    # save to pickle
-    with open(f'inversion_results_assim_{tot_assim_index[0]}.pkl', 'wb') as f:
+    out_path = os.path.join(args.results_dir, f'inversion_results_assim_{tot_assim_index[0]}.pkl')
+    with open(out_path, 'wb') as f:
         pickle.dump(results_dict, f)
+    print(f"Collect done -> {out_path}")
+
+def run_serial(args):
+    """Full pipeline in one process (0D + 1D + 2D). Regression baseline."""
+    cleanup_en_folders()
+    args.save_stage = False
+    stage = _esmda_0d1d_and_stage_inputs(args)
+    Ne = stage['Ne']
+    assim_index = int(stage['assim_index'])
+
+    post_param, post_pred, post_loss = [], [], []
+    for ne in range(Ne):
+        print(f"Optimizing ensemble member {ne+1}/{Ne} with gradient-based method")
+        r = run_member_lm(
+            stage['param_vec'][:, ne], stage['data_real'][:, ne],
+            stage['mean_theta'], stage['c_theta'], stage['Cd_vec'],
+            stage['Cd_inflated'], assim_index,
+        )
+        post_param.append(r['param'])
+        post_pred.append(r['pred'])
+        post_loss.append(r['loss'])
+
+    plot_ensemble_predictions(
+        np.array(post_pred).T, stage['data_real'], stage['data_vec'],
+        title_suffix='After Gradient Iterations',
+        filename='ensemble_posterior_predictions.png'
+    )
+    results_dict = {
+        'prior_params': stage['pr'],
+        'post_mda_params': stage['param_vec'],
+        'posterior_params': post_param,
+        'posterior_predictions': post_pred,
+        'posterior_losses': post_loss,
+    }
+    with open(f'inversion_results_assim_{stage["tot_assim_index"][0]}.pkl', 'wb') as f:
+        pickle.dump(results_dict, f)
+    print("Serial run done.")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mode', choices=['prep', 'worker', 'collect', 'serial'], required=True)
+    parser.add_argument('--member', type=int, default=None, help='ensemble member index (worker mode)')
+    parser.add_argument('--reference-model-path',
+                        default=os.environ.get('REF_MODEL_PATH', '/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3'),
+                        help='folder containing globalmodel.h5 + ascii/')
+    parser.add_argument('--data-dir', default=os.environ.get('DATA_DIR', '.'),
+                        help='folder containing data.pkl and var.pkl')
+    parser.add_argument('--stage-file', default=os.environ.get('STAGE_FILE', 'stage_2d.npz'))
+    parser.add_argument('--results-dir', default=os.environ.get('RESULTS_DIR', '.'))
+    parser.add_argument('--work-root', default=os.environ.get('WORK_ROOT', '.'),
+                        help='parent dir for per-worker working directories')
+    parser.add_argument('--ne', type=int, default=250, help='ensemble size for 0D/1D ESMDA')
+    parser.add_argument('--ne-2d', type=int, default=10, help='ensemble size for 2D gradient phase')
+    parser.add_argument('--assim-index', type=int, default=180)
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    if args.mode == 'prep':
+        run_prep(args)
+    elif args.mode == 'worker':
+        if args.member is None:
+            raise SystemExit('--member <int> is required for worker mode')
+        run_worker(args)
+    elif args.mode == 'collect':
+        run_collect(args)
+    elif args.mode == 'serial':
+        run_serial(args)
+
+
+if __name__ == '__main__':
+    main()
