@@ -43,6 +43,51 @@ posterior check succeeded for all five members: true mean misfit 95.31 versus
 linearized 91.40. No full inversion was relaunched. See the assessment for
 scope limits and acceptance decision.
 
+# Window-size study and solver-domain mechanics — 2026-10-06
+
+`window_size_test.py` (artifacts `runs/window-size-20261006T{085521Z,091248Z}`,
+raw responses in `responses.npz`) cell-averages the truth model into
+bit-centered windows and compares 2D forward responses against a ±100 ft
+reference (41×5 ft), in measurement-noise units, noise-floor channels
+(σ<1e-3) excluded.
+
+**Solver mechanics discovered** (fwd2D `buildgrid.f90`): the computational
+domain is FIXED at half-width `4 × tool_length` = ±332 ft laterally/vertically,
+independent of our window. The window model is nearest-edge-extended to fill
+it. Node layout: a refined core (±(Nx_uni/2)·sp_min; sp_min =
+tool_length/Nz_uni ≈ 2 ft for the wrapper defaults) around the tool, then
+geometric (×1.9) growth to the domain edge. Responses proved bit-identical
+across custom-grid variations (uniform nodes 16–44, averaging 1 vs 2), so the
+model content/extent — not the custom grid — controls accuracy.
+
+**Results (max |Δ|/σ vs ±100 ft reference):**
+
+| Window | Reach | Index 27 (transition) | Index 80 (reservoir) |
+|---|---|---:|---:|
+| 15×5 ft (current) | ±35 ft | 98.2 | 8.9 |
+| 21×5 ft | ±50 ft | 98.2 | 8.9 |
+| 27×5 ft | ±65 ft | 4.5 | 0.0 |
+| 33×5 ft | ±80 ft | 0.0 | 0.0 |
+| 15×10 ft | ±70 ft | 88.4 | 17.5 |
+| 21×10 ft | ±105 ft | 86.7 | 17.5 |
+| 15×5 ft, dz=10 ft | ±35/±100 ft | 98.2 | 427.4 |
+
+- The current window's edge extension is a real, large error source (up to
+  98σ); lateral content matters out to ~±65–80 ft (≈ the 83 ft tool spacing).
+- Coarse lateral cells trade reach for discretization error (17.5σ at equal
+  reach) — rejected. Coarse vertical cells are catastrophic (427σ) — rejected.
+- Cost is flat (22–36 s per field for any size; the solver domain is fixed),
+  so enlarging the window costs only parameters/rank: nx=33 → 1320 parameters
+  vs 600 today at 250 members.
+
+**Recommendation for the unified pilot: nx=33, dx=5, nz=20, dz=5**
+(conservative variant nx=35 ≥ 83 ft reach if the pilot shows residual edge
+sensitivity), with an ensemble-size sensitivity check (250 vs 400) because of
+rank pressure. Custom solver grids are now configurable end-to-end
+(`--solver-grid`/`DA_SIM_SOLVER_GRID`, worker-validated against fwd2D's input
+contract; default unchanged) — responses proved insensitive in the tested
+range, so production keeps the legacy default.
+
 # Unified moving-window domain (branch 2D-curtain) — 2026-10-06
 
 Phase 1 implementation of the unified-domain redesign (design agreed

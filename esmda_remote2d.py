@@ -79,6 +79,7 @@ class SimBackendConfig:
     jobs_dir: str = ""
     solver_tolerance: float = 1e-6
     poll_max_delay_seconds: float = 5.
+    solver_grid: tuple = (20, 4, 40, 30, 20, 30, 2, 1, 2)
 
     @classmethod
     def from_env(cls):
@@ -107,6 +108,8 @@ class SimBackendConfig:
             jobs_dir=_env("DA_SIM_JOBS_DIR", ""),
             solver_tolerance=float(_env("DA_SIM_TOLERANCE", 1e-6)),
             poll_max_delay_seconds=float(_env("DA_SIM_POLL_MAX_DELAY", 5.)),
+            solver_grid=tuple(int(v) for v in
+                              _env("DA_SIM_SOLVER_GRID", "20,4,40,30,20,30,2,1,2").split(",")),
         )
 
     def add_cli(self, parser):
@@ -144,6 +147,10 @@ class SimBackendConfig:
         parser.add_argument("--solver-tolerance", type=float, default=self.solver_tolerance)
         parser.add_argument("--poll-max-delay", type=float, default=self.poll_max_delay_seconds,
                             help="Maximum array-job polling sleep, seconds")
+        parser.add_argument("--solver-grid", default=",".join(str(v) for v in self.solver_grid),
+                            metavar="UX,UY,UZ,OX,OY,OZ,AX,AY,AZ",
+                            help="fwd2D custom grid: uniform and optimal node counts and "
+                                 "material averaging (default: %(default)s)")
 
     def from_args(self, args):
         kwargs = dict(
@@ -170,6 +177,7 @@ class SimBackendConfig:
             scratch=args.scratch,
             solver_tolerance=args.solver_tolerance,
             poll_max_delay_seconds=args.poll_max_delay,
+            solver_grid=tuple(int(v) for v in args.solver_grid.split(",")),
         )
         return SimBackendConfig(**{**asdict(self), **kwargs})
 
@@ -186,6 +194,8 @@ class Remote2D:
         self._backend = None
         if not 0 < config.solver_tolerance < 1:
             raise ValueError("Solver tolerance must lie between 0 and 1")
+        if len(config.solver_grid) != 9:
+            raise ValueError("solver_grid must be nine integers")
         if not np.isfinite(config.poll_max_delay_seconds) or config.poll_max_delay_seconds < 1:
             raise ValueError('Maximum polling delay must be finite and at least one second')
         if not np.isclose(self.dY, self.dX):
@@ -304,6 +314,7 @@ class Remote2D:
             "evaluation_timeout_seconds": 180.0,
             "solver_tolerance": self.config.solver_tolerance,
             "poll_max_delay_seconds": self.config.poll_max_delay_seconds,
+            "solver_grid": list(self.config.solver_grid),
         }
 
     # -- field / result mapping --------------------------------------------
