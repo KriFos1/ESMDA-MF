@@ -12,13 +12,12 @@ import time
 import h5py
 import numpy as np
 import pandas as pd
-from scipy.optimize import fsolve
 from scipy.stats import norm
 
 from esmda_core import (LOG_RH_LIMITS, LocalWindow, MemberEvaluationError, clamp_log_rh,
                         measurement_misfit, noise_floor_mask, observation_vectors,
                         optimizer_jacobian, optimize_members, project_to_modes,
-                        shift_posterior, shift_posterior_1d, update_members_once)
+                        update_members_once)
 from esmda_remote2d import UDAR_COMPONENTS, SimBackendConfig, make_remote2d
 import tv_regularization as tv
 
@@ -29,8 +28,6 @@ min_ratio, max_ratio = 1.0, 5.0
 tools = ["('6kHz','83ft')", "('12kHz','83ft')", "('24kHz','83ft')",
          "('24kHz','43ft')", "('48kHz','43ft')", "('96kHz','43ft')"]
 masked_udar_components = ('USDP', 'USDA')
-log_normal_rh_std_target = 3.6
-normal_rh_mean = 1.0
 ratio_latent_mean = 0.0
 ratio_latent_std = 0.25
 
@@ -59,12 +56,6 @@ def setup_simulators(benchmark_dir, tool_list):
     UTA1D_sim.setup_fwd_run(redund_sim=None)
 
 
-def normal_std_from_lognormal_std(sigma_X, mu):
-    def equation(sigma):
-        return np.sqrt((np.exp(sigma ** 2) - 1) * np.exp(2 * mu + sigma ** 2)) - sigma_X
-    return float(fsolve(equation, 1.0)[0])
-
-
 def sample_prior_0D(ne, background, reservoir, mode_std, fraction):
     """Two-mode mixture prior in ln Rh: background and reservoir levels."""
     reservoirs = np.random.random(ne) < fraction
@@ -77,14 +68,6 @@ def sample_prior_0D(ne, background, reservoir, mode_std, fraction):
     covariance = np.diag([variance, ratio_latent_std ** 2])
     samples = np.vstack([rh, np.random.normal(ratio_latent_mean, ratio_latent_std, ne)])
     return samples, covariance, np.array([mean, ratio_latent_mean])
-
-
-def sample_prior_0D_gaussian(ne):
-    rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
-    covariance = np.diag([rh_std ** 2, ratio_latent_std ** 2])
-    samples = np.vstack([np.random.normal(normal_rh_mean, rh_std, ne),
-                         np.random.normal(ratio_latent_mean, ratio_latent_std, ne)])
-    return samples, covariance, np.array([normal_rh_mean, ratio_latent_mean])
 
 
 def mixture_stats(nz, background, reservoir, mode_std, fraction):
@@ -130,101 +113,111 @@ def sample_blocky_prior_1D(ne, zero_d_posterior, background, reservoir, mode_std
     return np.vstack([rh, latent]), covariance, means
 
 
-def sample_chained_prior_1D(ne, trend, background, reservoir, mode_std, fraction, switch_prob,
-                          projection=True):
-    """Perturb the shifted previous posterior within its modes, flipping a
-    small fraction of cells so newly entering geology stays discoverable."""
-    nz = dims[2]
-    members = trend.shape[1]
-    base = trend[:, np.arange(ne) % members]
-    midpoint = 0.5 * (background + reservoir)
-    flips = np.random.random((nz, ne)) < switch_prob
-    reservoir_cells = base[:nz] > midpoint
-    rh = base[:nz] + np.random.normal(0., mode_std, (nz, ne))
-    rh = np.where(flips & reservoir_cells,
-                  np.random.normal(background, mode_std, (nz, ne)), rh)
-    rh = np.where(flips & ~reservoir_cells,
-                  np.random.normal(reservoir, mode_std, (nz, ne)), rh)
-    if projection:
-        rh = project_to_modes(rh, background, reservoir, 2. * mode_std)
-    latent = base[nz:] + np.random.normal(0., ratio_latent_std, (nz, ne))
-    means, covariance = mixture_stats(nz, background, reservoir, mode_std, fraction)
-    return np.vstack([rh, latent]), covariance, means
+def conditional_columns(base_rh, base_latent, background, reservoir, mode_std, latent_std, switch_prob):
+    """Blocky conditional draw of fresh cells from the adjacent ensemble column.
 
-
-def resample_prior_0D_to_1D(ne, param_vec_0D):
-    from geostat.decomp import Cholesky
-    if param_vec_0D.shape != (2, ne):
-        raise ValueError('0D ensemble must have shape (2, members)')
-    nz = dims[2]
-    center = nz // 2
-    geostat = Cholesky()
-    rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, param_vec_0D[0].mean())
-    samples, covariances, means = [], [], []
-    for field, std in enumerate((rh_std, ratio_latent_std)):
-        mean = np.full(nz, param_vec_0D[field].mean())
-        covariance = geostat.gen_cov2d(nz, 1, std ** 2, nz, 1, 0, 'exp')
-        unconditional = geostat.gen_real(mean, covariance, ne).reshape(nz, ne)
-        residual = param_vec_0D[field] - unconditional[center]
-        conditioned = unconditional + (covariance[:, center] / covariance[center, center])[:, None] * residual
-        conditioned[center] = param_vec_0D[field]
-        samples.append(conditioned)
-        covariances.append(covariance)
-        means.append(mean)
-    zeros = np.zeros_like(covariances[0])
-    return np.vstack(samples), np.block([[covariances[0], zeros], [zeros, covariances[1]]]), np.concatenate(means)
-
-
-def resample_prior_multiple_1D_to_2D(ne, columns, indices, previous=None, posterior_spread=None):
-    """Kriging-conditioned local fields, optionally around an aligned posterior.
-
-    ``posterior_spread`` scales the residual (and returned covariance) per
-    field by ``clip(spread/prior_std, 0.1, 1)`` so the 2D prior reflects the
-    lower-fidelity posterior uncertainty instead of the full initial spread.
+    Modes persist laterally with per-cell flips at ``switch_prob``; values are
+    redrawn at the mode level with ``mode_std`` spread. Formula-based: no
+    iterative solves, so entering cells cannot stall.
     """
-    from geostat.decomp import Cholesky
+    midpoint = 0.5 * (background + reservoir)
+    flips = np.random.random(base_rh.shape) < switch_prob
+    reservoir_cells = base_rh > midpoint
+    rh = base_rh + np.random.normal(0., mode_std, base_rh.shape)
+    rh = np.where(flips & reservoir_cells,
+                  np.random.normal(background, mode_std, base_rh.shape), rh)
+    rh = np.where(flips & ~reservoir_cells,
+                  np.random.normal(reservoir, mode_std, base_rh.shape), rh)
+    latent = base_latent + np.random.normal(0., latent_std, base_latent.shape)
+    return rh, latent
+
+
+def conditional_row(base_rh, base_latent, background, reservoir, mode_std, latent_std, switch_prob):
+    """One new depth row per column, conditioned on the deepest existing row."""
+    midpoint = 0.5 * (background + reservoir)
+    flips = np.random.random(base_rh.shape) < switch_prob
+    reservoir_cells = base_rh > midpoint
+    reservoir_row = np.logical_xor(flips, reservoir_cells)
+    rh = np.where(reservoir_row,
+                  np.random.normal(reservoir, mode_std, base_rh.shape),
+                  np.random.normal(background, mode_std, base_rh.shape))
+    latent = base_latent + np.random.normal(0., latent_std, base_latent.shape)
+    return rh, latent
+
+
+def sample_prior_2d(ne, zero_d_posterior, background, reservoir, mode_std, fraction,
+                    switch_prob, projection=True):
+    """Laterally persistent two-mode blocky window prior.
+
+    The bit column follows ``sample_blocky_prior_1D`` statistics conditioned on
+    the member's 0D posterior side; interfaces random-walk laterally through
+    ``conditional_columns`` so the ensemble carries real cross-column
+    correlation for the ES updates while new geology stays discoverable.
+    """
     nx, _, nz = dims
-    n_cells = nx * nz
-    indices = np.asarray(indices, dtype=int)
-    if not len(indices) or len(columns) != len(indices) or len(np.unique(indices)) != len(indices):
-        raise ValueError('Conditioning columns must have distinct indices')
-    if (indices < 0).any() or (indices >= nx).any():
-        raise ValueError('Conditioning column lies outside the window')
-    if any(np.shape(column) != (2 * nz, ne) for column in columns):
-        raise ValueError('1D columns do not match the window or ensemble')
-    if previous is not None and np.shape(previous) != (ne, 2 * n_cells):
-        raise ValueError('Previous posterior does not match the local window')
-    conditioning = np.concatenate([index * nz + np.arange(nz) for index in indices])
-    geostat = Cholesky()
-    var_range_cells = max(1, int(np.floor(5.0 * meter_to_feet / dX)))
-    vertical_aspect = 4 * dZ / dX
-    fields, covariances, means = [], [], []
-    for field in range(2):
-        values = np.concatenate([column[field*nz:(field+1)*nz] for column in columns])
-        if previous is None:
-            trend = np.tile(columns[-1][field*nz:(field+1)*nz], (nx, 1))
-        else:
-            trend = np.asarray(previous).reshape(ne, 2, n_cells)[:, field, :].T.copy()
-        trend[conditioning] = values
-        mean = trend.mean(axis=1)
-        std = (normal_std_from_lognormal_std(log_normal_rh_std_target, min(3, mean.max()))
-               if field == 0 else ratio_latent_std)
-        if posterior_spread is not None:
-            scale = float(np.clip(posterior_spread[field] / std, 0.03, 1.0))
-            std *= scale
-        covariance = geostat.gen_cov2d(nx, nz, std ** 2, var_range_cells, vertical_aspect, 0, 'exp')
-        residual = geostat.gen_real(np.zeros(n_cells), covariance, ne).reshape(n_cells, ne)
-        C_dd = covariance[np.ix_(conditioning, conditioning)] + np.eye(len(conditioning)) * np.finfo(float).eps
-        weights = np.linalg.solve(C_dd, -residual[conditioning])
-        residual += covariance[:, conditioning] @ weights
-        residual[conditioning] = 0
-        conditioned = trend + residual
-        conditioned[conditioning] = values
-        fields.append(conditioned)
-        covariances.append(covariance)
-        means.append(mean)
-    zeros = np.zeros_like(covariances[0])
-    return np.vstack(fields), np.block([[covariances[0], zeros], [zeros, covariances[1]]]), np.concatenate(means)
+    columns, _, _ = sample_blocky_prior_1D(ne, zero_d_posterior, background, reservoir,
+                                           mode_std, fraction, projection=projection)
+    rh = np.empty((nx, nz, ne))
+    latent = np.empty((nx, nz, ne))
+    bit = nx // 2
+    rh[bit], latent[bit] = columns[:nz], columns[nz:]
+    for column in range(bit - 1, -1, -1):
+        rh[column], latent[column] = conditional_columns(
+            rh[column + 1], latent[column + 1], background, reservoir,
+            mode_std, ratio_latent_std, switch_prob)
+    for column in range(bit + 1, nx):
+        rh[column], latent[column] = conditional_columns(
+            rh[column - 1], latent[column - 1], background, reservoir,
+            mode_std, ratio_latent_std, switch_prob)
+    if projection:
+        for column in range(nx):
+            rh[column] = project_to_modes(rh[column], background, reservoir, 2. * mode_std)
+    state = np.vstack([rh.reshape(nx * nz, ne), latent.reshape(nx * nz, ne)])
+    mean = state.mean(axis=1)
+    covariance = np.diag(np.maximum(state.var(axis=1), 1e-8))
+    return state, covariance, mean
+
+
+def shift_window_state(state, movement, background, reservoir, mode_std, latent_std, switch_prob):
+    """Reindex the moving window; entered cells become conditional blocky draws.
+
+    Exited cells are dropped and finalized. Cells entering laterally (or at the
+    bottom on vertical movement) are drawn from the adjacent interior ensemble
+    column/row, preserving correlation with the informed state.
+    """
+    nx, _, nz = dims
+    values = np.asarray(state, dtype=float)
+    if values.ndim != 2 or values.shape[0] != 2 * nx * nz:
+        raise ValueError('Window state must have shape (2*nx*nz, members)')
+    ne = values.shape[1]
+    x = np.clip(np.arange(nx) + movement[0], 0, nx - 1)
+    z = np.clip(np.arange(nz) + movement[1], 0, nz - 1)
+    cells = nx * nz
+    rh = values[:cells].reshape(nx, nz, ne)[x][:, z].copy()
+    latent = values[cells:].reshape(nx, nz, ne)[x][:, z].copy()
+    entered_x = int(movement[0])
+    if entered_x > 0:
+        for column in range(nx - entered_x, nx):
+            rh[column], latent[column] = conditional_columns(
+                rh[column - 1], latent[column - 1], background, reservoir,
+                mode_std, latent_std, switch_prob)
+    elif entered_x < 0:
+        for column in range(-entered_x - 1, -1, -1):
+            rh[column], latent[column] = conditional_columns(
+                rh[column + 1], latent[column + 1], background, reservoir,
+                mode_std, latent_std, switch_prob)
+    entered_z = int(movement[1])
+    if entered_z > 0:
+        for row in range(nz - entered_z, nz):
+            rh[:, row], latent[:, row] = conditional_row(
+                rh[:, row - 1], latent[:, row - 1], background, reservoir,
+                mode_std, latent_std, switch_prob)
+    elif entered_z < 0:
+        for row in range(-entered_z - 1, -1, -1):
+            rh[:, row], latent[:, row] = conditional_row(
+                rh[:, row + 1], latent[:, row + 1], background, reservoir,
+                mode_std, latent_std, switch_prob)
+    return np.vstack([rh.reshape(cells, ne), latent.reshape(cells, ne)])
 
 
 def _build_param_dict(param):
@@ -260,15 +253,6 @@ def component_positions(n_channels):
     for name in masked_udar_components:
         positions.extend(range(UDAR_COMPONENTS.index(name), n_channels, width))
     return np.asarray(sorted(positions), dtype=int)
-
-
-def soften_column_edges(column, nz):
-    """Turn a blocky log-Rh column into a two-cell ramp (5 ft cell average)."""
-    softened = np.asarray(column, dtype=float).copy()
-    rh = softened[:nz]
-    padded = np.r_[rh[0], rh, rh[-1]]
-    softened[:nz] = np.convolve(padded, [.25, .5, .25], mode='valid')
-    return softened
 
 
 def simulate_pred_only(param, logging_point_idx=0, simfidelity='2D'):
@@ -362,8 +346,8 @@ def parse_args(argv=None):
     parser.add_argument('--single-update', action='store_true',
                         help='Engaged 2D points take one batched linearized update '
                              'instead of iterated LM (one solver batch per point)')
-    parser.add_argument('--prior-style', choices=['blocky', 'gaussian'], default='blocky',
-                        help='1D prior family: two-mode blocky columns or the legacy smooth Gaussian')
+    parser.add_argument('--prior-style', choices=['blocky'], default='blocky',
+                        help='Unified-domain two-mode blocky prior')
     parser.add_argument('--prior-background', type=float, default=float(np.log10(1.5)),
                         help='log10 Rh of the background mode (Ohm-m)')
     parser.add_argument('--prior-reservoir', type=float, default=float(np.log10(30.)),
@@ -478,6 +462,7 @@ def main(argv=None):
                     'tools': tool_pairs, 'dims': dims, 'spacing_ft': (dX, dY, dZ),
                      'covariance_bytes': (2 * args.nx * args.nz) ** 2 * 8,
                      'parameter_units': '[ln(Rh / Ohm m), anisotropy latent]',
+                     'unified_domain': True,
                      'prior_projection_effective': projection,
                      'tv_weights_effective': {'1D': tv_weight_1d, '2D': tv_weight_2d},
                      'prior_units': {'cli': 'log10', 'internal': 'natural_log',
@@ -488,15 +473,11 @@ def main(argv=None):
         (output / 'run.json').write_text(json.dumps(manifest, default=str, indent=2))
         print(f'Local window {dims}, spacing {(dX, dY, dZ)} ft; backend={config.backend}', flush=True)
         previous = None
-        previous_kind = None
-        previous_1d = None
         previous_index = None
         for index in range(args.start, stop, args.frequency):
             point_started = time.monotonic()
             current_shift, movement = window.update((WX[index], WY[index], TVD[index]))
             _set_logging_point_state(index)
-            aligned = (shift_posterior(previous, dims, movement)
-                       if previous_kind == '2D' else None)
             observations, Cd = observation_vectors(data, variances, index, tool_pairs)
             sub_cell = np.zeros(len(observations), dtype=bool)
             sub_cell[component_positions(len(observations))] = True
@@ -507,120 +488,113 @@ def main(argv=None):
             if masked_channels:
                 print(f'Index {index}: masking {masked_channels} unrepresentable channels', flush=True)
             observations, Cd = observations[obs_mask], Cd[obs_mask]
-
-            def predict_ensemble(ens, fidelity):
-                full = np.column_stack([simulate_pred_only(ens[:, member], index, fidelity)
-                                        for member in range(ens.shape[1])])
-                return full[obs_mask]
-
-            threshold = args.misfit_threshold
-            if args.prior_style == 'gaussian':
-                ensemble, covariance, mean = sample_prior_0D_gaussian(args.ensemble_size)
-            else:
-                ensemble, covariance, mean = sample_prior_0D(
-                    args.ensemble_size, background, reservoir,
-                    mode_std, args.prior_reservoir_fraction)
-            ensemble = clamp_log_rh(ensemble)
-            updater = approx_update()
+            nx, _, nz = dims
+            cells = nx * nz
+            bit = nx // 2
             ne = args.ensemble_size
+            threshold = args.misfit_threshold
+            misfit = {}
+            tv_history = []
+            escalation_abandoned = None
+            solver_failures = []
+            alpha, used_weight = [10.], [0.]
+            spatial_weight = [None]
+            updater = approx_update()
             updater.proj = (np.eye(ne) - np.ones((ne, ne)) / ne) / np.sqrt(ne - 1)
             updater.trunc_energy, updater.keys_da, updater.lam = .95, {}, 0
             updater.list_states = ['rh', 'rv']
-            alpha, used_weight = 10., 0.
-            misfit = {}
-            tv_history = []
-            spatial_weight = None
-            for fidelity, budget in (('0D', .25), ('1D', .75)):
-                if fidelity == '1D':
-                    spatial_weight = 1. - used_weight
-                    if args.prior_style == 'gaussian':
-                        ensemble, covariance, mean = resample_prior_0D_to_1D(ne, ensemble)
-                    elif previous_1d is not None:
-                        trend = shift_posterior_1d(previous_1d.T, dims[2], movement).T
-                        ensemble, covariance, mean = sample_chained_prior_1D(
-                            ne, trend, background, reservoir,
-                            mode_std, args.prior_reservoir_fraction,
-                            args.prior_switch_prob, projection=projection)
-                    else:
-                        ensemble, covariance, mean = sample_blocky_prior_1D(
-                            ne, ensemble[0], background, reservoir,
-                            mode_std, args.prior_reservoir_fraction, projection=projection)
-                    ensemble = clamp_log_rh(ensemble)
-                updater.state_scaling = np.ones(ensemble.shape[0])
-                active = ensemble.shape[0] // 2
+
+            def predict_state(state, fidelity):
+                if fidelity == '0D' and state.shape[0] == 2:
+                    columns = [state[:, member] for member in range(ne)]
+                elif fidelity == '0D':
+                    columns = [np.array([state[:cells, member].mean(),
+                                         state[cells:, member].mean()]) for member in range(ne)]
+                else:
+                    upper, lower = bit * nz, cells + bit * nz
+                    columns = [np.r_[state[upper:upper + nz, member],
+                                     state[lower:lower + nz, member]] for member in range(ne)]
+                return np.column_stack([simulate_pred_only(column, index, fidelity)
+                                        for column in columns])[obs_mask]
+
+            def assimilate_stage(state, fidelity, budget):
+                updater.state_scaling = np.ones(state.shape[0])
+                active = state.shape[0] // 2
                 updater.prior_info = {key: {'active': active} for key in ('rh', 'rv')}
-                prediction = predict_ensemble(ensemble, fidelity)
+                prediction = predict_state(state, fidelity)
                 misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
                 misfit[f'{fidelity}_initial'] = misfit_now
-                while misfit_now > threshold and used_weight < budget:
-                    inflated = Cd * alpha
+                while misfit_now > threshold and used_weight[0] < budget:
+                    inflated = Cd * alpha[0]
                     updater.scale_data = np.sqrt(inflated)
-                    perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None], (len(Cd), ne))
-                    updater.update(enX=ensemble, enY=prediction, enE=perturbed)
-                    ensemble += updater.step
-                    np.clip(ensemble[:active], *LOG_RH_LIMITS, out=ensemble[:active])
+                    perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None],
+                                                 (len(Cd), ne))
+                    updater.update(enX=state, enY=prediction, enE=perturbed)
+                    state += updater.step
+                    np.clip(state[:active], *LOG_RH_LIMITS, out=state[:active])
                     if projection:
-                        ensemble[:active] = project_to_modes(
-                            ensemble[:active], background, reservoir, 2. * mode_std)
+                        state[:active] = project_to_modes(state[:active], background, reservoir,
+                                                          2. * mode_std)
                     if args.regularization == 'tv' and fidelity == '1D':
-                        dose = tv_weight_1d / alpha / spatial_weight
-                        ensemble = tv.regularize_columns(ensemble, dose, dZ,
-                                                         args.tv_epsilon, args.tv_iterations)
+                        dose = tv_weight_1d / alpha[0] / spatial_weight[0]
+                        state = tv.regularize_windows(state, nx, nz, dose, dX, dZ,
+                                                      args.tv_epsilon, args.tv_iterations)
                         tv_history.append({'stage': '1D', 'strength': dose,
-                                           'assimilation_fraction': 1 / alpha / spatial_weight})
-                    used_weight += 1 / alpha
-                    alpha *= 10 / 9
-                    prediction = predict_ensemble(ensemble, fidelity)
+                                           'assimilation_fraction': 1 / alpha[0] / spatial_weight[0]})
+                    used_weight[0] += 1 / alpha[0]
+                    alpha[0] *= 10 / 9
+                    prediction = predict_state(state, fidelity)
                     misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
-                    print(f'Index {index}, {fidelity}: misfit={misfit_now:.6g}, weight={used_weight:.4f}', flush=True)
+                    print(f'Index {index}, {fidelity}: misfit={misfit_now:.6g}, '
+                          f'weight={used_weight[0]:.4f}', flush=True)
                 misfit[f'{fidelity}_final'] = misfit_now
-            ranking_full = np.argsort([custom_loss(prediction[:, member], observations, ensemble[:, member], mean, covariance, Cd)
+                return state, prediction
+
+            if previous is None:
+                state = clamp_log_rh(sample_prior_0D(ne, background, reservoir, mode_std,
+                                                     args.prior_reservoir_fraction)[0])
+                state, _ = assimilate_stage(state, '0D', .25)
+                state = clamp_log_rh(sample_prior_2d(ne, state[0], background, reservoir, mode_std,
+                                                     args.prior_reservoir_fraction,
+                                                     args.prior_switch_prob, projection=projection)[0])
+                point_prior = state.copy()
+                spatial_weight[0] = 1. - used_weight[0]
+                state, prediction = assimilate_stage(state, '1D', .75)
+            else:
+                state = clamp_log_rh(shift_window_state(previous, movement, background, reservoir,
+                                                        mode_std, ratio_latent_std,
+                                                        args.prior_switch_prob))
+                point_prior = state.copy()
+                state, _ = assimilate_stage(state, '0D', .25)
+                spatial_weight[0] = 1. - used_weight[0]
+                state, prediction = assimilate_stage(state, '1D', .75)
+            post_1d_state = state.copy()
+            mean = state.mean(axis=1)
+            covariance = np.diag(np.maximum(state.var(axis=1), 1e-8))
+            ranking_full = np.argsort([custom_loss(prediction[:, member], observations,
+                                                   state[:, member], mean, covariance, Cd)
                                        for member in range(ne)])
             ranking = ranking_full[:args.opt_members]
-            selected = ensemble[:, ranking]
-            factor = 1 / (1 - used_weight)
+            factor = 1 / (1 - used_weight[0])
             inflated = Cd * factor
-            final_tv_fraction = 1 / factor / spatial_weight
+            final_tv_fraction = 1 / factor / spatial_weight[0]
             final_tv_dose = tv_weight_2d * final_tv_fraction
-            escalate = args.force_2d or misfit_now > threshold
+            escalate = args.force_2d or misfit['1D_final'] > threshold
+            mean_2d, covariance_2d = mean, covariance
             two_d_evaluations = [0]
-            nx, _, nz = dims
-            escalation_abandoned = None
-            solver_failures = []
-            mean_1d, covariance_1d = mean, covariance
             tv_history_mark = len(tv_history)
+            records = None
+            member_candidates = [int(rank) for rank in ranking]
+            posterior_misfit = None
+            worsened = False
             if escalate:
-                indices = np.arange(nx // 2 + 1)
-                if args.prior_style == 'blocky':
-                    prior_spread = (mode_std, ratio_latent_std)
-                    if aligned is not None and projection:
-                        aligned = aligned.copy()
-                        aligned[:, :nx * nz] = project_to_modes(
-                            aligned[:, :nx * nz], background, reservoir, 2. * mode_std)
-                elif aligned is None:
-                    half = ensemble.shape[0] // 2
-                    prior_spread = (float(np.median(ensemble[:half].std(axis=1))),
-                                    float(np.median(ensemble[half:].std(axis=1))))
-                else:
-                    prior_spread = (float(np.median(aligned[:, :nx * nz].std(axis=0))),
-                                    float(np.median(aligned[:, nx * nz:].std(axis=0))))
-                columns = []
-                for column in indices:
-                    if aligned is None or column == nx // 2:
-                        center = selected
-                    else:
-                        center = aligned.reshape(args.opt_members, 2, nx, nz)[:, :, column, :] \
-                            .reshape(args.opt_members, 2 * nz).T.copy()
-                    if args.prior_style == 'blocky':
-                        center = np.apply_along_axis(soften_column_edges, 0, center, nz)
-                    columns.append(center.copy())
-                prior, covariance, mean = resample_prior_multiple_1D_to_2D(
-                    args.opt_members, columns, indices, aligned, prior_spread)
-                prior = clamp_log_rh(prior)
+                prior = post_1d_state[:, ranking].copy()
+                mean_2d = prior.mean(axis=1)
+                covariance_2d = np.diag(np.maximum(prior.var(axis=1), 1e-8))
                 perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None],
                                              (len(Cd), args.opt_members))
                 active_cells = np.ones((2, nx, nz), dtype=bool)
-                active_cells[:, :nx // 2] = False
+                active_cells[:, :bit] = False
 
                 def evaluate_multi_2d(param_list):
                     two_d_evaluations[0] += len(param_list)
@@ -633,23 +607,6 @@ def main(argv=None):
                             masked.append((res[0][obs_mask], res[1][obs_mask]))
                     return masked
 
-                def substitute_prior(slot, candidate):
-                    center = ensemble[:, [candidate]].copy()
-                    if args.prior_style == 'blocky':
-                        center = np.apply_along_axis(soften_column_edges, 0, center, nz)
-                    member_columns = []
-                    for column in indices:
-                        if aligned is None or column == nx // 2:
-                            member_columns.append(center)
-                        else:
-                            member_columns.append(aligned.reshape(-1, 2, nx, nz)[slot, :, column, :]
-                                                   .reshape(2 * nz, 1))
-                    previous = None if aligned is None else aligned.reshape(-1, 2 * nx * nz)[slot:slot + 1]
-                    single, _, _ = resample_prior_multiple_1D_to_2D(1, member_columns, indices,
-                                                                    previous, prior_spread)
-                    return clamp_log_rh(single[:, 0])
-
-                member_candidates = [int(rank) for rank in ranking]
                 next_rank = [args.opt_members]
 
                 def substitute(slot, exc):
@@ -667,7 +624,7 @@ def main(argv=None):
                                             'substitute': candidate, 'error': str(exc)})
                     print(f'Index {index}, 2D slot {slot}: initial evaluation failed; '
                           f'substituting ensemble member {candidate}', flush=True)
-                    prior[:, slot] = substitute_prior(slot, candidate)
+                    prior[:, slot] = post_1d_state[:, candidate].copy()
                     perturbed[:, slot] = np.random.normal(observations, np.sqrt(inflated))
                     member_candidates[slot] = candidate
                     return prior[:, slot], perturbed[:, slot]
@@ -676,24 +633,24 @@ def main(argv=None):
                     if args.single_update:
                         update = map_update_data_space_LM
                         if args.regularization == 'tv':
-                            def update(theta, prediction, prior_mean, jacobian, datum, data_cov, prior_cov, damping):
+                            def update(theta, member_prediction, prior_mean, jacobian, datum,
+                                       data_cov, prior_cov, damping):
                                 return tv.linearized_step(
-                                    theta, prediction, prior_mean, jacobian, datum, data_cov,
+                                    theta, member_prediction, prior_mean, jacobian, datum, data_cov,
                                     (nx, nz), (dX, dZ), final_tv_dose, active_cells.ravel(),
                                     args.tv_epsilon, args.tv_iterations, args.tv_amplitude_std,
                                     args.tv_max_step, LOG_RH_LIMITS)
-
                             tv_history.append({'stage': '2D', 'strength': final_tv_dose,
-                                               'assimilation_fraction': 1 / factor / spatial_weight})
+                                               'assimilation_fraction': 1 / factor / spatial_weight[0]})
                         records = update_members_once([prior[:, slot] for slot in range(args.opt_members)],
                                                        [perturbed[:, slot] for slot in range(args.opt_members)],
-                                                       mean, covariance, inflated, evaluate_multi_2d,
-                                                        update, custom_loss,
+                                                       mean_2d, covariance_2d, inflated, evaluate_multi_2d,
+                                                       update, custom_loss,
                                                        active_cells.ravel(), substitute=substitute)
                     else:
                         records = optimize_members([prior[:, slot] for slot in range(args.opt_members)],
                                                    [perturbed[:, slot] for slot in range(args.opt_members)],
-                                                   mean, covariance, inflated, evaluate_multi_2d,
+                                                   mean_2d, covariance_2d, inflated, evaluate_multi_2d,
                                                    map_update_data_space_LM, custom_loss,
                                                    args.max_iterations, args.max_lm_trials,
                                                    active_cells.ravel(), substitute=substitute)
@@ -701,141 +658,129 @@ def main(argv=None):
                     escalation_abandoned = str(exc)
                     print(f'Index {index}: 2D escalation abandoned after '
                           f'{len(solver_failures)} substitutions; applying final 1D update', flush=True)
-                    mean, covariance = mean_1d, covariance_1d
                     del tv_history[tv_history_mark:]
                     escalate = False
                 else:
                     for slot, record in enumerate(records):
                         label = 'gaussian_diagnostic_loss' if args.regularization == 'tv' else 'loss'
                         print(f'Index {index}, 2D member {slot+1} (candidate {member_candidates[slot]}): '
-                              f'{label}={record["loss"]:.6g}, iterations={len(record["history"]) - 1}', flush=True)
-                    previous = np.stack([record['parameters'] for record in records])
-                    previous_kind = '2D'
-                    previous_1d = np.stack([np.concatenate(
-                        [np.asarray(record['parameters'])[:nx * nz].reshape(nx, nz)[nx // 2, :],
-                         np.asarray(record['parameters'])[nx * nz:].reshape(nx, nz)[nx // 2, :]])
-                        for record in records], axis=-1)
+                              f'{label}={record["loss"]:.6g}, iterations={len(record["history"]) - 1}',
+                              flush=True)
+                    misfit['before_final'] = misfit['1D_final']
                     posterior_misfit = [measurement_misfit(record['prediction'], observations, Cd)
                                         for record in records]
-                    misfit['before_final'] = misfit['1D_final']
                     misfit['after_final'] = float(np.mean(posterior_misfit))
-                    worsened = False
-                    results = {'prior_params': prior, 'post_mda_params': prior.copy(),
-                               'post_1d_params': selected,
-                               'posterior_params': [record['parameters'] for record in records],
-                               'posterior_predictions': [record['prediction'] for record in records],
-                               'posterior_losses': [record['loss'] for record in records],
-                               'optimizer_history': [record['history'] for record in records],
-                               'trial_errors': [record['trial_errors'] for record in records],
-                               'observations': observations, 'perturbed_observations': perturbed,
-                               'data_covariance': inflated, 'prior_mean': mean, 'prior_covariance': covariance,
-                               'dims': dims, 'spacing_ft': (dX, dY, dZ), 'shift_ft': dict(current_shift),
-                               'window_movement': movement, 'previous_index': previous_index,
-                               'logging_index': index, 'tools': tool_pairs, 'seed': args.seed,
-                               'mda_weight': used_weight + 1 / factor, 'lower_fidelity_weight': used_weight,
-                               'final_inflation_factor': factor,
-                               'optimized_2d': True, 'selected_fidelity': '2D', 'two_d_calls': two_d_evaluations[0],
-                               'two_d_mode': 'single-update' if args.single_update else 'lm',
-                               'prior_style': args.prior_style,
-                               'misfit': misfit, 'misfit_threshold': threshold,
-                               'posterior_misfit': posterior_misfit, 'final_iteration_worsened': worsened,
-                               'member_candidates': member_candidates, 'solver_failures': solver_failures,
-                               'substituted_members': len(solver_failures), 'prior_spread': prior_spread,
-                               'observation_mask': obs_mask, 'masked_channels': masked_channels,
-                               'masked_components': masked_udar_components}
-            if not escalate:
+            if records is None:
                 misfit['before_final'] = misfit['1D_final']
-                updater.state_scaling = np.ones(ensemble.shape[0])
-                active = ensemble.shape[0] // 2
+                updater.state_scaling = np.ones(state.shape[0])
+                active = state.shape[0] // 2
                 updater.prior_info = {key: {'active': active} for key in ('rh', 'rv')}
                 updater.scale_data = np.sqrt(inflated)
-                perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None], (len(Cd), ne))
-                updater.update(enX=ensemble, enY=prediction, enE=perturbed)
-                ensemble += updater.step
-                np.clip(ensemble[:active], *LOG_RH_LIMITS, out=ensemble[:active])
+                perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None],
+                                             (len(Cd), ne))
+                updater.update(enX=state, enY=prediction, enE=perturbed)
+                state += updater.step
+                np.clip(state[:active], *LOG_RH_LIMITS, out=state[:active])
                 if projection:
-                    ensemble[:active] = project_to_modes(
-                        ensemble[:active], background, reservoir, 2. * mode_std)
+                    state[:active] = project_to_modes(state[:active], background, reservoir,
+                                                      2. * mode_std)
                 if args.regularization == 'tv':
-                    final_tv_dose = tv_weight_1d * final_tv_fraction
-                    ensemble = tv.regularize_columns(ensemble, final_tv_dose, dZ,
-                                                     args.tv_epsilon, args.tv_iterations)
-                    tv_history.append({'stage': 'final_1D', 'strength': final_tv_dose,
-                                       'assimilation_fraction': 1 / factor / spatial_weight})
-                used_weight += 1 / factor
-                prediction = predict_ensemble(ensemble, '1D')
+                    final_dose = tv_weight_1d * final_tv_fraction
+                    state = tv.regularize_windows(state, nx, nz, final_dose, dX, dZ,
+                                                  args.tv_epsilon, args.tv_iterations)
+                    tv_history.append({'stage': 'final_1D', 'strength': final_dose,
+                                       'assimilation_fraction': final_tv_fraction})
+                used_weight[0] += 1 / factor
+                prediction = predict_state(state, '1D')
                 misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
                 misfit['after_final'] = misfit_now
                 worsened = bool(misfit_now > misfit['before_final'])
                 print(f'Index {index}, final 1D update: misfit {misfit["before_final"]:.6g} -> '
                       f'{misfit_now:.6g}{" (increased)" if worsened else ""}, weight=1.0000', flush=True)
                 ranking = np.argsort([custom_loss(prediction[:, member], perturbed[:, member],
-                                                  ensemble[:, member], mean, covariance, inflated)
+                                                  state[:, member], mean, covariance, inflated)
                                       for member in range(ne)])[:args.opt_members]
-                selected = ensemble[:, ranking]
-                perturbed = perturbed[:, ranking]
-                records = [{'parameters': selected[:, member].copy(),
+                member_candidates = [int(rank) for rank in ranking]
+                records = [{'parameters': state[:, ranking[member]].copy(),
                             'prediction': prediction[:, ranking[member]],
-                            'loss': custom_loss(prediction[:, ranking[member]], perturbed[:, member],
-                                                selected[:, member], mean, covariance, inflated)}
+                            'loss': float(custom_loss(prediction[:, ranking[member]],
+                                                      perturbed[:, member],
+                                                      state[:, ranking[member]], mean,
+                                                      covariance, inflated)),
+                            'history': [], 'trial_errors': []}
                            for member in range(args.opt_members)]
-                previous = selected.T
-                previous_kind = '1D'
-                previous_1d = selected
                 posterior_misfit = [measurement_misfit(record['prediction'], observations, Cd)
                                     for record in records]
-                results = {'prior_params': None, 'post_mda_params': selected.copy(),
-                           'post_1d_params': selected.copy(),
-                           'posterior_params': [record['parameters'] for record in records],
-                           'posterior_predictions': [record['prediction'] for record in records],
-                           'posterior_losses': [record['loss'] for record in records],
-                           'optimizer_history': [[record['loss']] for record in records],
-                           'trial_errors': [[] for _ in records],
-                           'observations': observations, 'perturbed_observations': perturbed,
-                           'data_covariance': inflated, 'prior_mean': mean, 'prior_covariance': covariance,
-                           'dims': dims, 'spacing_ft': (dX, dY, dZ), 'shift_ft': dict(current_shift),
-                           'window_movement': movement, 'previous_index': previous_index,
-                           'logging_index': index, 'tools': tool_pairs, 'seed': args.seed,
-                           'mda_weight': used_weight, 'lower_fidelity_weight': used_weight - 1 / factor,
-                           'final_inflation_factor': factor,
-                            'optimized_2d': False, 'selected_fidelity': '1D', 'two_d_calls': two_d_evaluations[0],
-                            'prior_style': args.prior_style,
-                           'misfit': misfit, 'misfit_threshold': threshold,
-                           'posterior_misfit': posterior_misfit, 'final_iteration_worsened': worsened,
-                           'member_candidates': [int(rank) for rank in ranking], 'solver_failures': [],
-                           'substituted_members': 0,
-                            'observation_mask': obs_mask, 'masked_channels': masked_channels,
-                            'masked_components': masked_udar_components}
-                if escalation_abandoned is not None:
-                    results.update(solver_failures=solver_failures,
-                                   substituted_members=len(solver_failures),
-                                   escalation_abandoned=escalation_abandoned,
-                                   two_d_mode='abandoned')
-            linearized = escalate and args.single_update
+                for record in records:
+                    record['history'] = [record['loss']]
+            engaged = escalate and records is not None
+            if engaged:
+                state = state.copy()
+                for slot, record in enumerate(records):
+                    state[:, member_candidates[slot]] = record['parameters']
+            linearized = engaged and args.single_update
             kind = 'linearized' if linearized else 'forward'
-            results.update(parameter_units='natural_log', prior_projection=args.prior_projection,
-                           prior_units=manifest['prior_units'], posterior_prediction_kind=kind,
-                           posterior_misfit_kind=kind, posterior_forward_verified=not linearized,
+            selected_fidelity = '2D' if engaged else '1D'
+            two_d_mode = ('single-update' if args.single_update else 'lm') if engaged \
+                else ('abandoned' if escalation_abandoned is not None else None)
+            results = {'prior_params': point_prior, 'post_mda_params': post_1d_state.copy(),
+                       'post_1d_params': post_1d_state.copy(),
+                       'posterior_params': [record['parameters'] for record in records],
+                       'posterior_predictions': [record['prediction'] for record in records],
+                       'posterior_losses': [record['loss'] for record in records],
+                       'optimizer_history': [record['history'] for record in records],
+                       'trial_errors': [record['trial_errors'] for record in records],
+                       'observations': observations, 'perturbed_observations': perturbed,
+                       'data_covariance': inflated,
+                       'prior_mean': mean_2d if engaged else mean,
+                       'prior_covariance': covariance_2d if engaged else covariance,
+                       'dims': dims, 'spacing_ft': (dX, dY, dZ), 'shift_ft': dict(current_shift),
+                       'window_movement': movement, 'previous_index': previous_index,
+                       'logging_index': index, 'tools': tool_pairs, 'seed': args.seed,
+                       'mda_weight': used_weight[0],
+                       'lower_fidelity_weight': used_weight[0] - (0. if engaged else 1. / factor),
+                       'final_inflation_factor': factor,
+                       'optimized_2d': engaged, 'selected_fidelity': selected_fidelity,
+                       'two_d_calls': two_d_evaluations[0], 'two_d_mode': two_d_mode,
+                       'prior_style': args.prior_style,
+                       'misfit': misfit, 'misfit_threshold': threshold,
+                       'posterior_misfit': posterior_misfit,
+                       'final_iteration_worsened': worsened,
+                       'member_candidates': member_candidates,
+                       'solver_failures': solver_failures,
+                       'substituted_members': len(solver_failures),
+                       'observation_mask': obs_mask, 'masked_channels': masked_channels,
+                       'masked_components': masked_udar_components}
+            if escalation_abandoned is not None:
+                results['escalation_abandoned'] = escalation_abandoned
+            results.update(unified_domain=True, parameter_units='natural_log',
+                           prior_projection=args.prior_projection,
+                           prior_units=manifest['prior_units'],
+                           posterior_prediction_kind=kind, posterior_misfit_kind=kind,
+                           posterior_forward_verified=not linearized,
                            point_elapsed_seconds=time.monotonic() - point_started)
             results.update(regularization=args.regularization, tv_weight=args.tv_weight,
                            tv_epsilon=args.tv_epsilon, tv_iterations=args.tv_iterations,
                            tv_history=tv_history, prior_projection_effective=projection,
                            tv_strength_applied=sum(entry['strength'] for entry in tv_history),
-                           loss_kind='gaussian_diagnostic' if args.regularization == 'tv' else 'gaussian')
+                           loss_kind='gaussian_diagnostic' if args.regularization == 'tv'
+                           else 'gaussian')
             results['tv_weights_effective'] = manifest['tv_weights_effective']
             if args.regularization == 'tv':
-                shape, spacing = ((nx, nz), (dX, dZ)) if escalate else ((nz,), (dZ,))
-                cells = int(np.prod(shape))
-                results['posterior_tv'] = [tv.value_and_gradient(np.asarray(param)[:cells], shape,
-                                                                spacing, args.tv_epsilon)[0]
-                                            for param in results['posterior_params']]
+                results['posterior_tv'] = [tv.value_and_gradient(np.asarray(param)[:cells],
+                                                                 (nx, nz), (dX, dZ),
+                                                                 args.tv_epsilon)[0]
+                                           for param in results['posterior_params']]
             results['misfit']['after_final_kind'] = kind
             if linearized:
-                results['prior_forward_predictions'] = [record['initial_prediction'] for record in records]
+                results['prior_forward_predictions'] = [record['initial_prediction']
+                                                        for record in records]
                 results['prior_forward_misfit'] = [measurement_misfit(record['initial_prediction'],
-                                                                      observations, Cd) for record in records]
+                                                                      observations, Cd)
+                                                   for record in records]
             with open(f'inversion_results_assim_{index}.pkl', 'xb') as stream:
                 pickle.dump(results, stream)
+            previous = state
             previous_index = index
     finally:
         os.chdir(previous_cwd)

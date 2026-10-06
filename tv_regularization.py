@@ -83,6 +83,17 @@ def regularize_columns(ensemble, strength, dz, epsilon=1e-3, iterations=8):
     return result
 
 
+def regularize_windows(ensemble, nx, nz, strength, dx, dz, epsilon=1e-3, iterations=8):
+    """Regularize each member's full 2D Rh window independently; latent untouched."""
+    result = np.asarray(ensemble, dtype=float).copy()
+    cells = nx * nz
+    if strength:
+        for member in range(result.shape[1]):
+            result[:cells, member] = prox(result[:cells, member].reshape(nx, nz),
+                                          strength, (dx, dz), epsilon, iterations).reshape(cells)
+    return result
+
+
 def linearized_step(parameters, prediction, mean, jacobian, observations, data_covariance,
                     shape, spacing, strength, active_mask, epsilon=1e-3, iterations=6,
                     amplitude_std=np.log(10.), max_step=.5, bounds=(-1., 4.)):

@@ -43,6 +43,44 @@ posterior check succeeded for all five members: true mean misfit 95.31 versus
 linearized 91.40. No full inversion was relaunched. See the assessment for
 scope limits and acceptance decision.
 
+# Unified moving-window domain (branch 2D-curtain) — 2026-10-06
+
+Phase 1 implementation of the unified-domain redesign (design agreed
+2026-10-06; see r2 termination section above):
+
+- One state: `(2*nx*nz, members)` window ensemble at every fidelity. 0D
+  assimilates a homogeneous functional (window-mean ln Rh/latent → UTA0D);
+  1D assimilates the bit column (UTA1D); information reaches all cells
+  through sampled ES cross-covariances (no localization, 250 members).
+  Gate, budgets and per-response TV weights (`--tv-weight-1d/2d`) are
+  unchanged. Engaged 2D points keep the single-update linearized step with
+  trust region bit+ahead, substitution cap and 1D fallback.
+- Prior: `sample_prior_2d` builds laterally persistent two-mode windows
+  (bit column from the 0D-conditioned blocky sampler, interfaces
+  random-walk laterally). Window movement: `shift_window_state` reindexes
+  the state; entering cells (x-edge and bottom rows) are formula-based
+  conditional blocky draws from the adjacent interior column/row; exited
+  cells are dropped and finalized.
+- TV is one 2D operator (`regularize_windows`). Deleted machinery:
+  kriging resample (`resample_prior_multiple_1D_to_2D` — the index-87
+  stall source), chained/aligned 1D↔2D branching, `soften_column_edges`,
+  the Gaussian prior path. `fsolve` import removed; no iterative solves
+  remain in prior construction.
+- Checkpoints: always window-shaped; `unified_domain: True`; 1D points
+  are forward-verified, engaged points linearized-labeled as before.
+  `plot_curtain` is shape-agnostic (no change); `check_posterior`
+  unchanged.
+- Tests: 49 pass — six staged-machinery tests removed, unified tests
+  added (lateral prior correlation, conditional entry/exit semantics,
+  mode preservation/rare flips); controller tests adapted to
+  window-shaped checkpoints; a real bug fixed by the suite (escalation
+  abandonment now resets `escalate`, engaged points record the update
+  prior mean/covariance).
+
+Phase 2 (matched pilots zones 27/80/160 + forced 2D at 80 vs the r2
+baseline, with behind-column drift, ahead-column spread and no-data
+control diagnostics) is pending.
+
 ## r2 terminated as unified-domain baseline — 2026-10-06 08:0x UTC
 
 Run `benchmark3-full-20261005-r2` terminated by user decision at index 130

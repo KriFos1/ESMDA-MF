@@ -171,15 +171,6 @@ def test_las_header_order_and_variance_generation(tmp_path):
     assert len(variances.iloc[1, 0]) == 2
 
 
-def test_conditioning_respects_actual_columns(monkeypatch):
-    monkeypatch.setattr(sequential, 'dims', (4, 5, 3))
-    columns = [np.full((6, 2), .5), np.full((6, 2), 1.5)]
-    previous = np.zeros((2, 24))
-    ensemble, covariance, _ = sequential.resample_prior_multiple_1D_to_2D(2, columns, [1, 3], previous)
-    fields = ensemble.reshape(2, 4, 3, 2)
-    np.testing.assert_array_equal(fields[:, 1], .5)
-    np.testing.assert_array_equal(fields[:, 3], 1.5)
-    assert covariance.shape == (24, 24)
 
 
 def test_lm_updates_prediction_and_preserves_accepted_result_after_failure():
@@ -326,7 +317,7 @@ def test_controller_abandons_2d_after_substitution_cap_and_falls_back_to_1d(
         assert result['substituted_members'] == 3
         assert result['escalation_abandoned'].startswith('Initial evaluation failed twice')
         assert len(result['solver_failures']) == 3
-        assert np.shape(result['posterior_params']) == (2, 8)
+        assert np.shape(result['posterior_params']) == (2, 24)
         assert result['two_d_calls'] > 0
         assert result['posterior_prediction_kind'] == 'forward'
 
@@ -466,21 +457,6 @@ def test_optimize_members_substitutes_failed_initial_member():
                          evaluate_multi, update, loss, max_iterations=1, substitute=None)
 
 
-def test_prior_spread_scales_residual_and_covariance(monkeypatch):
-    monkeypatch.setattr(sequential, 'dims', (4, 5, 3))
-    columns = [np.full((6, 2), .5), np.full((6, 2), 1.5)]
-    previous = np.zeros((2, 24))
-    wide, cov_wide, _ = sequential.resample_prior_multiple_1D_to_2D(2, columns, [1, 3], previous)
-    tight, cov_tight, _ = sequential.resample_prior_multiple_1D_to_2D(
-        2, columns, [1, 3], previous, posterior_spread=(1e-6, 1e-6))
-    fields_wide = wide.reshape(2, 4, 3, 2)
-    fields_tight = tight.reshape(2, 4, 3, 2)
-    np.testing.assert_allclose(fields_wide[:, 1], .5)
-    np.testing.assert_allclose(fields_tight[:, 1], .5)
-    spread_wide = fields_wide[:, 2].std(axis=-1).mean()
-    spread_tight = fields_tight[:, 2].std(axis=-1).mean()
-    assert 0. < spread_tight < spread_wide
-    assert np.trace(cov_tight) < np.trace(cov_wide)
 
 
 def test_run_grad_multi_maps_worker_failures_to_none_jacobians(monkeypatch):
@@ -645,18 +621,6 @@ def test_prior_cli_conversion_preserves_physical_levels_and_width():
             sequential.parse_args(['--output-dir', 'unused', flag, 'nan'])
 
 
-def test_projection_toggle_keeps_identical_chaining_draws(monkeypatch):
-    monkeypatch.setattr(sequential, 'dims', (3, 5, 4))
-    bg, res = np.log([1.5, 30.])
-    width = np.log(10) * .1
-    trend = np.r_[np.full(4, res + 2.), np.zeros(4)][:, None]
-    np.random.seed(21)
-    on, _, _ = sequential.sample_chained_prior_1D(10, trend, bg, res, width, .15, 0., True)
-    np.random.seed(21)
-    off, _, _ = sequential.sample_chained_prior_1D(10, trend, bg, res, width, .15, 0., False)
-    np.testing.assert_array_equal(on[4:], off[4:])
-    assert np.all(on[:4] <= res + 2 * width)
-    assert np.all(off[:4] > res + 2 * width)
 
 
 def test_plot_labels_old_single_update_as_linearized():
@@ -753,39 +717,8 @@ def test_shift_posterior_1d_tracks_and_extends_edges():
     assert fields[0, 0, 2] == 7.
 
 
-def test_chained_prior_preserves_trend_and_switches(monkeypatch):
-    monkeypatch.setattr(sequential, 'dims', (15, 5, 20))
-    np.random.seed(3)
-    nz = 20
-    background, reservoir, mode_std, fraction, switch_prob = 0.18, 1.46, 0.10, 0.15, 0.05
-    trend = np.zeros((2 * nz, 2))
-    trend[:nz, 0] = background
-    trend[:nz, 1] = reservoir
-    trend[nz:] = 0.1
-    ensemble, covariance, mean = sequential.sample_chained_prior_1D(
-        50, trend, background, reservoir, mode_std, fraction, switch_prob)
-    rh = ensemble[:nz]
-    midpoint = 0.5 * (background + reservoir)
-    kept = rh[:, :50]  # members 0..49 cycle trends 0,1
-    member0 = rh[:, 0::2][:, :25]
-    flips0 = (member0 > midpoint).mean()
-    flips1 = (rh[:, 1::2][:, :25] < midpoint).mean()
-    assert flips0 < 0.2 and flips1 < 0.2
-    background_members = rh[:, 0::2].ravel()
-    assert np.abs(background_members[background_members < midpoint].mean() - background) < 0.05
-    latent = ensemble[nz:]
-    assert abs(latent.mean() - 0.1) < 0.05
-    assert covariance.shape == (2 * nz, 2 * nz)
 
 
-def test_soften_column_edges_ramps_blocky_steps():
-    nz = 6
-    column = np.concatenate([np.full(3, 0.18), np.full(3, 1.46), np.full(nz, 0.25)])
-    softened = sequential.soften_column_edges(column, nz)
-    jumps = np.abs(np.diff(softened[:nz]))
-    assert jumps.max() < (1.46 - 0.18) / 2 + 1e-12
-    assert np.allclose(softened[nz:], column[nz:])
-    np.testing.assert_allclose(softened[:nz], [0.18, 0.18, 0.5, 1.14, 1.46, 1.46])
 
 
 def test_project_to_modes_anchors_deviations():
@@ -857,10 +790,11 @@ def test_three_point_controller_carries_window_and_checkpoints(tmp_path, monkeyp
                      '--nx', '3', '--nz', '4', '--ensemble-size', '4', '--opt-members', '2',
                      '--max-iterations', '0'] + (['--force-2d'] if force_2d else []))
     assert Path.cwd() == cwd
-    expected_params = 2 * (3 * 4 if force_2d else 4)
+    expected_params = 2 * 3 * 4
     for index in range(3):
         result = pd.read_pickle(output / f'inversion_results_assim_{index}.pkl')
         assert np.shape(result['posterior_params']) == (2, expected_params)
+        assert result['unified_domain'] is True
         assert result['previous_index'] == (index - 1 if index else None)
         assert result['window_movement'] == ((1, 1) if index else (0, 0))
         assert result['optimized_2d'] == force_2d
@@ -937,7 +871,7 @@ def test_adaptive_gate_skips_2d_and_runs_final_1d_update(tmp_path, monkeypatch, 
             assert result['misfit']['before_final'] <= result['misfit_threshold']
             assert np.isfinite(result['misfit']['after_final'])
             assert result['final_iteration_worsened'] in (True, False)
-            assert np.shape(result['posterior_params']) == (2, 8)
+            assert np.shape(result['posterior_params']) == (2, 24)
         else:
             assert result['selected_fidelity'] == '2D'
             assert result['optimized_2d'] is True
@@ -968,28 +902,3 @@ def test_worsened_final_iteration_is_reported_not_reverted(tmp_path, monkeypatch
     assert result['final_iteration_worsened'] is True
     assert result['misfit']['after_final'] > result['misfit']['before_final']
     assert result['mda_weight'] == pytest.approx(1.)
-
-
-def test_cold_start_2d_prior_after_1d_only_point(tmp_path, monkeypatch, controller_environment):
-    base, benchmark = controller_environment
-
-    def fake_pred(param, index, simfidelity='2D'):
-        return np.ones(8) if index == 0 else np.ones(8) * 5
-
-    def fake_grad_multi(param_list, index):
-        return [(np.ones(8), np.zeros((8, len(param)))) for param in param_list]
-
-    monkeypatch.setattr(sequential, 'simulate_pred_only', fake_pred)
-    monkeypatch.setattr(sequential, 'simulate_and_grad_multi', fake_grad_multi)
-    output = tmp_path / 'run'
-    sequential.main(['--benchmark', str(benchmark), '--data', str(tmp_path / 'data.pkl'),
-                     '--variance', str(tmp_path / 'var.pkl'), '--output-dir', str(output),
-                     '--nx', '3', '--nz', '4', '--ensemble-size', '4', '--opt-members', '2',
-                     '--max-iterations', '0'])
-    first = pd.read_pickle(output / 'inversion_results_assim_0.pkl')
-    second = pd.read_pickle(output / 'inversion_results_assim_1.pkl')
-    assert first['selected_fidelity'] == '1D'
-    assert second['selected_fidelity'] == '2D'
-    assert second['prior_params'] is not None
-    assert second['prior_params'].shape == (24, 2)
-    assert second['previous_index'] == 0
