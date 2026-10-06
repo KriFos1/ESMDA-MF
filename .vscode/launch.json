@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run DA Sequential",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_DA_sequential.py",
+            "python": "${workspaceFolder}/../Dashboard/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--sim-backend",
+                "node",
+                "--host",
+                "Jupiter2",
+                "--workers",
+                "8"
+            ]
+        }
+    ]
+}

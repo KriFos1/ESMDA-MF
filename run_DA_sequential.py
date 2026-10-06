@@ -1,1422 +1,846 @@
-"""
-Combine ESMDA with a gradient based optimizaiton method.
-1. Do N_MDA - 1 ESMDA iterations
-2. Do gradient based optimization for each ensemble member for the last MDA "iteration"
-"""
+"""Sequential 0D/1D ES-MDA and local-window 2D gradient inversion."""
 
-import numpy as np
-from EMsim.EM import UTA2D
-from EMsim.EM import UTA0D
-from EMsim.EM import UTA1D
-import os
-from scipy.stats import norm
-import copy
-import h5py
 import argparse
-from ThreeDGiGEarth.common import h5_to_dict
-import pandas as pd
 import ast
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
 import pickle
-import matplotlib.pyplot as plt
-from pipt.update_schemes.update_methods_ns.approx_update import approx_update
-from pipt.misc_tools.cov_regularization import localization
+import time
 
-## setup the model
-for folder in os.listdir('.'):
-    if folder.startswith('En_') and os.path.isdir(folder):
-        import shutil
-        shutil.rmtree(folder)
+import h5py
+import numpy as np
+import pandas as pd
+from scipy.optimize import fsolve
+from scipy.stats import norm
+
+from esmda_core import (LOG_RH_LIMITS, LocalWindow, MemberEvaluationError, clamp_log_rh,
+                        measurement_misfit, noise_floor_mask, observation_vectors,
+                        optimizer_jacobian, optimize_members, project_to_modes,
+                        shift_posterior, shift_posterior_1d, update_members_once)
+from esmda_remote2d import UDAR_COMPONENTS, SimBackendConfig, make_remote2d
+import tv_regularization as tv
 
 meter_to_feet = 3.28084
-
-dims = (15,3,20) # number of cells in each direction (x,y,z)
-dims = (15,3,20) # number of cells in each direction (x,y,z)
-cell_thickness_ft = 5  # meters to feet
-dX = cell_thickness_ft * (1)
-dY = cell_thickness_ft * 1 * 4
-dZ = cell_thickness_ft * (1)
-
-# observed_data_order_udar = [
-#         'USDP', 'USDA',
-#         'UADP', 'UADA',
-#         'UHRP', 'UHRA',
-#         'UHAP', 'UHAA'
-#     ]
-# selected_data = ['USDP', 'USDA', 'UADP', 'UADA','UHRP', 'UHRA','UHAP', 'UHAA']
-# #selected_data = ['USDA', 'UADA'] 
-# selected_data_indices = [observed_data_order_udar.index(data) for data in selected_data]
-
-observed_data_order_bfield = ['real(Bxx)', 'real(Bxy)', 'real(Bxz)',
-                            'real(Byx)', 'real(Byy)', 'real(Byz)',
-                            'real(Bzx)', 'real(Bzy)', 'real(Bzz)',
-                            'img(Bxx)', 'img(Bxy)', 'img(Bxz)',
-                            'img(Byx)', 'img(Byy)', 'img(Byz)',
-                            'img(Bzx)', 'img(Bzy)', 'img(Bzz)']
-
-observed_data_order_0D_bfield = ['real(Bxx)','img(Bxx)',
-                                'real(Byy)','img(Byy)',
-                                'real(Bzz)','img(Bzz)',
-                                'real(Bxz)','img(Bxz)',
-                                'real(Bzx)','img(Bzx)']
-
-selected_data = ['real(Bxx)',
-                # 'real(Bxy)',
-                 'real(Bxz)',
-                #'real(Byx)', 'real(Byy)', 'real(Byz)',
-                'real(Bzx)', 
-                #'real(Bzy)',
-                'real(Bzz)',
-                'img(Bxx)',
-                #'img(Bxy)',
-                'img(Bxz)',
-                #'img(Byx)', 'img(Byy)', 'img(Byz)',
-                'img(Bzx)',
-                #'img(Bzy)',
-                'img(Bzz)']
-selected_data_indices = [observed_data_order_bfield.index(data) for data in selected_data]
-selected_data_indices_0D = [observed_data_order_0D_bfield.index(data) for data in selected_data if data in observed_data_order_0D_bfield]
-selected_data_indices_1D = selected_data_indices_0D
-
-min_ratio, max_ratio = 1, 5 # Bounds for the anisotropy ratio
-
-tools = ["('6kHz','83ft')","('12kHz','83ft')","('24kHz','83ft')",
-         "('24kHz','43ft')","('48kHz','43ft')","('96kHz','43ft')"]
-
-#tools = ["('24kHz','83ft')"] #, "('96kHz','43ft')"]
-
-#tools = ["('6kHz','83ft')","('12kHz','83ft')",
-#         "('24kHz','43ft')","('48kHz','43ft')"]
-
-#tools = ["('12kHz','83ft')","('24kHz','83ft')",
-#        "('96kHz','43ft')"]
-
-#tools = ["('96kHz','43ft')"] #
-
-def setup_simulators(reference_model_path, data_type):
-    """
-    Set up the UTA0D, UTA1D, and UTA2D simulators with the given reference model path and data type.
-    """
-    global UTA0D_sim, UTA1D_sim, UTA2D_sim, TVD, MD, WX, WY, wellpath
-
-    UTA_input_dict = {'toolflag': 0,
-                'datasign': 3 if data_type == 'UDAR' else 0,
-                'anisoflag': 1,
-                'toolsetting': f'{reference_model_path}/ascii/tool.inp',
-                'trajectory': f'{reference_model_path}/ascii/trajectory.DAT',
-                'reference_model': f'{reference_model_path}/globalmodel.h5',
-                'parallel': 1,
-                'map':{'ratio': [1,3]},
-            }
-
-    with h5py.File(UTA_input_dict['reference_model'], "r") as f:
-        ref_model = h5_to_dict(f)
-
-    wellpath = ref_model['wellpath']
-    TVD = wellpath['Z'][:,0] * meter_to_feet  # in feet
-    MD = wellpath['Distance'][:,0] * meter_to_feet  # in feet
-    WX = wellpath['X'][:,0] * meter_to_feet  # in feet
-    WY = wellpath['Y'][:,0] * meter_to_feet  # in feet
-
-    sim_info = {
-    'obsname': 'tvd',
-    'assimindex': [[0]],
-    'datatype': tools
-    }
-
-    # Setup UTA0D simulator
-    UTA0D_input = {key: UTA_input_dict[key] for key in ['toolflag', 'datasign', 'anisoflag', 'reference_model', 'map',
-                                                        'toolsetting']}
-    UTA0D_sim = UTA0D({**UTA0D_input, **sim_info})
-    UTA0D_sim.setup_fwd_run(redund_sim=None)
-
-    # Setup UTA1D simulator
-    initial_surface_depth = [TVD[0] - 0.5 * dims[2] * dZ + i * dZ for i in range(dims[2])]
-    UTA1D_input = {key: UTA_input_dict[key] for key in ['toolflag', 'datasign', 'anisoflag', 'reference_model', 'map',
-                                                        'toolsetting', 'trajectory']}
-    UTA1D_input['surface_depth'] = initial_surface_depth
-    UTA1D_sim = UTA1D({**UTA1D_input, **sim_info})
-    UTA1D_sim.setup_fwd_run(redund_sim=None)
-
-    # Setup UTA2D simulator
-    UTA2D_input = {key: UTA_input_dict[key] for key in ['toolflag', 'datasign', 'anisoflag','reference_model','map',
-                                                        'toolsetting']}
-    UTA2D_input['dims'] = dims
-    UTA2D_input['dX'] = dX
-    UTA2D_input['dY'] = dY
-    UTA2D_input['dZ'] = dZ
-    UTA2D_input['shift'] = {'x':0,
-                            'y':0,
-                            'z':0}
-    UTA2D_input['jacobian'] = True
-
-    UTA2D_sim = UTA2D({**UTA2D_input, **sim_info},{'jacobi': True})
-    UTA2D_sim.setup_fwd_run(redund_sim=None)
-
-def sample_prior_0D(ne):
-    #sample the 0D prior, that is a univariate Gaussian for log-resistivity and a standard normal for the anisotropy ratio latent variable, without correlation
-    # Create 2x2 diagonal covariance matrix for [log_rh, ratio_latent]
-    normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
-    C_theta = np.diag([normal_rh_std**2, ratio_latent_std**2])
-
-    normal_rh_samples = np.random.normal(loc=normal_rh_mean, scale=normal_rh_std, size=(ne,))
-    ratio_latent_samples = np.random.normal(loc=ratio_latent_mean, scale=ratio_latent_std, size=(ne,))
-    
-    # Stack samples: shape (2, ne)
-    samples = np.vstack([normal_rh_samples, ratio_latent_samples])
-    
-    mean_theta = np.array([normal_rh_mean, ratio_latent_mean])
-
-    return samples, C_theta, mean_theta
-
-def normal_std_from_lognormal_std(sigma_X, mu):
-    """
-    Calculate the standard deviation of the normal distribution
-    associated with a given log-normal standard deviation.
-
-    Parameters:
-    - sigma_X: Standard deviation of the log-normal distribution
-    - mu: Mean of the normal distribution
-
-    Returns:
-    - sigma: Standard deviation of the normal distribution
-    """
-
-    # Initial guess for sigma
-    sigma_guess = 1.0  # Starting guess
-
-    # Function to compute the difference we want to be 0
-    def equation(sigma):
-        return np.sqrt((np.exp(sigma ** 2) - 1) * np.exp(2 * mu + sigma ** 2)) - sigma_X
-
-    # Find the standard deviation of the normal distribution
-    from scipy.optimize import fsolve
-    sigma_solution = fsolve(equation, sigma_guess)[0]
-
-    return sigma_solution
-
-def find_std_keeping_variance_fixed(new_rh_mean, normal_rh_mean_target, normal_rh_std_target):
-    # Known values
-
-    # Calculate target variance for log_normal distribution
-    target_variance = (np.exp(normal_rh_std_target ** 2) - 1) * np.exp(2 * normal_rh_mean_target + normal_rh_std_target ** 2)
-
-    def equation_to_solve(log_rh_std):
-        return (np.exp(log_rh_std ** 2) - 1) * np.exp(2 * new_rh_mean + log_rh_std ** 2) - target_variance
-
-    log_normal_rh_std_initial_guess = 1.0
-    log_normal_rh_std_solution = np.nan
-
-    try:
-        from scipy.optimize import fsolve
-        log_normal_rh_std_solution = fsolve(equation_to_solve, log_normal_rh_std_initial_guess)[0]
-    except Exception as e:
-        print(f"Could not find solution: {e}")
-
-    return log_normal_rh_std_solution
-
-def compute_log_normal_params(mu, sigma):
-    """
-    Compute log-normal distribution parameters based on normal distribution parameters.
-
-    Parameters:
-    - mu: Mean of the normal distribution
-    - sigma: Standard deviation of the normal distribution
-
-    Returns:
-    - mean_X, std_dev_X: Mean and standard deviation of the log-normal distribution
-    """
-    # Mean of the log-normal distribution
-    mean_X = np.exp(mu + (sigma ** 2) / 2)
-
-    # Variance of the log-normal distribution
-    variance_X = (np.exp(sigma ** 2) - 1) * np.exp(2 * mu + sigma ** 2)
-
-    # Standard deviation of the log-normal distribution
-    std_dev_X = np.sqrt(variance_X)
-
-    return mean_X, std_dev_X
-
-def resample_prior_0D_to_1D(ne, param_vec_0D):
-    """Resample a 0D ensemble into vertically correlated 1D columns."""
-    from geostat.decomp import Cholesky
-
-    param_vec_0D = np.asarray(param_vec_0D, dtype=float)
-    if param_vec_0D.shape != (2, ne):
-        raise ValueError(
-            f"Expected param_vec_0D with shape (2, {ne}), got {param_vec_0D.shape}"
-        )
-
-    geostat = Cholesky()
-    nz = dims[2]
-    center_idx = nz // 2
-
-    column_height_ft = nz * dZ
-    var_range_m = column_height_ft / meter_to_feet
-    var_range_ft = var_range_m * meter_to_feet
-    var_range_cells = max(1, int(np.ceil(var_range_ft / dZ)))
-
-    param_vec_1D = np.empty((2 * nz, ne), dtype=float)
-    cov_blocks = []
-    mean_blocks = []
-
-    normal_rh_mean_0D = float(np.mean(param_vec_0D[0]))
-    normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean_0D)
-    oneD_std = [normal_rh_std, ratio_latent_std]  # Standard deviations for the 1D fields, can be tuned
-
-    for param_idx in range(2):
-        stationary_mean = float(np.mean(param_vec_0D[param_idx]))
-        stationary_std = float(oneD_std[param_idx])
-        mean_vec = np.full(nz, stationary_mean, dtype=float)
-        mean_blocks.append(mean_vec)
-
-        if stationary_std <= np.finfo(float).eps:
-            cov = np.eye(nz, dtype=float) * np.finfo(float).eps
-            conditioned_samples = np.tile(mean_vec[:, np.newaxis], (1, ne))
-            conditioned_samples[center_idx, :] = param_vec_0D[param_idx, :]
-        else:
-            cov = geostat.gen_cov2d(
-                nz, 1, stationary_std**2, var_range_cells, 1, 0, 'exp'
-            )
-            unconditional_samples = geostat.gen_real(mean_vec, cov, ne).reshape(nz, ne, order='C')
-            kriging_weights = cov[:, center_idx] / cov[center_idx, center_idx]
-            conditioning_residual = param_vec_0D[param_idx, :] - unconditional_samples[center_idx, :]
-            conditioned_samples = unconditional_samples + kriging_weights[:, np.newaxis] * conditioning_residual[np.newaxis, :]
-            conditioned_samples[center_idx, :] = param_vec_0D[param_idx, :]
-
-        start = param_idx * nz
-        stop = start + nz
-        param_vec_1D[start:stop, :] = conditioned_samples
-        cov_blocks.append(cov)
-
-    C_theta_1D = np.block([
-        [cov_blocks[0], np.zeros_like(cov_blocks[0])],
-        [np.zeros_like(cov_blocks[1]), cov_blocks[1]],
-    ])
-    mean_theta_1D = np.concatenate(mean_blocks)
-
-    return param_vec_1D, C_theta_1D, mean_theta_1D
-
-def resample_prior_multiple_1D_to_2D(ne, param_vec_1D_list, param_1D_columns):
-    """Resample a 1D ensemble into 2D fields conditioned on the central column."""
-    from geostat.decomp import Cholesky
-
-    #param_vec_1D = np.asarray(param_vec_1D, dtype=float)
-    nz = dims[2]
-    nx = dims[0]
-    n_params_per_type = nx * nz
-
-    geostat = Cholesky()
-
-    var_range_m = 5.0
-    var_range_ft = var_range_m * meter_to_feet
-    var_range_cells = max(1, int(np.floor(var_range_ft / dX)))
-    vertical_aspect = (4 * dZ) / dX
-
-    #normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
-    #twoD_std = [normal_rh_std, ratio_latent_std]  # Standard deviations for the 1D fields, can be tuned
-
-
-    #center_x_idx = nx // 2
-    #conditioning_indices = center_x_idx * nz + np.arange(nz)
-
-    param_vec_2D = np.empty((2 * n_params_per_type, ne), dtype=float)
-    cov_blocks = []
-    mean_blocks = []
-
-    for param_idx in range(2):
-        mean_vec = np.zeros(nz*nx)
-        memberwise_trend = np.zeros([nz*nx,ne])
-        all_conditioning_indices = []
-        all_conditioning_columns = []
-        for column_idx_no, column_idx in enumerate(param_1D_columns):
-            param_vec_1D = param_vec_1D_list[column_idx_no]
-            conditioning_indices = column_idx * nz + np.arange(nz)
-            if param_vec_1D.shape != (2 * nz, ne):
-                raise ValueError(
-                    f"Expected param_vec_1D with shape ({2 * nz}, {ne}), got {param_vec_1D.shape}"
-                )
-            conditioning_column = param_vec_1D[param_idx * nz:(param_idx + 1) * nz, :]
-            mean_profile = np.mean(conditioning_column, axis=1)
-            if column_idx_no == 0:
-                mean_vec = np.tile(mean_profile, nx)
-                memberwise_trend = np.tile(conditioning_column, (nx, 1))
-            mean_vec[conditioning_indices] = mean_profile
-            memberwise_trend[conditioning_indices, :] = conditioning_column
-            if column_idx_no == len(param_1D_columns):
-                mean_vec[column_idx * nz : nx * nz] = np.tile(mean_profile, nx-column_idx)
-                memberwise_trend[column_idx * nz : nx * nz, :] = np.tile(conditioning_column, (nx-column_idx, 1))
-            all_conditioning_indices.append(conditioning_indices)
-            all_conditioning_columns.append(conditioning_column)
-        all_conditioning_indices = np.concatenate(all_conditioning_indices, axis=0)
-        all_conditioning_columns = np.concatenate(all_conditioning_columns, axis=0)
-        if param_idx == 0:
-            #TODO, implement a maximum value for rh
-            normal_rh_mean_1D = min(3,np.max(mean_vec))
-            normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean_1D)
-        twoD_std = [normal_rh_std, ratio_latent_std]  # Standard deviations for the 1D fields, can be tuned
-        #stationary_std = float(twoD_std[param_idx])
-        stationary_std = float(twoD_std[param_idx])
-        # Keep the prior mean as the ensemble-average 1D trend, but generate
-        # each 2D realization around its own 1D column so the full center
-        # column imprint propagates more uniformly across x.
-        #mean_vec = np.tile(mean_profile, nx)
-        mean_blocks.append(mean_vec)
-        #memberwise_trend = np.tile(conditioning_column, (nx, 1))
-
-        if stationary_std <= np.finfo(float).eps:
-            cov = np.eye(n_params_per_type, dtype=float) * np.finfo(float).eps
-            conditioned_residuals = np.zeros((n_params_per_type, ne), dtype=float)
-        else:
-            cov = geostat.gen_cov2d(
-                nx, nz, stationary_std**2, var_range_cells, vertical_aspect, 0, 'exp'
-            )
-            unconditional_residuals = geostat.gen_real(
-                np.zeros(n_params_per_type, dtype=float), cov, ne
-            ).reshape(
-                n_params_per_type, ne, order='C'
-            )
-
-            C_dd = cov[np.ix_(all_conditioning_indices, all_conditioning_indices)]
-            C_dd = C_dd + np.eye(C_dd.shape[0], dtype=float) * np.finfo(float).eps
-            C_xd = cov[:, all_conditioning_indices]
-            conditioning_residual = -unconditional_residuals[all_conditioning_indices, :]
-
-            try:
-                kriging_weights = np.linalg.solve(C_dd, conditioning_residual)
-            except np.linalg.LinAlgError:
-                kriging_weights = np.linalg.pinv(C_dd) @ conditioning_residual
-
-            conditioned_residuals = unconditional_residuals + C_xd @ kriging_weights
-            conditioned_residuals[all_conditioning_indices, :] = 0.0
-
-        conditioned_samples = memberwise_trend + conditioned_residuals
-        conditioned_samples[all_conditioning_indices, :] = all_conditioning_columns
-
-        start = param_idx * n_params_per_type
-        stop = start + n_params_per_type
-        param_vec_2D[start:stop, :] = conditioned_samples
-        cov_blocks.append(cov)
-
-    C_theta_2D = np.block([[cov_blocks[0], np.zeros_like(cov_blocks[0])],
-        [np.zeros_like(cov_blocks[1]), cov_blocks[1]],])
-    mean_theta_2D = np.concatenate(mean_blocks)
-
-    return param_vec_2D, C_theta_2D, mean_theta_2D
-
-def resample_prior_multiple_1D_to_2D_including_prev_2D(ne, param_vec_1D_list, param_1D_columns, post_param= None):
-    """Resample a 1D ensemble into 2D fields conditioned on the central column."""
-    from geostat.decomp import Cholesky
-
-    #param_vec_1D = np.asarray(param_vec_1D, dtype=float)
-    nz = dims[2]
-    nx = dims[0]
-    n_params_per_type = nx * nz
-
-    geostat = Cholesky()
-
-    var_range_m = 5.0
-    var_range_ft = var_range_m * meter_to_feet
-    var_range_cells = max(1, int(np.floor(var_range_ft / dX)))
-    vertical_aspect = (4 * dZ) / dX
-
-    #center_x_idx = nx // 2
-    #conditioning_indices = center_x_idx * nz + np.arange(nz)
-
-    param_vec_2D = np.empty((2 * n_params_per_type, opt_NE), dtype=float)
-    cov_blocks = []
-    mean_blocks = []
-
-    for param_idx in range(2):
-        mean_vec = np.zeros(nz*nx)
-        memberwise_trend = np.zeros([nz*nx,opt_NE])
-        all_conditioning_indices = []
-        all_conditioning_columns = []
-        for column_idx_no, column_idx in enumerate(param_1D_columns):
-            param_vec_1D = param_vec_1D_list[column_idx_no]
-            conditioning_indices = column_idx_no * nz + np.arange(nz)
-            if param_vec_1D.shape != (2 * nz, opt_NE):
-                raise ValueError(
-                    f"Expected param_vec_1D with shape ({2 * nz}, {opt_NE}), got {param_vec_1D.shape}"
-                )
-            conditioning_column = param_vec_1D[param_idx * nz:(param_idx + 1) * nz, :]
-            mean_profile = np.mean(conditioning_column, axis=1)
-            if column_idx_no == 0:
-                if post_param is None:
-                    mean_vec = np.tile(mean_profile, nx)
-                    memberwise_trend = np.tile(conditioning_column, (nx, 1))
-                else:
-                    reshaped_idx =np.array([])
-                    for post_param_one_ens_member in post_param: # initialize with previous 2D results
-                        # implement this shift of the 2D estimate at previous logging point only if inversion grid is moved
-                        reshaped_org = post_param_one_ens_member.reshape(2, dims[0] * dims[2])
-                        if not keep_inversion_lim_x:
-                            reshaped = np.concatenate((reshaped_org[:, nz:], reshaped_org[:, -nz:]), axis=1)
-                        else:
-                            reshaped = reshaped_org
-
-                        if not keep_inversion_lim_z:
-                            arr = reshaped.reshape(2, nx, nz)
-                            # build new array where for each indx we drop indz=0 and append a copy of indz=nz-1
-                            # result has same shape (2, nx, nz)
-                            new_arr = np.empty_like(arr)
-                            # take original indz 1..nz-1
-                            new_arr[:, :, : nz - 1] = arr[:, :, 1: nz]
-                            # duplicate original indz = nz-1 into last position
-                            new_arr[:, :, nz - 1] = arr[:, :, nz - 1]
-
-                            # flatten back to original 2D layout if needed
-                            reshaped = new_arr.reshape(2, nx * nz)
-
-
-                        if reshaped_idx.size == 0:
-                            reshaped_idx = reshaped[param_idx, :].reshape(-1, 1)
-                        else:
-                            reshaped_idx = np.concatenate((reshaped_idx, reshaped[param_idx, :].reshape(-1, 1)), axis=1)
-                    mean_vec = np.mean(reshaped_idx, axis=1)
-                    memberwise_trend = reshaped_idx
-            mean_vec[conditioning_indices] = mean_profile
-            memberwise_trend[conditioning_indices, :] = conditioning_column[:,:]
-            #if column_idx_no == len(param_1D_columns): # is also entries after logging point populated by 1D results?
-            #    mean_vec[column_idx * nz : nx * nz] = np.tile(mean_profile, nx-column_idx)
-            #    memberwise_trend[column_idx * nz : nx * nz, :] = np.tile(conditioning_column[:,best_members_indices], (nx-column_idx, 1))
-            all_conditioning_indices.append(conditioning_indices)
-            all_conditioning_columns.append(conditioning_column)
-        all_conditioning_columns = np.concatenate(all_conditioning_columns, axis=0)
-        all_conditioning_indices = np.concatenate(all_conditioning_indices, axis=0)
-
-        if param_idx == 0:
-            normal_rh_mean_1D = min(3,np.max(mean_vec))
-            normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean_1D)
-        twoD_std = [normal_rh_std, ratio_latent_std]  # Standard deviations for the 1D fields, can be tuned
-        stationary_std = float(twoD_std[param_idx])
-        # Keep the prior mean as the ensemble-average 1D trend, but generate
-        # each 2D realization around its own 1D column so the full center
-        # column imprint propagates more uniformly across x.
-        #mean_vec = np.tile(mean_profile, nx)
-        mean_blocks.append(mean_vec)
-        #memberwise_trend = np.tile(conditioning_column, (nx, 1))
-
-        if stationary_std <= np.finfo(float).eps:
-            cov = np.eye(n_params_per_type, dtype=float) * np.finfo(float).eps
-            conditioned_residuals = np.zeros((n_params_per_type, opt_NE), dtype=float)
-        else:
-            cov = geostat.gen_cov2d(
-                nx, nz, stationary_std**2, var_range_cells, vertical_aspect, 0, 'exp'
-            )
-            unconditional_residuals = geostat.gen_real(
-                np.zeros(n_params_per_type, dtype=float), cov, opt_NE
-            ).reshape(
-                n_params_per_type, opt_NE, order='C'
-            )
-
-            C_dd = cov[np.ix_(all_conditioning_indices, all_conditioning_indices)]
-            C_dd = C_dd + np.eye(C_dd.shape[0], dtype=float) * np.finfo(float).eps
-            C_xd = cov[:, all_conditioning_indices]
-            conditioning_residual = -unconditional_residuals[all_conditioning_indices, :]
-
-            try:
-                kriging_weights = np.linalg.solve(C_dd, conditioning_residual)
-            except np.linalg.LinAlgError:
-                kriging_weights = np.linalg.pinv(C_dd) @ conditioning_residual
-
-            conditioned_residuals = unconditional_residuals + C_xd @ kriging_weights
-            conditioned_residuals[all_conditioning_indices, :] = 0.0
-
-        #conditioned_residuals[:nz * (nx //2), :] = 0.0 # do not impose param uncertainty behind logging point
-        conditioned_samples = memberwise_trend + conditioned_residuals[:, :]
-        conditioned_samples[all_conditioning_indices, :] = all_conditioning_columns[:, :]
-
-        start = param_idx * n_params_per_type
-        stop = start + n_params_per_type
-        param_vec_2D[start:stop, :] = conditioned_samples
-        cov_blocks.append(cov)
-
-    C_theta_2D = np.block([[cov_blocks[0], np.zeros_like(cov_blocks[0])],
-        [np.zeros_like(cov_blocks[1]), cov_blocks[1]],])
-    mean_theta_2D = np.concatenate(mean_blocks)
-
-    return param_vec_2D, C_theta_2D, mean_theta_2D
-
-def vertical_spacing_log_points(logging_point_idx):
-    dtvd = TVD[logging_point_idx]-TVD[logging_point_idx-assim_step_integer]
-    return dtvd
-
-def horizontal_spacing_log_points(logging_point_idx):
-    dwx = WX[logging_point_idx] -WX[logging_point_idx-assim_step_integer]
-    return dwx
-
-def _no_logging_points_per_grid_cell(d_cell, d_logg):
-    no_log_points_per_cell = np.ceil(d_cell / d_logg)
-    return no_log_points_per_cell
-
-def logging_point_vs_inversion_domain():
-
-    if el == 0:
-        keep_inversion_lim_z = False
-        keep_inversion_lim_x = False
-    else:
-        # check if the logging point reach a new grid cell;
-        dtvd = vertical_spacing_log_points(assim_index[0])
-        no_log_points_per_cell_z = _no_logging_points_per_grid_cell(dZ, dtvd)
-        dwx = horizontal_spacing_log_points(assim_index[0])
-        no_log_points_per_cell_x = _no_logging_points_per_grid_cell(dX, dwx)
-        if el <= no_log_points_per_cell_z // 2:
-            keep_inversion_lim_z = True
-        elif (el + no_log_points_per_cell_z // 2) % no_log_points_per_cell_z == 0:
-            keep_inversion_lim_z = False
-            print(f'shift inversion domain in z after {no_log_points_per_cell_z} logging points')
-        else:
-            keep_inversion_lim_z = True
-        if el <= no_log_points_per_cell_x // 2:
-            keep_inversion_lim_x = True
-        elif (el + no_log_points_per_cell_x // 2) % no_log_points_per_cell_x == 0:
-            keep_inversion_lim_x = False
-            print(f'shift inversion domain in x after {no_log_points_per_cell_x} logging points')
-        else:
-            keep_inversion_lim_x = True
-
-    return keep_inversion_lim_z, keep_inversion_lim_x
-
-def resample_prior_1D_to_2D(ne, param_vec_1D):
-    """Resample a 1D ensemble into 2D fields conditioned on the central column."""
-    from geostat.decomp import Cholesky
-
-    param_vec_1D = np.asarray(param_vec_1D, dtype=float)
-    nz = dims[2]
-    nx = dims[0]
-    n_params_per_type = nx * nz
-
-    if param_vec_1D.shape != (2 * nz, ne):
-        raise ValueError(
-            f"Expected param_vec_1D with shape ({2 * nz}, {ne}), got {param_vec_1D.shape}"
-        )
-
-    geostat = Cholesky()
-
-    var_range_m = 5.0
-    var_range_ft = var_range_m * meter_to_feet
-    var_range_cells = max(1, int(np.floor(var_range_ft / dX)))
-    vertical_aspect = (4 * dZ) / dX
-
-    normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
-    twoD_std = [normal_rh_std, ratio_latent_std]  # Standard deviations for the 1D fields, can be tuned
-    center_x_idx = nx // 2
-    conditioning_indices = center_x_idx * nz + np.arange(nz)
-
-    param_vec_2D = np.empty((2 * n_params_per_type, ne), dtype=float)
-    cov_blocks = []
-    mean_blocks = []
-
-    for param_idx in range(2):
-        conditioning_column = param_vec_1D[param_idx * nz:(param_idx + 1) * nz, :]
-        mean_profile = np.mean(conditioning_column, axis=1)
-        stationary_std = float(twoD_std[param_idx])
-        # Keep the prior mean as the ensemble-average 1D trend, but generate
-        # each 2D realization around its own 1D column so the full center
-        # column imprint propagates more uniformly across x.
-        mean_vec = np.tile(mean_profile, nx)
-        mean_blocks.append(mean_vec)
-        memberwise_trend = np.tile(conditioning_column, (nx, 1))
-
-        if stationary_std <= np.finfo(float).eps:
-            cov = np.eye(n_params_per_type, dtype=float) * np.finfo(float).eps
-            conditioned_residuals = np.zeros((n_params_per_type, ne), dtype=float)
-        else:
-            cov = geostat.gen_cov2d(
-                nx, nz, stationary_std**2, var_range_cells, vertical_aspect, 0, 'exp'
-            )
-            unconditional_residuals = geostat.gen_real(
-                np.zeros(n_params_per_type, dtype=float), cov, ne
-            ).reshape(
-                n_params_per_type, ne, order='C'
-            )
-
-            C_dd = cov[np.ix_(conditioning_indices, conditioning_indices)]
-            C_dd = C_dd + np.eye(C_dd.shape[0], dtype=float) * np.finfo(float).eps
-            C_xd = cov[:, conditioning_indices]
-            conditioning_residual = -unconditional_residuals[conditioning_indices, :]
-
-            try:
-                kriging_weights = np.linalg.solve(C_dd, conditioning_residual)
-            except np.linalg.LinAlgError:
-                kriging_weights = np.linalg.pinv(C_dd) @ conditioning_residual
-
-            conditioned_residuals = unconditional_residuals + C_xd @ kriging_weights
-            conditioned_residuals[conditioning_indices, :] = 0.0
-
-        conditioned_samples = memberwise_trend + conditioned_residuals
-        conditioned_samples[conditioning_indices, :] = conditioning_column
-
-        start = param_idx * n_params_per_type
-        stop = start + n_params_per_type
-        param_vec_2D[start:stop, :] = conditioned_samples
-        cov_blocks.append(cov)
-
-    C_theta_2D = np.block([[cov_blocks[0], np.zeros_like(cov_blocks[0])],
-        [np.zeros_like(cov_blocks[1]), cov_blocks[1]],])
-    mean_theta_2D = np.concatenate(mean_blocks)
-
-    return param_vec_2D, C_theta_2D, mean_theta_2D
-
-def resample_post_2D_to_0D(post_param):
-
-    center_idx = dims[0] // 2
-    #center_idz = dims[2] // 2
-    c_param_1 = []
-    c_param_2 = []
-    for post_param_one_ens_member in post_param:
-        reshaped = post_param_one_ens_member.reshape(2, dims[0]*dims[2])
-        c_param_1_value = np.mean(reshaped[0, :])
-        c_param_2_value = np.mean(reshaped[1, :])
-        c_param_1.append(c_param_1_value)
-        c_param_2.append(c_param_2_value)
-
-    c_param_1 = np.array(c_param_1)
-    c_param_2 = np.array(c_param_2)
-    rh_mean = np.mean(c_param_1)
-    ratio_latent_mean = np.mean(c_param_2)
-    return rh_mean, ratio_latent_mean
-
-def _build_param_dict(param):
-    """Map optimizer parameters to simulator input dictionary."""
-    n_params_per_type = dims[0] * dims[2]  # nx * nz
-    # Optimizer vector uses (nx, nz) with C-order flattening (z-fastest).
-    rh_2d = param[:n_params_per_type].reshape(dims[0], dims[2], order='C')
-    rh_ratio_2d = param[n_params_per_type:].reshape(dims[0], dims[2], order='C')
-    
-    # Broadcast 2D arrays to 3D by tiling along the y-axis
-    rh = np.tile(rh_2d[:, np.newaxis, :], (1, dims[1], 1))
-
-    # make rv - using reciprocal distribution for ratio
-    rh_ratio = np.tile(rh_ratio_2d[:, np.newaxis, :], (1, dims[1], 1))
-    u = norm.cdf(rh_ratio)  # Map to [0, 1]
-    ratio = min_ratio * np.power(max_ratio / min_ratio, u)  # Reciprocal distribution
-    rv = np.log(np.exp(rh) * ratio)
-    
-
-    param_dict = {'rh': rh.flatten(order='F'),
-                  'rv': rv.flatten(order='F')
-        }
-    return param_dict, rh_2d, rh_ratio_2d
-
-def _build_param_dict_1D(param):
-    """Map a z-column parameter vector to the 1D simulator input dictionary."""
-    n_params_per_type = dims[2]
-    if np.size(param) != 2 * n_params_per_type:
-        raise ValueError(
-            f"Expected a 1D state vector of length {2 * n_params_per_type}, got {np.size(param)}"
-        )
-    rh_1d = np.asarray(param[:n_params_per_type], dtype=float)
-    rh_ratio_1d = np.asarray(param[n_params_per_type:], dtype=float)
-
-    u = norm.cdf(rh_ratio_1d)
-    ratio = min_ratio * np.power(max_ratio / min_ratio, u)
-    rv_1d = np.log(np.exp(rh_1d) * ratio)
-
-    param_dict = {'rh': rh_1d,
-                  'rv': rv_1d
-        }
-    return param_dict, rh_1d, rh_ratio_1d
-
-def _get_1d_surface_depth(logging_point_idx):
-    """Return a column whose center cell is aligned with the current TVD."""
-    column_top_ft = TVD[logging_point_idx] - 0.5 * dims[2] * dZ
-    return [column_top_ft + i * dZ for i in range(dims[2])]
-
-def _set_logging_point_state(logging_point_idx, keep_inversion_z_lim = None, keep_inversion_x_lim = None):
-    """Update tool/grid state for current logging point."""
-    UTA0D_sim.tool['tvd'] = TVD[logging_point_idx:logging_point_idx+1]
-    UTA0D_sim.tool['MD'] = MD[logging_point_idx:logging_point_idx+1]
-    UTA0D_sim.tool['X'] = WX[logging_point_idx:logging_point_idx+1]
-    UTA0D_sim.tool['ijk'] = WY[logging_point_idx:logging_point_idx+1]
-    UTA0D_sim.tool['nlog'] = 1
-
-    UTA1D_sim.tool['tvd'] = TVD[logging_point_idx:logging_point_idx+1]
-    UTA1D_sim.tool['MD'] = MD[logging_point_idx:logging_point_idx+1]
-    UTA1D_sim.tool['X'] = WX[logging_point_idx:logging_point_idx+1]
-    UTA1D_sim.tool['ijk'] = WY[logging_point_idx:logging_point_idx+1]
-    if el == 0 or keep_inversion_z_lim is None:
-        UTA1D_sim.tool['surface_depth'] = _get_1d_surface_depth(logging_point_idx)
-    else:
-        if not keep_inversion_z_lim:
-            UTA1D_sim.tool['surface_depth'] = [depth + dZ for depth in UTA1D_sim.tool['surface_depth']]
-
-    UTA2D_sim.tool['tvd'] = TVD[logging_point_idx:logging_point_idx+1]
-    well_x_m = wellpath['X'][logging_point_idx][0]
-    well_y_m = wellpath['Y'][logging_point_idx][0]
-    well_z_m = wellpath['Z'][logging_point_idx][0]
-    if el == 0 or keep_inversion_z_lim is None:
-        UTA2D_sim.model['shift'] = {'x': well_x_m * meter_to_feet - dX * (dims[0]//2),
-                                'y': well_y_m * meter_to_feet - dY * (dims[1]//2),
-                                'z': well_z_m * meter_to_feet - dZ * (dims[2]//2)}
-    else:
-        if not keep_inversion_z_lim:
-            UTA2D_sim.model['shift']['z'] += dZ
-        if not keep_inversion_x_lim:
-            UTA2D_sim.model['shift']['x'] +=  dX
-        UTA2D_sim.model['shift']['y'] = well_y_m * meter_to_feet - dY * (dims[0] // 2)
-
-    UTA2D_sim.tool['MD'] = MD[logging_point_idx:logging_point_idx+1]
-    UTA2D_sim.tool['X'] = WX[logging_point_idx:logging_point_idx+1]
-    UTA2D_sim.tool['ijk'] = WY[logging_point_idx:logging_point_idx+1]
-
-def simulate_pred_only(param, logging_point_idx=0, simfidelity="2D", keep_inversion_lim_z = None, keep_inversion_lim_x = None):
-    """Forward response only (no Jacobian expected)."""
-    if simfidelity == "0D":
-        param_dict = {'rh':param[0],
-                      'rv':np.log(np.exp(param[0]) * 
-                                  (min_ratio*np.power(max_ratio / min_ratio, norm.cdf(param[1]))))}
-        _set_logging_point_state(logging_point_idx, keep_inversion_lim_z, keep_inversion_lim_x)
-        pred = UTA0D_sim.run_fwd_sim(param_dict, 0)
-        pred_vec = np.concatenate([pred[0][k][selected_data_indices_0D] for k in tools])
-
-    elif simfidelity == "1D":
-        param_dict, _, _ = _build_param_dict_1D(param)
-        _set_logging_point_state(logging_point_idx, keep_inversion_lim_z, keep_inversion_lim_x)
-        pred = UTA1D_sim.run_fwd_sim(param_dict, 0)
-        pred_vec = np.concatenate([pred[0][k][selected_data_indices_1D] for k in tools])
-        
-    else:        
-        param_dict, _, _ = _build_param_dict(param)
-        _set_logging_point_state(logging_point_idx, keep_inversion_lim_z, keep_inversion_lim_x)
-        original_jac_flag = UTA2D_sim.options.get('jacobi', True)
-        UTA2D_sim.options['jacobi'] = False
-        try:
-            pred = UTA2D_sim.run_fwd_sim(param_dict, 0)
-        finally:
-            UTA2D_sim.options['jacobi'] = original_jac_flag
-        pred_vec = np.concatenate([pred[0][k][selected_data_indices] for k in tools])
-    return pred_vec
-
-def simulate_and_grad(param, logging_point_idx=0):
-    param_dict, rh_2d, rh_ratio_2d = _build_param_dict(param)
-    
-    _set_logging_point_state(logging_point_idx)
-    
-    pred,jacobian = UTA2D_sim.run_fwd_sim(param_dict, 0)
-    
-    jac_list = []
-    for param_idx, param_key in enumerate(['rh', 'rv']):
-        # Collect Jacobian for this parameter across all tool settings in the same order as data_keys
-        jac_param_list = []
-        for tool_key in tools:
-            # jacobian block layout from EMsim is (ncomp, nz, ny, nx).
-            # After summing broadcasted y-direction we get (ncomp, nz, nx).
-            # Optimizer parameter layout is (nx, nz) flattened with C-order (z-fastest).
-            # Reorder Jacobian from (nz, nx) -> (nx, nz) before flattening.
-            jac_tool_selected = np.sum(jacobian[0][tool_key][param_idx], axis=2)[selected_data_indices, :, :]
-            jac_tool_selected = jac_tool_selected.transpose(0, 2, 1)  # (ncomp, nx, nz)
-            jac_param_list.append(jac_tool_selected.reshape(jac_tool_selected.shape[0], -1))
-        # Concatenate along data axis: stack data from all tool settings
-        jac_param = np.vstack(jac_param_list)
-        jac_list.append(jac_param)
-
-    # -------------------------------------------------------------------------
-    # Chain rule from Fortran Jacobian space -> optimizer space.
-    #
-    # jac_list[0] : d(data)/dRh_2D   (after collapsing broadcasted y-direction)
-    # jac_list[1] : d(data)/dRv_2D   (after collapsing broadcasted y-direction)
-    #
-    # Optimizer parameters:
-    #   m = log(Rh_2D)
-    #   z = Gaussian latent for anisotropy ratio
-    #   ratio = min_ratio + (max_ratio-min_ratio)*Phi(z)
-    #   Rv_2D = Rh_2D * ratio
-    #
-    # Needed derivatives:
-    #   dRh/dm = Rh
-    #   dRv/dm = Rv
-    #   dRv/dz = Rh * (max_ratio-min_ratio) * phi(z)
-    #
-    # Therefore:
-    #   d(data)/dm = d(data)/dRh * dRh/dm + d(data)/dRv * dRv/dm
-    #   d(data)/dz = d(data)/dRv * dRv/dz
-    # -------------------------------------------------------------------------
-    j_rh = jac_list[0]  # d(data)/dRh_2D
-    j_rv = jac_list[1]  # d(data)/dRv_2D
-
-    u_2d = norm.cdf(rh_ratio_2d)
-    ratio_2d = min_ratio * np.power(max_ratio / min_ratio, u_2d)  # Reciprocal distribution
-    dratio_dz_2d = np.log(max_ratio / min_ratio) * ratio_2d * norm.pdf(rh_ratio_2d)
-
-    rh_phys_2d = np.exp(rh_2d)
-    rv_phys_2d = rh_phys_2d * ratio_2d
-
-    # Keep flatten convention consistent with reshape(...).reshape(-1) above.
-    rh_phys_vec = rh_phys_2d.reshape(-1, order='C')
-    rv_phys_vec = rv_phys_2d.reshape(-1, order='C')
-    drv_dz_vec = (rh_phys_2d * dratio_dz_2d).reshape(-1, order='C')
-
-    j_m = j_rh * rh_phys_vec[np.newaxis, :] + j_rv * rv_phys_vec[np.newaxis, :]
-    j_z = j_rv * drv_dz_vec[np.newaxis, :]
-
-    # Jacobian wrt optimizer parameters [m, z]
-    jacobian_matrix = np.hstack([j_m, j_z])
-
-    pred_vec = np.concatenate([pred[0][k][selected_data_indices] for k in tools])
-
-    # loss = custom_loss(pred_vec, data_real, param,Cd)
-    # print(loss)
-
-    # grad = jacobian_matrix.T @ ((data_real- pred_vec) / Cd) + np.linalg.solve(cov_res, param - mean_res.flatten())
-
-    #hessian_approx = jacobian_matrix.T @ (jacobian_matrix / Cd[:, np.newaxis]) + inv_cm
-
-    return pred_vec, jacobian_matrix #, hessian_approx
-
-def custom_loss(predictions, data_real, theta, theta_mean, C_theta, Cd):
-    # Example: weighted mean squared error
-    residuals_data = data_real - predictions.flatten()
-    data_loss = 0.5 * np.sum((residuals_data ** 2) / Cd)
-    
-    residuals_theta = theta.flatten() - theta_mean.flatten()
-    
-    theta_loss = 0.5 * residuals_theta @ np.linalg.solve(C_theta, residuals_theta)
-
-    loss = data_loss + theta_loss
-    
-    return loss
-
-def map_update_data_space_LM(theta, f_theta, theta_mean, J, y, Cd_diag, C_theta, step_lambda):
-    """
-    Levenberg-Marquardt MAP update in data-space using matrix inversion lemma.
-    L(theta) = 0.5 * ||y - f(theta)||^2_{Cd^-1} + 0.5 * ||theta - theta_prior||^2_{Cm^-1}
-    
-    Using Sherman-Morrison-Woodbury formula to avoid inverting [n x n] matrix.
-    Instead, we invert [d x d] matrix.
-    
-    Parameters:
-    theta: [n] - current parameter estimate
-    f_theta: [d] - forward model prediction at current theta
-    J: [d, n] - Jacobian matrix
-    y: [d] - observed data
-    Cd_diag: [d] - diagonal of data covariance matrix
-    
-    Returns:
-    theta_new: [n] - updated parameter estimate
-    """
-    
-    theta = theta.flatten()
-    theta_prior = theta_mean.flatten()
-    f_theta = f_theta.flatten()
-    y = y.flatten()
-    Cd_diag = Cd_diag.flatten()
-
-    # Residuals in model and data spaces.
-    r_d = f_theta - y
-    damp_scale = 1.0 + step_lambda
-    r_m = (theta - theta_prior) / damp_scale
-
-    # Data-space MAP Levenberg-Marquardt step:
-    #   delta = -r_m - C_theta J^T [ (1+lambda)Cd + J C_theta J^T ]^{-1} (r_d - J r_m)
-    CM_JT = C_theta @ J.T
-    H_data = damp_scale * np.diag(Cd_diag) + J @ CM_JT
-    rhs = r_d - J @ r_m
-
-    try:
-        w = np.linalg.solve(H_data, rhs)
-    except np.linalg.LinAlgError:
-        w = np.linalg.lstsq(H_data, rhs, rcond=None)[0]
-
-    delta_theta = -r_m - CM_JT @ w
-    return delta_theta
-
-def order_ensemble_members_after_loss(top_en_n):
-    losses = []
-    indices = []
-    for i in range(Ne):
-        curr_loss_en = custom_loss(pred_curr[:, i], data_real[:, i], param_vec[:, i], mean_theta, c_theta, Cd_vec)
-        losses.append(curr_loss_en)
-        indices.append(i)
-
-    losses = np.array(losses)
-    indices = np.array(indices)
-    # Get indices sorted by loss (smallest to largest)
-    sorted_indices = indices[np.argsort(losses)]
-    # Select the top N members with the smallest losses
-    best_members_indices = sorted_indices[:top_en_n]
-
-    return best_members_indices
-
-def make_param_vec_list():
-    # list. Length of list defines how many columns (x-values) that is being used in th kriging
-    # n_1D_columns: Length of list defines how many columns (x-values) that is being used in th kriging
-    # param_1D_columns: indices of columns that is to be used in kriging
-    param_vec_list = []
-    nz = dims[2]
-    # column_idx_no, column_idx in enumerate(param_1D_columns):
-
-    for idx in param_1D_columns:
-        param_vec_1D = np.zeros((nz * 2, opt_NE))
-        if idx < param_1D_columns[-1]:
-            for ne_member, post_param_one_ens_member in enumerate(post_param):
-                reshaped = post_param_one_ens_member.reshape(2, dims[0] * dims[2])
-                for param_idx in range(2):  # number of parameters (rh, rv)
-                    param_vec_1D[param_idx*nz:(param_idx+1)*nz, ne_member] = reshaped[param_idx, idx* nz: (idx+1)* nz]
-        elif idx == param_1D_columns[-1]:
-            param_vec_1D = param_vec[:, best_members_indices]
-        param_vec_list.append(param_vec_1D)
-
-    return param_vec_list
-
-def plot_ensemble_predictions(pred_curr, data_real, data_vec, title_suffix='', filename='ensemble_predictions.png'):
-    """Plot ensemble predictions vs observed data with percentile bands.
-
-    Parameters:
-    pred_curr: [d, Ne] - ensemble predictions
-    data_real: [d, Ne] - perturbed observed data
-    data_vec: [d] - true observed data
-    title_suffix: str - suffix for plot title
-    filename: str - output filename
-    """
-    plt.figure(figsize=(10, 6))
-    x_indices = np.arange(pred_curr.shape[0])
-
-    # Compute percentiles for pred_curr (axis=1 is ensemble dimension)
-    pred_p05 = np.percentile(pred_curr, 5, axis=1)
-    pred_p95 = np.percentile(pred_curr, 95, axis=1)
-    pred_median = np.percentile(pred_curr, 50, axis=1)
-
-    # Compute percentiles for data_real
-    data_p05 = np.percentile(data_real, 5, axis=1)
-    data_p95 = np.percentile(data_real, 95, axis=1)
-    data_median = np.percentile(data_real, 50, axis=1)
-
-    # Plot pred_curr first
-    plt.fill_between(x_indices, pred_p05, pred_p95, alpha=0.3, color='blue', label='Pred 5-95%')
-    plt.plot(x_indices, pred_median, 'b-', label='Pred median')
-
-    # Plot data_real after
-    plt.fill_between(x_indices, data_p05, data_p95, alpha=0.3, color='red', label='Data 5-95%')
-    plt.plot(x_indices, data_median, 'r--', label='Data median')
-
-    plt.plot(data_vec, 'kx', label='True Data', markersize=10)
-    plt.xlabel('Data Point Index')
-    plt.ylabel('Data Value')
-    plt.title(f'Ensemble Predictions vs Observed Data{title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-
-def plot_distributions_using_seaborn():
-    import seaborn as sns
-    ne = 1000
-    # normal distribution fro log-param-values
-    normal_mean_values = [0.5, 1, 1.5, 2, 3]
-    # Plot using seaborn
-    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
-
-
-    # Generate samples
-    for normal_mean in normal_mean_values:
-        normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_mean)
-        #log_rh_std  = find_std_keeping_variance_fixed(log_rh_mean)
-        #variance_rh_samples = (np.exp(log_rh_std ** 2) - 1) * np.exp(2 * log_rh_mean + log_rh_std ** 2)
-        normal_rh_samples = np.random.normal(loc=normal_mean, scale=normal_rh_std, size=(ne,))
-        #ratio_latent_samples = np.random.normal(loc=ratio_latent_mean, scale=ratio_latent_std, size=(ne,))
-        # Plot log_rh_samples
-        sns.kdeplot(normal_rh_samples, fill=True, color="skyblue", ax=axs[0], label=f"log_rh_samples\nMean: {normal_mean:.1f}, Std dev: {normal_rh_std:.1f}")
-
-        # Add a vertical line for the mean
-        axs[0].axvline(normal_mean, color='red', linestyle='--')
-
-    axs[0].set_title('Density plot for log_rh_samples (normal distribution)')
-    axs[0].set_xlabel('Value')
-    axs[0].set_ylabel('Density')
-    axs[0].legend()
-    axs[0].grid(True)
-    for normal_mean in normal_mean_values:
-        # Generate log_rh_samples
-        #log_normal_rh_std = find_std_keeping_variance_fixed(normal_mean, 1, 1.7)
-        normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_mean)
-        normal_rh_samples = np.random.normal(loc=normal_mean, scale=normal_rh_std, size=(ne,))
-        # Convert to rh_samples
-        log_normal_rh_samples = np.exp(normal_rh_samples)
-        log_normal_mean, log_normal_rh_std = compute_log_normal_params(normal_mean, normal_rh_std)
-        # Plot rh_samples
-        sns.kdeplot(log_normal_rh_samples, fill=True, color="green", ax=axs[1], label=f"Mean: {log_normal_mean:.1f}, Std dev: {log_normal_rh_std:.1f}")
-
-        # Add a vertical line for the mean in log-normal
-        axs[1].axvline(log_normal_mean, color='red', linestyle='--')
-
-    # Finalize the second subplot
-    axs[1].set_title('Density plot for rh_samples (log-normal distribution)')
-    axs[1].set_xlabel('Value')
-    axs[1].set_ylabel('Density')
-    axs[1].legend()
-    axs[1].grid(True)
-    # Plot for ratio_latent_samples
-    #plt.subplot(1, 2, 2)
-    #sns.kdeplot(ratio_latent_samples, fill=True, color="orange",
-    #            label=f"ratio_latent_samples\nMean: {ratio_latent_mean}, Std Dev: {ratio_latent_std}")
-    #plt.axvline(ratio_latent_mean, color='red', linestyle='--')
-    #plt.title('Density Plot for ratio_latent_samples')
-    #plt.xlabel('Value')
-    #plt.ylabel('Density')
-    #plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-def assess_intermediate_param_values(fidelity_level, post_estim = False):
-
-
-    if fidelity_level == 0:
-        nx = 1
-        nz = 1
-    elif fidelity_level == 1:
-        _, _, nz = dims
-        nx = 1
-    else:
-        nx, _, nz = dims
-    if fidelity_level == 2 and post_estim:
-        plot_param = np.asarray(post_param)
-    else:
-        plot_param = np.asarray(param_vec).T
-    n_param_per_type = nx * nz
-
-    MIN_RATIO = 1.0
-    MAX_RATIO = 5.0
-
-    rh = plot_param[:,:n_param_per_type].reshape(-1, nx, nz, order="C")
-    latent_ratio = plot_param[:,n_param_per_type:].reshape(-1, nx, nz, order="C")
-
-    u = norm.cdf(latent_ratio)
-    ratio = MIN_RATIO * np.power(MAX_RATIO / MIN_RATIO, u)
-    rv = np.log(np.exp(rh) * ratio)
-    rh = np.exp(rh)
-    rv = np.exp(rv)
-    rh_median = np.median(rh)#, axis=0)
-    rv_median = np.median(rv)#, axis=0)
-    rh_mean = np.mean(rh)#, axis=0)
-    rv_mean = np.mean(rv)#, axis=0)
-    if post_estim:
-        str_part = "after"
-    else:
-        str_part = "before"
-
-    print(f'mean value for rh {str_part} D{fidelity_level} inversion is: {rh_mean}')
-    print(f'mean value for rv {str_part} D{fidelity_level} inversion is: {rv_mean}')
-    #print(f'median value for rh {str_part} D{fidelity_level} inversion is: {rh_median}')
-    #print(f'median value for rv {str_part} D{fidelity_level} inversion is: {rv_median}')
-
-
-
-#reference_model_path = '/home/AD.NORCERESEARCH.NO/krfo/CodeProjects/DISTINGUISH/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
-reference_model_path = '/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
-Ne_MDA = 250 # ES-MDA
-opt_NE = 5 # gradient based
-Ne = Ne_MDA
-
-
-debug = True
+dims = (15, 5, 20)
+dX = dY = dZ = 5.0
+min_ratio, max_ratio = 1.0, 5.0
+tools = ["('6kHz','83ft')", "('12kHz','83ft')", "('24kHz','83ft')",
+         "('24kHz','43ft')", "('48kHz','43ft')", "('96kHz','43ft')"]
+masked_udar_components = ('USDP', 'USDA')
 log_normal_rh_std_target = 3.6
 normal_rh_mean = 1.0
-normal_rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
-ratio_latent_mean = 0
+ratio_latent_mean = 0.0
 ratio_latent_std = 0.25
-pr, c_theta, mean_theta = sample_prior_0D(Ne)
-setup_simulators(reference_model_path='/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3', data_type='Bfield')
 
-# Load reference model for plotting
-with h5py.File(reference_model_path, "r") as f:
-    ref_model = h5_to_dict(f)
 
-# initalize the parameter vector for optimization
-param_vec = copy.deepcopy(pr)
+def setup_simulators(benchmark_dir, tool_list):
+    from EMsim.EM import UTA0D, UTA1D
+    global UTA0D_sim, UTA1D_sim, wellpath, TVD, MD, WX, WY
+    with h5py.File(Path(benchmark_dir) / 'globalmodel.h5', 'r') as handle:
+        wellpath = {key: value[:] for key, value in handle['wellpath'].items()}
+    TVD, MD, WX, WY = [wellpath[key][:, 0] * meter_to_feet
+                       for key in ('Z', 'Distance', 'X', 'Y')]
+    tool_path = Path('tool.inp').resolve()
+    with tool_path.open('w') as stream:
+        stream.write('freq,sub\n')
+        for tool in tool_list:
+            freq, sub = ast.literal_eval(tool)
+            stream.write(f'{int(freq[:-3])},{int(sub[:-2])}\n')
+    inputs = {'toolflag': 0, 'datasign': 3, 'anisoflag': 1,
+              'toolsetting': str(tool_path),
+              'reference_model': str(Path(benchmark_dir) / 'globalmodel.h5'),
+              'map': {'ratio': [1, 5]}, 'obsname': 'tvd',
+              'assimindex': [[0]], 'datatype': tool_list}
+    UTA0D_sim = UTA0D(inputs)
+    UTA0D_sim.setup_fwd_run(redund_sim=None)
+    UTA1D_sim = UTA1D({**inputs, 'surface_depth': list(np.arange(dims[2]) * dZ)})
+    UTA1D_sim.setup_fwd_run(redund_sim=None)
 
-#tot_assim_index = [180]
-tot_assim_index = [[el] for el in range(250)]
-datatype = 'Bfield'
 
-data = pd.read_pickle('data.pkl')
-Cd = pd.read_pickle('var.pkl')
+def normal_std_from_lognormal_std(sigma_X, mu):
+    def equation(sigma):
+        return np.sqrt((np.exp(sigma ** 2) - 1) * np.exp(2 * mu + sigma ** 2)) - sigma_X
+    return float(fsolve(equation, 1.0)[0])
 
-# setup ESMDA update
-at = approx_update()
-at.proj = (np.eye(Ne) - np.ones((Ne, Ne))/Ne) / np.sqrt(Ne - 1)
-at.trunc_energy = 0.95
-at.keys_da = {}
-#{'localization':{"autoadaloc":0.5,
-#                              "type": "sigm",
-#                              "field": [dims[0], dims[2]]}
-#        }
-#at.localization = localization(
-#                    at.keys_da['localization'],
-#                    [],
-#                    [],
-#                    [],
-#                    Ne
-#                )
-at.list_states = ['rh', 'rv']
-at.prior_info = {'rh':{"active": np.prod([dims[0], dims[2]])},
-                 'rv':{"active": np.prod([dims[0], dims[2]])}
-        }
-at.state_scaling = np.ones(param_vec.shape[0]) # No scaling for now, but could be tuned for better performance
-at.lam = 0
 
-#plot_distributions_using_seaborn()
-assim_step_integer = 1
+def sample_prior_0D(ne, background, reservoir, mode_std, fraction):
+    """Two-mode mixture prior in ln Rh: background and reservoir levels."""
+    reservoirs = np.random.random(ne) < fraction
+    rh = np.where(reservoirs,
+                  np.random.normal(reservoir, mode_std, ne),
+                  np.random.normal(background, mode_std, ne))
+    mean = fraction * reservoir + (1. - fraction) * background
+    variance = (fraction * (mode_std ** 2 + (reservoir - mean) ** 2)
+                + (1. - fraction) * (mode_std ** 2 + (background - mean) ** 2))
+    covariance = np.diag([variance, ratio_latent_std ** 2])
+    samples = np.vstack([rh, np.random.normal(ratio_latent_mean, ratio_latent_std, ne)])
+    return samples, covariance, np.array([mean, ratio_latent_mean])
 
-for el, assim_index in enumerate(tot_assim_index[80:120:assim_step_integer]):#enumerate([tot_assim_index[0]]):
-    Cd_row = Cd.iloc[assim_index[0]]
-    Cd_vec = np.concatenate([np.array(Cd_row[ast.literal_eval(tool)][1])[selected_data_indices] for tool in tools])
-    data_vec = np.concatenate([data.iloc[assim_index[0]][ast.literal_eval(tool)][selected_data_indices] for tool in tools])
-    threshold = len(data_vec)*2
-    MDA_inflation_factor = [10.0]
-    curr_loss = np.inf
-    mda_counter = 0
-    mda_inflation = 1/(1 - 1/MDA_inflation_factor[-1]) # to ensure a geometric series
-    print(f"Optimizing in 0D at assimilation step {assim_index[0]} with MDA method")
-    # initialize 0D representation based on 2D results
-    # 1.) find param value in logging point from 2D array
-    keep_inversion_lim_z, keep_inversion_lim_x =  logging_point_vs_inversion_domain()
 
-    Ne = Ne_MDA
+def sample_prior_0D_gaussian(ne):
+    rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, normal_rh_mean)
+    covariance = np.diag([rh_std ** 2, ratio_latent_std ** 2])
+    samples = np.vstack([np.random.normal(normal_rh_mean, rh_std, ne),
+                         np.random.normal(ratio_latent_mean, ratio_latent_std, ne)])
+    return samples, covariance, np.array([normal_rh_mean, ratio_latent_mean])
 
-    if el > 0: # successive assimilation step - use results from previous assimilation step as input
-        # update mean values
-        #normal_rh_mean, ratio_latent_mean = resample_post_2D_to_0D(post_param)
-        pr, c_theta, mean_theta = sample_prior_0D(Ne)
-        param_vec = copy.deepcopy(pr)
-        at.state_scaling = np.ones(param_vec.shape[0])
 
-    assess_intermediate_param_values(0)
-    while curr_loss > threshold and sum([1/mda for mda in MDA_inflation_factor[:-1]]) < 0.25:
-        print(f"MDA iteration {mda_counter}, inflation factor: {MDA_inflation_factor[-1]:.3f}")
-        en_pred = []
-        for ne in range(Ne):
-            en_pred.append(simulate_pred_only(param_vec[:,ne], logging_point_idx=assim_index[0], simfidelity="0D",
-                                              keep_inversion_lim_z = keep_inversion_lim_z, keep_inversion_lim_x = keep_inversion_lim_x))
-        
-        Cd_inflated = Cd_vec * MDA_inflation_factor[-1]
-        at.scale_data = np.sqrt(Cd_inflated)
-        data_real = np.random.normal(loc=data_vec[:, np.newaxis], 
-                                     scale=at.scale_data[:, np.newaxis], 
-                                     size=(len(data_vec), Ne))
-        
-        pred_curr = np.array(en_pred).T  # shape (d, Ne)
+def mixture_stats(nz, background, reservoir, mode_std, fraction):
+    mean = fraction * reservoir + (1. - fraction) * background
+    variance = (fraction * (mode_std ** 2 + (reservoir - mean) ** 2)
+                + (1. - fraction) * (mode_std ** 2 + (background - mean) ** 2))
+    means = np.concatenate([np.full(nz, mean), np.full(nz, ratio_latent_mean)])
+    covariance = np.diag(np.concatenate([np.full(nz, variance), np.full(nz, ratio_latent_std ** 2)]))
+    return means, covariance
 
-        if not debug:
-            plot_ensemble_predictions(
-            pred_curr, data_real, data_vec,
-            title_suffix=f' after {mda_counter} MDA iterations',
-            filename=f'ensemble_predictions_after_MDA_iter_{mda_counter}.png'
-            )
 
-        at.update(
-                enX = param_vec, 
-                enY = pred_curr, 
-                enE = data_real
-            )
-        
-        param_vec += at.step
+def sample_blocky_prior_1D(ne, zero_d_posterior, background, reservoir, mode_std, fraction,
+                         projection=True):
+    """Two-mode layered columns with random block edges.
 
-        curr_loss = custom_loss(pred_curr.mean(axis=1), data_real.mean(axis=1), param_vec.mean(axis=1), mean_theta, c_theta, Cd_vec)
-        print(f"Loss: {curr_loss}")
+    Each member draws 1-4 switch positions; modes alternate between the
+    background and reservoir levels. The segment holding the center cell
+    follows the member's 0D posterior side of the level midpoint.
+    """
+    nz = dims[2]
+    midpoint = 0.5 * (background + reservoir)
+    rh = np.empty((nz, ne))
+    for member in range(ne):
+        count = min(int(np.random.randint(1, 5)), nz - 1)
+        switches = np.sort(np.random.choice(np.arange(1, nz), size=count, replace=False))
+        bounds = np.concatenate(([0], switches, [nz]))
+        reservoir_segment = np.random.random() < fraction
+        modes = np.empty(nz, dtype=bool)
+        for start, stop, state in zip(bounds[:-1], bounds[1:],
+                                      [reservoir_segment if i % 2 == 0 else not reservoir_segment
+                                       for i in range(len(bounds) - 1)]):
+            modes[start:stop] = state
+        center_segment = int(np.searchsorted(bounds, nz // 2, side='right')) - 1
+        modes[bounds[center_segment]:bounds[center_segment + 1]] = \
+            zero_d_posterior[member] > midpoint
+        rh[:, member] = np.where(modes,
+                                 np.random.normal(reservoir, mode_std, nz),
+                                 np.random.normal(background, mode_std, nz))
+    if projection:
+        rh = project_to_modes(rh, background, reservoir, 2. * mode_std)
+    latent = np.random.normal(ratio_latent_mean, ratio_latent_std, (nz, ne))
+    means, covariance = mixture_stats(nz, background, reservoir, mode_std, fraction)
+    return np.vstack([rh, latent]), covariance, means
 
-        mda_counter += 1
-        MDA_inflation_factor.append(MDA_inflation_factor[-1] * mda_inflation)
-        print(f"MDA condition check: {sum([1/mda for mda in MDA_inflation_factor]):.3f}")
 
-    assess_intermediate_param_values(0, post_estim = True)
-    # Now do 1D ESMDA iterations
-    pr, c_theta, mean_theta = resample_prior_0D_to_1D(Ne, param_vec) # Resample prior, conditioned on the 0D posterior
+def sample_chained_prior_1D(ne, trend, background, reservoir, mode_std, fraction, switch_prob,
+                          projection=True):
+    """Perturb the shifted previous posterior within its modes, flipping a
+    small fraction of cells so newly entering geology stays discoverable."""
+    nz = dims[2]
+    members = trend.shape[1]
+    base = trend[:, np.arange(ne) % members]
+    midpoint = 0.5 * (background + reservoir)
+    flips = np.random.random((nz, ne)) < switch_prob
+    reservoir_cells = base[:nz] > midpoint
+    rh = base[:nz] + np.random.normal(0., mode_std, (nz, ne))
+    rh = np.where(flips & reservoir_cells,
+                  np.random.normal(background, mode_std, (nz, ne)), rh)
+    rh = np.where(flips & ~reservoir_cells,
+                  np.random.normal(reservoir, mode_std, (nz, ne)), rh)
+    if projection:
+        rh = project_to_modes(rh, background, reservoir, 2. * mode_std)
+    latent = base[nz:] + np.random.normal(0., ratio_latent_std, (nz, ne))
+    means, covariance = mixture_stats(nz, background, reservoir, mode_std, fraction)
+    return np.vstack([rh, latent]), covariance, means
 
-    param_vec = copy.deepcopy(pr)
 
-    at.state_scaling = np.ones(param_vec.shape[0]) # No scaling for now, but could be tuned for better performance
-    print(f"Optimizing in 1D at assimilation step {assim_index[0]} with MDA method")
-    assess_intermediate_param_values(1)
-    while curr_loss > threshold and sum([1/mda for mda in MDA_inflation_factor[:-1]]) < 0.75: # Half energy for 1D
-        print(f"MDA iteration {mda_counter}, inflation factor: {MDA_inflation_factor[-1]:.3f}")
-        en_pred = []
-        for ne in range(Ne):
-            en_pred.append(simulate_pred_only(param_vec[:,ne], logging_point_idx=assim_index[0], simfidelity="1D"))
-        
-        Cd_inflated = Cd_vec * MDA_inflation_factor[-1]
-        at.scale_data = np.sqrt(Cd_inflated)
-        data_real = np.random.normal(loc=data_vec[:, np.newaxis], 
-                                     scale=at.scale_data[:, np.newaxis], 
-                                     size=(len(data_vec), Ne))
-        
-        pred_curr = np.array(en_pred).T  # shape (d, Ne)
+def resample_prior_0D_to_1D(ne, param_vec_0D):
+    from geostat.decomp import Cholesky
+    if param_vec_0D.shape != (2, ne):
+        raise ValueError('0D ensemble must have shape (2, members)')
+    nz = dims[2]
+    center = nz // 2
+    geostat = Cholesky()
+    rh_std = normal_std_from_lognormal_std(log_normal_rh_std_target, param_vec_0D[0].mean())
+    samples, covariances, means = [], [], []
+    for field, std in enumerate((rh_std, ratio_latent_std)):
+        mean = np.full(nz, param_vec_0D[field].mean())
+        covariance = geostat.gen_cov2d(nz, 1, std ** 2, nz, 1, 0, 'exp')
+        unconditional = geostat.gen_real(mean, covariance, ne).reshape(nz, ne)
+        residual = param_vec_0D[field] - unconditional[center]
+        conditioned = unconditional + (covariance[:, center] / covariance[center, center])[:, None] * residual
+        conditioned[center] = param_vec_0D[field]
+        samples.append(conditioned)
+        covariances.append(covariance)
+        means.append(mean)
+    zeros = np.zeros_like(covariances[0])
+    return np.vstack(samples), np.block([[covariances[0], zeros], [zeros, covariances[1]]]), np.concatenate(means)
 
-        if not debug:
-            plot_ensemble_predictions(
-            pred_curr, data_real, data_vec,
-            title_suffix=f' after {mda_counter} MDA iterations',
-            filename=f'ensemble_predictions_after_MDA_iter_{mda_counter}_assim_step{assim_index[0]}.png'
-            )
 
-        at.update(
-                enX = param_vec, 
-                enY = pred_curr, 
-                enE = data_real
-            )
-        
-        param_vec += at.step
-        # impose hard constraints
+def resample_prior_multiple_1D_to_2D(ne, columns, indices, previous=None, posterior_spread=None):
+    """Kriging-conditioned local fields, optionally around an aligned posterior.
 
-        curr_loss = custom_loss(pred_curr.mean(axis=1), data_real.mean(axis=1), param_vec.mean(axis=1), mean_theta, c_theta, Cd_vec)
-        print(f"Loss: {curr_loss}")
-
-        mda_counter += 1
-        MDA_inflation_factor.append(MDA_inflation_factor[-1] * mda_inflation)
-        print(f"MDA condition check: {sum([1/mda for mda in MDA_inflation_factor]):.3f}")
-
-    assess_intermediate_param_values(1, post_estim=True)
-    # Finally, do 2D gradient-based optimization for each ensemble member with the last inflation factor if not converged
-    if curr_loss > threshold:
-        # select a subset of ensemble members based on their loss
-        best_members_indices = order_ensemble_members_after_loss(opt_NE)
-        # Resample the prior again, conditioned on the 1D posterior
-        #pr, c_theta, mean_theta = resample_prior_1D_to_2D(Ne, param_vec) # Resample prior, conditioned on the 1D posterior
-        # test code that allows for multiple 1D arrays as input for the 2D optimization
-        if el == 0:
-            n_1D_columns = dims[0] //2  + 1 # Set the desired number of copies
-            param_1D_columns = np.arange(n_1D_columns)
-            param_vec_list = [param_vec.copy() for _ in range(n_1D_columns)]
+    ``posterior_spread`` scales the residual (and returned covariance) per
+    field by ``clip(spread/prior_std, 0.1, 1)`` so the 2D prior reflects the
+    lower-fidelity posterior uncertainty instead of the full initial spread.
+    """
+    from geostat.decomp import Cholesky
+    nx, _, nz = dims
+    n_cells = nx * nz
+    indices = np.asarray(indices, dtype=int)
+    if not len(indices) or len(columns) != len(indices) or len(np.unique(indices)) != len(indices):
+        raise ValueError('Conditioning columns must have distinct indices')
+    if (indices < 0).any() or (indices >= nx).any():
+        raise ValueError('Conditioning column lies outside the window')
+    if any(np.shape(column) != (2 * nz, ne) for column in columns):
+        raise ValueError('1D columns do not match the window or ensemble')
+    if previous is not None and np.shape(previous) != (ne, 2 * n_cells):
+        raise ValueError('Previous posterior does not match the local window')
+    conditioning = np.concatenate([index * nz + np.arange(nz) for index in indices])
+    geostat = Cholesky()
+    var_range_cells = max(1, int(np.floor(5.0 * meter_to_feet / dX)))
+    vertical_aspect = 4 * dZ / dX
+    fields, covariances, means = [], [], []
+    for field in range(2):
+        values = np.concatenate([column[field*nz:(field+1)*nz] for column in columns])
+        if previous is None:
+            trend = np.tile(columns[-1][field*nz:(field+1)*nz], (nx, 1))
         else:
-            # TODO make sure this is correct also for nx being an even number
-            n_1D_columns = dims[0] //2 + 1
+            trend = np.asarray(previous).reshape(ne, 2, n_cells)[:, field, :].T.copy()
+        trend[conditioning] = values
+        mean = trend.mean(axis=1)
+        std = (normal_std_from_lognormal_std(log_normal_rh_std_target, min(3, mean.max()))
+               if field == 0 else ratio_latent_std)
+        if posterior_spread is not None:
+            scale = float(np.clip(posterior_spread[field] / std, 0.03, 1.0))
+            std *= scale
+        covariance = geostat.gen_cov2d(nx, nz, std ** 2, var_range_cells, vertical_aspect, 0, 'exp')
+        residual = geostat.gen_real(np.zeros(n_cells), covariance, ne).reshape(n_cells, ne)
+        C_dd = covariance[np.ix_(conditioning, conditioning)] + np.eye(len(conditioning)) * np.finfo(float).eps
+        weights = np.linalg.solve(C_dd, -residual[conditioning])
+        residual += covariance[:, conditioning] @ weights
+        residual[conditioning] = 0
+        conditioned = trend + residual
+        conditioned[conditioning] = values
+        fields.append(conditioned)
+        covariances.append(covariance)
+        means.append(mean)
+    zeros = np.zeros_like(covariances[0])
+    return np.vstack(fields), np.block([[covariances[0], zeros], [zeros, covariances[1]]]), np.concatenate(means)
 
-            param_1D_columns = np.arange(n_1D_columns)
-            if not keep_inversion_lim_x: # inversion grid is shifted one column since last logging point
-                param_1D_columns += 1
 
-            # Create N copies of the array gathered in a list
-            param_vec_list = make_param_vec_list()
+def _build_param_dict(param):
+    n_cells = dims[0] * dims[2]
+    param = np.asarray(param, dtype=float)
+    if param.shape != (2 * n_cells,):
+        raise ValueError('2D parameter vector does not match the local window')
+    log_rh = param[:n_cells].reshape(dims[0], dims[2])
+    latent = param[n_cells:].reshape(dims[0], dims[2])
+    log_rv = log_rh + np.log(min_ratio) + np.log(max_ratio / min_ratio) * norm.cdf(latent)
+    fields = [np.repeat(field[:, None, :], dims[1], axis=1).ravel(order='F')
+              for field in (log_rh, log_rv)]
+    return dict(zip(('rh', 'rv'), fields)), log_rh, latent
 
-        if el == 0:
-            pr, c_theta, mean_theta = resample_prior_multiple_1D_to_2D(Ne, param_vec_list, param_1D_columns)
-            param_vec = copy.deepcopy(pr[:, best_members_indices])  # Take the Ne samples with the lowes loss in case resampling returns more
-        else:
-            # assumes logging point moves one grid cell in x-direction per assimilation_step
-            pr, c_theta, mean_theta = resample_prior_multiple_1D_to_2D_including_prev_2D(Ne, param_vec_list, param_1D_columns, post_param)
-            param_vec = copy.deepcopy(pr[:, :opt_NE]) #
 
-        assess_intermediate_param_values(2)
-        Ne = min(Ne, opt_NE)
-        #post_1D = copy.deepcopy(param_vec) # Keep the last 1D MDA ensemble for comparison
-        #param_vec = copy.deepcopy(pr[:, :Ne]) # Take only the first Ne samples in case resampling returns more
-        #param_vec = copy.deepcopy(pr[:, best_members_indices])
+def _set_logging_point_state(logging_point_idx):
+    for sim in (UTA0D_sim, UTA1D_sim):
+        for key, source in (('tvd', 'Z'), ('MD', 'Distance'), ('X', 'X'), ('ijk', 'Y')):
+            sim.tool[key] = wellpath[source][logging_point_idx:logging_point_idx+1, 0] * meter_to_feet
+        for key, source in (('dip', 'Inclination'), ('Azim', 'Azimuth')):
+            sim.tool[key] = wellpath[source][logging_point_idx:logging_point_idx+1, 0]
+        sim.tool['degwell'] = [np.array([sim.tool['dip'][0], sim.tool['Azim'][0]])]
+        sim.tool['nlog'] = 1
+    UTA1D_sim.tool['surface_depth'] = [current_shift['z'] + i * dZ for i in range(dims[2])]
 
-        final_factor = 1/(1-sum([1/mda for mda in MDA_inflation_factor[:-1]]))
-        MDA_inflation_factor[-1] = final_factor # Final inflation factor to ensure proper weighting of data and prior in the last iteration
-        # Optimize each ensemble member with gradient-based method
-        post_param = []
-        post_pred = []
-        post_loss = []
 
-        Cd_inflated = Cd_vec * MDA_inflation_factor[-1]
-        data_real = np.random.normal(loc=data_vec[:, np.newaxis],
-                                    scale=np.sqrt(Cd_inflated)[:, np.newaxis], 
-                                    size=(len(data_vec), Ne))
+def component_positions(n_channels):
+    """Channels of the ultra-shallow UDAR components, sub-cell for the 2D grid."""
+    width = len(UDAR_COMPONENTS)
+    if n_channels % width:
+        raise ValueError('Channel count must be a multiple of the UDAR component count')
+    positions = []
+    for name in masked_udar_components:
+        positions.extend(range(UDAR_COMPONENTS.index(name), n_channels, width))
+    return np.asarray(sorted(positions), dtype=int)
 
-        for ne in range(Ne):
-            print(f"Optimizing ensemble member {ne+1}/{Ne} at assimilation step {assim_index[0]} with gradient-based method")
 
-            # Ensure that the MDA conditon still applies for this member before optimization
-            param_current = param_vec[:, ne]
-            data_current = data_real[:, ne]
-    
-            tot_loss = []
-            lambda_down = 10.0
-            lambda_up = 5.0
-            lambda_min = 1e-6
-            lambda_max = 1e16
-            max_lm_trials = 2
-            max_iterations = 5
-            # Initial evaluation
-            pred_curr, jac_curr = simulate_and_grad(param_current, logging_point_idx=assim_index[0])
-            curr_loss = custom_loss(pred_curr, data_current, param_current, mean_theta, c_theta, Cd_vec)
-            print(f"Initial Loss: {curr_loss}")
-            step_lambda = 10**np.floor(np.log10(curr_loss))  # Initial lambda based on loss magnitude
-            for iter in range(max_iterations):
-                accepted = False
-                used_lambda = step_lambda
+def soften_column_edges(column, nz):
+    """Turn a blocky log-Rh column into a two-cell ramp (5 ft cell average)."""
+    softened = np.asarray(column, dtype=float).copy()
+    rh = softened[:nz]
+    padded = np.r_[rh[0], rh, rh[-1]]
+    softened[:nz] = np.convolve(padded, [.25, .5, .25], mode='valid')
+    return softened
 
-                for _ in range(max_lm_trials):
-                    used_lambda = step_lambda
-                    search_dir = map_update_data_space_LM(
-                        param_current, pred_curr, mean_theta, jac_curr, data_current, Cd_inflated, c_theta, used_lambda
-                    )
-                    s_dir_org = search_dir
-                    for param_indx in range(2):
-                        start = dims[2] * dims[0] * param_indx
-                        end = dims[2] * dims[0] * (param_indx + 1)
-                        search_dir_T = search_dir.T
-                        block = search_dir_T[start:end]
-                        reshaped = block.reshape(dims[0], dims[2], order="C")
-                        reshaped[:dims[0] // 2, :] = 0
-                        # put modified block back, preserving original shape and order
-                        search_dir_T[start:end] = reshaped.reshape(block.shape, order="C")
 
-                        # write back updated search_dir (undo transpose)
-                        search_dir = search_dir_T.T
-                    trial_param = param_current + search_dir
+def simulate_pred_only(param, logging_point_idx=0, simfidelity='2D'):
+    if simfidelity == '2D':
+        parameters, _, _ = _build_param_dict(param)
+        return remote_2d.run_pred(parameters, logging_point_idx, current_shift, wellpath)
+    if simfidelity not in ('0D', '1D'):
+        raise ValueError(f'Unknown fidelity {simfidelity}')
+    _set_logging_point_state(logging_point_idx)
+    size = 1 if simfidelity == '0D' else dims[2]
+    log_rh = np.asarray(param[:size])
+    latent = np.asarray(param[size:])
+    log_rv = log_rh + np.log(min_ratio) + np.log(max_ratio / min_ratio) * norm.cdf(latent)
+    parameters = {'rh': log_rh.item() if size == 1 else log_rh,
+                  'rv': log_rv.item() if size == 1 else log_rv}
+    sim = UTA0D_sim if simfidelity == '0D' else UTA1D_sim
+    prediction = sim.run_fwd_sim(parameters, 0)
+    vector = np.concatenate([np.asarray(prediction[0][tool]).ravel() for tool in tools])
+    if vector.shape != (8 * len(tools),) or not np.isfinite(vector).all():
+        raise RuntimeError(f'Invalid {simfidelity} UDAR response')
+    return vector
 
-                    try:
-                        pred_trial, jac_trial = simulate_and_grad(
-                            trial_param, logging_point_idx=assim_index[0]
-                        )
-                        #pred_trial = simulate_pred_only(trial_param, logging_point_idx=assim_index[0])
-                        trial_loss = custom_loss(pred_trial, data_current, trial_param, mean_theta, c_theta, Cd_inflated)
-                    except Exception:
-                        trial_loss = np.inf
-                        pred_trial = None
 
-                    if np.isfinite(trial_loss) and trial_loss < curr_loss:
-                        accepted = True
-                        param_current = trial_param
-                        # Re-evaluate with Jacobian for consistency in next iteration
-                        # pred_curr, jac_curr = simulate_and_grad(
-                        #     param_current, data_real, Cd_inflated, logging_point_idx=assim_index[0]
-                        # )
-                        # curr_loss_reeval = custom_loss(pred_curr, data_real, param_current, mean_theta, c_theta, Cd_inflated)
-                    
-                        # # Check for simulator inconsistency
-                        # if abs(curr_loss_reeval - trial_loss) > 1e-6:
-                        #     print(f"  WARNING: Simulator gives different results with/without Jacobian!")
-                        #     print(f"    Trial loss (no Jac): {trial_loss:.6f}")
-                        #     print(f"    Re-eval loss (w/ Jac): {curr_loss_reeval:.6f}")
-                        #     print(f"    Difference: {abs(curr_loss_reeval - trial_loss):.6f}")
-                    
-                        #curr_loss = curr_loss_reeval
-                        curr_loss = trial_loss
-                        jac_curr = jac_trial
-                        step_lambda = max(step_lambda / lambda_down, lambda_min)
-                        break
+def simulate_and_grad(param, logging_point_idx=0):
+    parameters, _, latent = _build_param_dict(param)
+    prediction, j_rh, j_rv = remote_2d.run_grad(parameters, logging_point_idx, current_shift, wellpath)
+    return prediction, optimizer_jacobian(j_rh, j_rv, latent, min_ratio, max_ratio)
 
-                    step_lambda = min(step_lambda * lambda_up, lambda_max)
 
-                tot_loss.append(curr_loss)
-                if accepted:
-                    print(f"Iteration {iter}, Loss: {curr_loss} (accepted, lambda={used_lambda:.3g})")
+def simulate_and_grad_multi(param_list, logging_point_idx=0):
+    """Batched 2D evaluation; one (prediction, jacobian) or Exception per input."""
+    results = remote_2d.run_grad_multi([_build_param_dict(param)[0] for param in param_list],
+                                       logging_point_idx, current_shift, wellpath)
+    outcome = []
+    for param, (prediction, j_rh, j_rv) in zip(param_list, results):
+        if j_rh is None:
+            outcome.append(RuntimeError('2D evaluation failed for one member field'))
+            continue
+        _, _, latent = _build_param_dict(param)
+        outcome.append((prediction, optimizer_jacobian(j_rh, j_rv, latent, min_ratio, max_ratio)))
+    return outcome
+
+
+def custom_loss(predictions, data_real, theta, theta_mean, C_theta, Cd):
+    residual = np.asarray(data_real).ravel() - np.asarray(predictions).ravel()
+    prior_residual = np.asarray(theta).ravel() - np.asarray(theta_mean).ravel()
+    return 0.5 * (np.sum(residual ** 2 / Cd) + prior_residual @ np.linalg.solve(C_theta, prior_residual))
+
+
+def map_update_data_space_LM(theta, f_theta, theta_mean, J, y, Cd_diag, C_theta, step_lambda):
+    scale = 1 + step_lambda
+    prior_residual = (np.asarray(theta).ravel() - np.asarray(theta_mean).ravel()) / scale
+    CM_JT = C_theta @ J.T
+    H_data = scale * np.diag(Cd_diag) + J @ CM_JT
+    rhs = np.asarray(f_theta).ravel() - np.asarray(y).ravel() - J @ prior_residual
+    try:
+        weights = np.linalg.solve(H_data, rhs)
+    except np.linalg.LinAlgError:
+        weights = np.linalg.lstsq(H_data, rhs, rcond=None)[0]
+    return -prior_residual - CM_JT @ weights
+
+
+def parse_args(argv=None):
+    config = SimBackendConfig.from_env()
+    parser = argparse.ArgumentParser(description=__doc__)
+    config.add_cli(parser)
+    here = Path(__file__).resolve().parent
+    parser.add_argument('--benchmark', type=Path, default=here.parent / 'Dashboard/benchmarks/Benchmark-3')
+    parser.add_argument('--data', type=Path, default=here / 'data.pkl')
+    parser.add_argument('--variance', type=Path, default=here / 'var.pkl')
+    parser.add_argument('--output-dir', type=Path, required=True, help='Fresh directory for outputs and simulator files')
+    parser.add_argument('--start', type=int, default=0)
+    parser.add_argument('--stop', type=int)
+    parser.add_argument('--frequency', type=int, default=1)
+    parser.add_argument('--nx', type=int, default=15)
+    parser.add_argument('--nz', type=int, default=20)
+    parser.add_argument('--y-layers', type=int, default=5)
+    parser.add_argument('--dx-ft', type=float, default=5.)
+    parser.add_argument('--dz-ft', type=float, default=5.)
+    parser.add_argument('--ensemble-size', type=int, default=250)
+    parser.add_argument('--opt-members', type=int, default=5)
+    parser.add_argument('--max-iterations', type=int, default=5)
+    parser.add_argument('--max-substitutions', type=int, default=8,
+                        help='Per-point 2D member substitutions before escalation is abandoned '
+                             'in favor of the final 1D update')
+    parser.add_argument('--max-lm-trials', type=int, default=2)
+    parser.add_argument('--misfit-threshold', type=float, default=4.,
+                        help='Reduced measurement misfit below which 1D is deemed sufficient')
+    parser.add_argument('--seed', type=int, default=2026)
+    parser.add_argument('--force-2d', action='store_true', help='Exercise 2D even if the lower fidelities converge')
+    parser.add_argument('--single-update', action='store_true',
+                        help='Engaged 2D points take one batched linearized update '
+                             'instead of iterated LM (one solver batch per point)')
+    parser.add_argument('--prior-style', choices=['blocky', 'gaussian'], default='blocky',
+                        help='1D prior family: two-mode blocky columns or the legacy smooth Gaussian')
+    parser.add_argument('--prior-background', type=float, default=float(np.log10(1.5)),
+                        help='log10 Rh of the background mode (Ohm-m)')
+    parser.add_argument('--prior-reservoir', type=float, default=float(np.log10(30.)),
+                        help='log10 Rh of the reservoir mode (Ohm-m)')
+    parser.add_argument('--prior-mode-std', type=float, default=0.10,
+                        help='Within-mode log10 Rh standard deviation')
+    parser.add_argument('--prior-reservoir-fraction', type=float, default=0.15,
+                        help='Fraction of reservoir-mode cells in the prior')
+    parser.add_argument('--prior-switch-prob', type=float, default=0.05,
+                        help='Per-cell mode-flip probability when chaining on the previous posterior')
+    parser.add_argument('--prior-projection', choices=['on', 'off'], default='on',
+                        help='Mode projection for the blocky prior; off retains identical chaining')
+    parser.add_argument('--regularization', choices=['none', 'tv'], default='none',
+                        help='Approximate TV-regularized ensemble updates (disables mode projection)')
+    parser.add_argument('--tv-weight', type=float, default=.05,
+                        help='Total per-point TV dose in natural-log coordinates')
+    parser.add_argument('--tv-weight-1d', type=float, default=None,
+                        help='1D TV coefficient; defaults to --tv-weight')
+    parser.add_argument('--tv-weight-2d', type=float, default=None,
+                        help='2D TV coefficient; defaults to --tv-weight')
+    parser.add_argument('--tv-epsilon', type=float, default=1e-3,
+                        help='Smoothed-TV gradient scale in ln resistivity per foot')
+    parser.add_argument('--tv-iterations', type=int, default=8,
+                        help='Maximum local IRLS sweeps; no extra simulator calls')
+    parser.add_argument('--tv-max-step', type=float, default=.5,
+                        help='Maximum active 2D increment in optimizer coordinates')
+    parser.add_argument('--tv-amplitude-std', type=float, default=float(np.log(10.)),
+                        help='Weak independent 2D ln Rh prior standard deviation')
+    args = parser.parse_args(argv)
+    if args.ensemble_size < 2 or not 1 <= args.opt_members <= args.ensemble_size:
+        parser.error('Require ensemble-size >= 2 and 1 <= opt-members <= ensemble-size')
+    if min(args.frequency, args.nx, args.nz, args.y_layers, args.max_lm_trials) < 1 or args.max_iterations < 0:
+        parser.error('Sizes, frequency and LM trials must be positive; iterations must be nonnegative')
+    if args.max_substitutions < 0:
+        parser.error('Require max-substitutions >= 0')
+    if not np.isfinite([args.dx_ft, args.dz_ft]).all() or min(args.dx_ft, args.dz_ft) <= 0:
+        parser.error('Cell sizes must be positive and finite')
+    if not np.isfinite(args.misfit_threshold) or args.misfit_threshold <= 0:
+        parser.error('Misfit threshold must be positive and finite')
+    if args.start < 0 or (args.stop is not None and args.stop <= args.start):
+        parser.error('Require 0 <= start < stop')
+    if not np.isfinite([args.prior_background, args.prior_reservoir, args.prior_mode_std,
+                        args.prior_reservoir_fraction, args.prior_switch_prob]).all():
+        parser.error('Prior parameters must be finite')
+    if not args.prior_background < args.prior_reservoir:
+        parser.error('Require prior-background < prior-reservoir (log10 Ohm-m)')
+    if min(args.prior_mode_std, args.prior_reservoir_fraction) <= 0 \
+            or args.prior_reservoir_fraction >= 1 or not 0 <= args.prior_switch_prob < 1:
+        parser.error('Require 0 < mode-std, 0 < reservoir-fraction < 1, 0 <= switch-prob < 1')
+    if not np.isfinite([args.tv_weight, args.tv_epsilon, args.tv_max_step, args.tv_amplitude_std]).all() \
+            or args.tv_weight < 0 or min(args.tv_epsilon, args.tv_max_step, args.tv_amplitude_std) <= 0 \
+            or args.tv_iterations < 1:
+        parser.error('Require finite nonnegative TV weight and positive TV scales/iterations')
+    for weight in (args.tv_weight_1d, args.tv_weight_2d):
+        if weight is not None and (not np.isfinite(weight) or weight < 0):
+            parser.error('Stage-specific TV coefficients must be finite and nonnegative')
+    if args.regularization == 'tv' and not args.single_update:
+        parser.error('TV currently uses --single-update with fixed-Jacobian inner IRLS')
+    n_cells = args.nx * args.nz
+    if (2 * n_cells) ** 2 * 8 > 1024 ** 3:
+        parser.error('Local-window dense covariance exceeds 1 GiB; use a smaller window')
+    return args, config.from_args(args)
+
+
+def prior_parameters_ln(args):
+    """Convert the documented log10 CLI levels and width once at the boundary."""
+    return tuple(np.log(10.) * np.array([args.prior_background, args.prior_reservoir,
+                                       args.prior_mode_std]))
+
+
+def main(argv=None):
+    global dims, dX, dY, dZ, tools, current_shift, remote_2d
+    args, config = parse_args(argv)
+    tv_weight_1d = args.tv_weight if args.tv_weight_1d is None else args.tv_weight_1d
+    tv_weight_2d = args.tv_weight if args.tv_weight_2d is None else args.tv_weight_2d
+    background, reservoir, mode_std = prior_parameters_ln(args)
+    projection = (args.prior_style == 'blocky' and args.prior_projection == 'on'
+                  and args.regularization != 'tv')
+    from pipt.update_schemes.update_methods_ns.approx_update import approx_update
+    benchmark = args.benchmark.resolve()
+    data = pd.read_pickle(args.data.resolve())
+    variances = pd.read_pickle(args.variance.resolve())
+    if not data.index.equals(variances.index) or not data.columns.equals(variances.columns):
+        raise ValueError('Data and variance indices/tools do not match')
+    with h5py.File(benchmark / 'globalmodel.h5', 'r') as handle:
+        depths = handle['wellpath/Z'][:, 0] * meter_to_feet
+    if len(data) != len(depths) or not np.allclose(data.index.to_numpy(), depths):
+        raise ValueError('Observation rows do not match the benchmark trajectory')
+    stop = len(data) if args.stop is None else args.stop
+    if not args.start < stop <= len(data):
+        raise ValueError('Assimilation range lies outside the benchmark')
+    tool_pairs = list(data.columns)
+    tools = [str(tool) for tool in tool_pairs]
+    for index in range(args.start, stop, args.frequency):
+        observation_vectors(data, variances, index, tool_pairs)
+    dims = (args.nx, args.y_layers, args.nz)
+    dX, dY, dZ = args.dx_ft, args.dx_ft, args.dz_ft
+    window = LocalWindow(dims, (dX, dY, dZ))
+    output = args.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    previous_cwd = Path.cwd()
+    np.random.seed(args.seed)
+    try:
+        os.chdir(output)
+        setup_simulators(benchmark, tools)
+        remote_2d = make_remote2d(config, dims, dX, dY, dZ, tools)
+        remote_2d.jobs_dir = str(output / 'jobs')
+        if not remote_2d.backend().trusts_ad('2D'):
+            raise RuntimeError('Select an exact-adjoint 2D solver build')
+        manifest = {**vars(args), 'benchmark': benchmark, 'simulator': asdict(config),
+                    'runtime': remote_2d.runtime_identity(),
+                    'tools': tool_pairs, 'dims': dims, 'spacing_ft': (dX, dY, dZ),
+                     'covariance_bytes': (2 * args.nx * args.nz) ** 2 * 8,
+                     'parameter_units': '[ln(Rh / Ohm m), anisotropy latent]',
+                     'prior_projection_effective': projection,
+                     'tv_weights_effective': {'1D': tv_weight_1d, '2D': tv_weight_2d},
+                     'prior_units': {'cli': 'log10', 'internal': 'natural_log',
+                                     'background_ohm_m': float(np.exp(background)),
+                                     'reservoir_ohm_m': float(np.exp(reservoir)),
+                                     'background_ln': background, 'reservoir_ln': reservoir,
+                                     'mode_std_ln': mode_std, 'projection_radius_ln': 2 * mode_std}}
+        (output / 'run.json').write_text(json.dumps(manifest, default=str, indent=2))
+        print(f'Local window {dims}, spacing {(dX, dY, dZ)} ft; backend={config.backend}', flush=True)
+        previous = None
+        previous_kind = None
+        previous_1d = None
+        previous_index = None
+        for index in range(args.start, stop, args.frequency):
+            point_started = time.monotonic()
+            current_shift, movement = window.update((WX[index], WY[index], TVD[index]))
+            _set_logging_point_state(index)
+            aligned = (shift_posterior(previous, dims, movement)
+                       if previous_kind == '2D' else None)
+            observations, Cd = observation_vectors(data, variances, index, tool_pairs)
+            sub_cell = np.zeros(len(observations), dtype=bool)
+            sub_cell[component_positions(len(observations))] = True
+            obs_mask = ~(noise_floor_mask(observations, Cd) | sub_cell)
+            if not obs_mask.any():
+                raise ValueError(f'Index {index}: every channel is masked')
+            masked_channels = int((~obs_mask).sum())
+            if masked_channels:
+                print(f'Index {index}: masking {masked_channels} unrepresentable channels', flush=True)
+            observations, Cd = observations[obs_mask], Cd[obs_mask]
+
+            def predict_ensemble(ens, fidelity):
+                full = np.column_stack([simulate_pred_only(ens[:, member], index, fidelity)
+                                        for member in range(ens.shape[1])])
+                return full[obs_mask]
+
+            threshold = args.misfit_threshold
+            if args.prior_style == 'gaussian':
+                ensemble, covariance, mean = sample_prior_0D_gaussian(args.ensemble_size)
+            else:
+                ensemble, covariance, mean = sample_prior_0D(
+                    args.ensemble_size, background, reservoir,
+                    mode_std, args.prior_reservoir_fraction)
+            ensemble = clamp_log_rh(ensemble)
+            updater = approx_update()
+            ne = args.ensemble_size
+            updater.proj = (np.eye(ne) - np.ones((ne, ne)) / ne) / np.sqrt(ne - 1)
+            updater.trunc_energy, updater.keys_da, updater.lam = .95, {}, 0
+            updater.list_states = ['rh', 'rv']
+            alpha, used_weight = 10., 0.
+            misfit = {}
+            tv_history = []
+            spatial_weight = None
+            for fidelity, budget in (('0D', .25), ('1D', .75)):
+                if fidelity == '1D':
+                    spatial_weight = 1. - used_weight
+                    if args.prior_style == 'gaussian':
+                        ensemble, covariance, mean = resample_prior_0D_to_1D(ne, ensemble)
+                    elif previous_1d is not None:
+                        trend = shift_posterior_1d(previous_1d.T, dims[2], movement).T
+                        ensemble, covariance, mean = sample_chained_prior_1D(
+                            ne, trend, background, reservoir,
+                            mode_std, args.prior_reservoir_fraction,
+                            args.prior_switch_prob, projection=projection)
+                    else:
+                        ensemble, covariance, mean = sample_blocky_prior_1D(
+                            ne, ensemble[0], background, reservoir,
+                            mode_std, args.prior_reservoir_fraction, projection=projection)
+                    ensemble = clamp_log_rh(ensemble)
+                updater.state_scaling = np.ones(ensemble.shape[0])
+                active = ensemble.shape[0] // 2
+                updater.prior_info = {key: {'active': active} for key in ('rh', 'rv')}
+                prediction = predict_ensemble(ensemble, fidelity)
+                misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
+                misfit[f'{fidelity}_initial'] = misfit_now
+                while misfit_now > threshold and used_weight < budget:
+                    inflated = Cd * alpha
+                    updater.scale_data = np.sqrt(inflated)
+                    perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None], (len(Cd), ne))
+                    updater.update(enX=ensemble, enY=prediction, enE=perturbed)
+                    ensemble += updater.step
+                    np.clip(ensemble[:active], *LOG_RH_LIMITS, out=ensemble[:active])
+                    if projection:
+                        ensemble[:active] = project_to_modes(
+                            ensemble[:active], background, reservoir, 2. * mode_std)
+                    if args.regularization == 'tv' and fidelity == '1D':
+                        dose = tv_weight_1d / alpha / spatial_weight
+                        ensemble = tv.regularize_columns(ensemble, dose, dZ,
+                                                         args.tv_epsilon, args.tv_iterations)
+                        tv_history.append({'stage': '1D', 'strength': dose,
+                                           'assimilation_fraction': 1 / alpha / spatial_weight})
+                    used_weight += 1 / alpha
+                    alpha *= 10 / 9
+                    prediction = predict_ensemble(ensemble, fidelity)
+                    misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
+                    print(f'Index {index}, {fidelity}: misfit={misfit_now:.6g}, weight={used_weight:.4f}', flush=True)
+                misfit[f'{fidelity}_final'] = misfit_now
+            ranking_full = np.argsort([custom_loss(prediction[:, member], observations, ensemble[:, member], mean, covariance, Cd)
+                                       for member in range(ne)])
+            ranking = ranking_full[:args.opt_members]
+            selected = ensemble[:, ranking]
+            factor = 1 / (1 - used_weight)
+            inflated = Cd * factor
+            final_tv_fraction = 1 / factor / spatial_weight
+            final_tv_dose = tv_weight_2d * final_tv_fraction
+            escalate = args.force_2d or misfit_now > threshold
+            two_d_evaluations = [0]
+            nx, _, nz = dims
+            escalation_abandoned = None
+            solver_failures = []
+            mean_1d, covariance_1d = mean, covariance
+            tv_history_mark = len(tv_history)
+            if escalate:
+                indices = np.arange(nx // 2 + 1)
+                if args.prior_style == 'blocky':
+                    prior_spread = (mode_std, ratio_latent_std)
+                    if aligned is not None and projection:
+                        aligned = aligned.copy()
+                        aligned[:, :nx * nz] = project_to_modes(
+                            aligned[:, :nx * nz], background, reservoir, 2. * mode_std)
+                elif aligned is None:
+                    half = ensemble.shape[0] // 2
+                    prior_spread = (float(np.median(ensemble[:half].std(axis=1))),
+                                    float(np.median(ensemble[half:].std(axis=1))))
                 else:
-                    print(f"Iteration {iter}, Loss: {curr_loss} (LM step rejected, lambda={used_lambda:.3g})")
-                    break
-            post_param.append(param_current)
-            post_pred.append(pred_trial)
-            post_loss.append(trial_loss)
+                    prior_spread = (float(np.median(aligned[:, :nx * nz].std(axis=0))),
+                                    float(np.median(aligned[:, nx * nz:].std(axis=0))))
+                columns = []
+                for column in indices:
+                    if aligned is None or column == nx // 2:
+                        center = selected
+                    else:
+                        center = aligned.reshape(args.opt_members, 2, nx, nz)[:, :, column, :] \
+                            .reshape(args.opt_members, 2 * nz).T.copy()
+                    if args.prior_style == 'blocky':
+                        center = np.apply_along_axis(soften_column_edges, 0, center, nz)
+                    columns.append(center.copy())
+                prior, covariance, mean = resample_prior_multiple_1D_to_2D(
+                    args.opt_members, columns, indices, aligned, prior_spread)
+                prior = clamp_log_rh(prior)
+                perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None],
+                                             (len(Cd), args.opt_members))
+                active_cells = np.ones((2, nx, nz), dtype=bool)
+                active_cells[:, :nx // 2] = False
 
-        assess_intermediate_param_values(2, post_estim=True)
-        if not debug:
-            plot_ensemble_predictions(
-                np.array(post_pred).T, data_real, data_vec,
-                title_suffix=f'After Gradient Iterations',
-                filename=f'ensemble_posterior_predictions_assim_step{assim_index[0]}.png'
-                )
-        # save results
-        results_dict = {
-            'prior_params': pr,
-            'post_mda_params': param_vec,
-            'posterior_params': post_param,
-            'posterior_predictions': post_pred,
-            'posterior_losses': post_loss
-        }
-        # save to pickle
-        with open(f'inversion_results_assim_{assim_index[0]}.pkl', 'wb') as f:
-            pickle.dump(results_dict, f)
+                def evaluate_multi_2d(param_list):
+                    two_d_evaluations[0] += len(param_list)
+                    results = simulate_and_grad_multi(param_list, index)
+                    masked = []
+                    for res in results:
+                        if isinstance(res, Exception):
+                            masked.append(res)
+                        else:
+                            masked.append((res[0][obs_mask], res[1][obs_mask]))
+                    return masked
+
+                def substitute_prior(slot, candidate):
+                    center = ensemble[:, [candidate]].copy()
+                    if args.prior_style == 'blocky':
+                        center = np.apply_along_axis(soften_column_edges, 0, center, nz)
+                    member_columns = []
+                    for column in indices:
+                        if aligned is None or column == nx // 2:
+                            member_columns.append(center)
+                        else:
+                            member_columns.append(aligned.reshape(-1, 2, nx, nz)[slot, :, column, :]
+                                                   .reshape(2 * nz, 1))
+                    previous = None if aligned is None else aligned.reshape(-1, 2 * nx * nz)[slot:slot + 1]
+                    single, _, _ = resample_prior_multiple_1D_to_2D(1, member_columns, indices,
+                                                                    previous, prior_spread)
+                    return clamp_log_rh(single[:, 0])
+
+                member_candidates = [int(rank) for rank in ranking]
+                next_rank = [args.opt_members]
+
+                def substitute(slot, exc):
+                    if len(solver_failures) >= args.max_substitutions:
+                        print(f'Index {index}, 2D slot {slot}: substitution cap '
+                              f'{args.max_substitutions} reached; abandoning 2D escalation', flush=True)
+                        return None
+                    if next_rank[0] >= ne:
+                        print(f'Index {index}, 2D slot {slot}: {exc}; no members left to substitute',
+                              flush=True)
+                        return None
+                    candidate = int(ranking_full[next_rank[0]])
+                    next_rank[0] += 1
+                    solver_failures.append({'slot': slot, 'member': member_candidates[slot],
+                                            'substitute': candidate, 'error': str(exc)})
+                    print(f'Index {index}, 2D slot {slot}: initial evaluation failed; '
+                          f'substituting ensemble member {candidate}', flush=True)
+                    prior[:, slot] = substitute_prior(slot, candidate)
+                    perturbed[:, slot] = np.random.normal(observations, np.sqrt(inflated))
+                    member_candidates[slot] = candidate
+                    return prior[:, slot], perturbed[:, slot]
+
+                try:
+                    if args.single_update:
+                        update = map_update_data_space_LM
+                        if args.regularization == 'tv':
+                            def update(theta, prediction, prior_mean, jacobian, datum, data_cov, prior_cov, damping):
+                                return tv.linearized_step(
+                                    theta, prediction, prior_mean, jacobian, datum, data_cov,
+                                    (nx, nz), (dX, dZ), final_tv_dose, active_cells.ravel(),
+                                    args.tv_epsilon, args.tv_iterations, args.tv_amplitude_std,
+                                    args.tv_max_step, LOG_RH_LIMITS)
+
+                            tv_history.append({'stage': '2D', 'strength': final_tv_dose,
+                                               'assimilation_fraction': 1 / factor / spatial_weight})
+                        records = update_members_once([prior[:, slot] for slot in range(args.opt_members)],
+                                                       [perturbed[:, slot] for slot in range(args.opt_members)],
+                                                       mean, covariance, inflated, evaluate_multi_2d,
+                                                        update, custom_loss,
+                                                       active_cells.ravel(), substitute=substitute)
+                    else:
+                        records = optimize_members([prior[:, slot] for slot in range(args.opt_members)],
+                                                   [perturbed[:, slot] for slot in range(args.opt_members)],
+                                                   mean, covariance, inflated, evaluate_multi_2d,
+                                                   map_update_data_space_LM, custom_loss,
+                                                   args.max_iterations, args.max_lm_trials,
+                                                   active_cells.ravel(), substitute=substitute)
+                except MemberEvaluationError as exc:
+                    escalation_abandoned = str(exc)
+                    print(f'Index {index}: 2D escalation abandoned after '
+                          f'{len(solver_failures)} substitutions; applying final 1D update', flush=True)
+                    mean, covariance = mean_1d, covariance_1d
+                    del tv_history[tv_history_mark:]
+                    escalate = False
+                else:
+                    for slot, record in enumerate(records):
+                        label = 'gaussian_diagnostic_loss' if args.regularization == 'tv' else 'loss'
+                        print(f'Index {index}, 2D member {slot+1} (candidate {member_candidates[slot]}): '
+                              f'{label}={record["loss"]:.6g}, iterations={len(record["history"]) - 1}', flush=True)
+                    previous = np.stack([record['parameters'] for record in records])
+                    previous_kind = '2D'
+                    previous_1d = np.stack([np.concatenate(
+                        [np.asarray(record['parameters'])[:nx * nz].reshape(nx, nz)[nx // 2, :],
+                         np.asarray(record['parameters'])[nx * nz:].reshape(nx, nz)[nx // 2, :]])
+                        for record in records], axis=-1)
+                    posterior_misfit = [measurement_misfit(record['prediction'], observations, Cd)
+                                        for record in records]
+                    misfit['before_final'] = misfit['1D_final']
+                    misfit['after_final'] = float(np.mean(posterior_misfit))
+                    worsened = False
+                    results = {'prior_params': prior, 'post_mda_params': prior.copy(),
+                               'post_1d_params': selected,
+                               'posterior_params': [record['parameters'] for record in records],
+                               'posterior_predictions': [record['prediction'] for record in records],
+                               'posterior_losses': [record['loss'] for record in records],
+                               'optimizer_history': [record['history'] for record in records],
+                               'trial_errors': [record['trial_errors'] for record in records],
+                               'observations': observations, 'perturbed_observations': perturbed,
+                               'data_covariance': inflated, 'prior_mean': mean, 'prior_covariance': covariance,
+                               'dims': dims, 'spacing_ft': (dX, dY, dZ), 'shift_ft': dict(current_shift),
+                               'window_movement': movement, 'previous_index': previous_index,
+                               'logging_index': index, 'tools': tool_pairs, 'seed': args.seed,
+                               'mda_weight': used_weight + 1 / factor, 'lower_fidelity_weight': used_weight,
+                               'final_inflation_factor': factor,
+                               'optimized_2d': True, 'selected_fidelity': '2D', 'two_d_calls': two_d_evaluations[0],
+                               'two_d_mode': 'single-update' if args.single_update else 'lm',
+                               'prior_style': args.prior_style,
+                               'misfit': misfit, 'misfit_threshold': threshold,
+                               'posterior_misfit': posterior_misfit, 'final_iteration_worsened': worsened,
+                               'member_candidates': member_candidates, 'solver_failures': solver_failures,
+                               'substituted_members': len(solver_failures), 'prior_spread': prior_spread,
+                               'observation_mask': obs_mask, 'masked_channels': masked_channels,
+                               'masked_components': masked_udar_components}
+            if not escalate:
+                misfit['before_final'] = misfit['1D_final']
+                updater.state_scaling = np.ones(ensemble.shape[0])
+                active = ensemble.shape[0] // 2
+                updater.prior_info = {key: {'active': active} for key in ('rh', 'rv')}
+                updater.scale_data = np.sqrt(inflated)
+                perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None], (len(Cd), ne))
+                updater.update(enX=ensemble, enY=prediction, enE=perturbed)
+                ensemble += updater.step
+                np.clip(ensemble[:active], *LOG_RH_LIMITS, out=ensemble[:active])
+                if projection:
+                    ensemble[:active] = project_to_modes(
+                        ensemble[:active], background, reservoir, 2. * mode_std)
+                if args.regularization == 'tv':
+                    final_tv_dose = tv_weight_1d * final_tv_fraction
+                    ensemble = tv.regularize_columns(ensemble, final_tv_dose, dZ,
+                                                     args.tv_epsilon, args.tv_iterations)
+                    tv_history.append({'stage': 'final_1D', 'strength': final_tv_dose,
+                                       'assimilation_fraction': 1 / factor / spatial_weight})
+                used_weight += 1 / factor
+                prediction = predict_ensemble(ensemble, '1D')
+                misfit_now = measurement_misfit(prediction.mean(axis=1), observations, Cd)
+                misfit['after_final'] = misfit_now
+                worsened = bool(misfit_now > misfit['before_final'])
+                print(f'Index {index}, final 1D update: misfit {misfit["before_final"]:.6g} -> '
+                      f'{misfit_now:.6g}{" (increased)" if worsened else ""}, weight=1.0000', flush=True)
+                ranking = np.argsort([custom_loss(prediction[:, member], perturbed[:, member],
+                                                  ensemble[:, member], mean, covariance, inflated)
+                                      for member in range(ne)])[:args.opt_members]
+                selected = ensemble[:, ranking]
+                perturbed = perturbed[:, ranking]
+                records = [{'parameters': selected[:, member].copy(),
+                            'prediction': prediction[:, ranking[member]],
+                            'loss': custom_loss(prediction[:, ranking[member]], perturbed[:, member],
+                                                selected[:, member], mean, covariance, inflated)}
+                           for member in range(args.opt_members)]
+                previous = selected.T
+                previous_kind = '1D'
+                previous_1d = selected
+                posterior_misfit = [measurement_misfit(record['prediction'], observations, Cd)
+                                    for record in records]
+                results = {'prior_params': None, 'post_mda_params': selected.copy(),
+                           'post_1d_params': selected.copy(),
+                           'posterior_params': [record['parameters'] for record in records],
+                           'posterior_predictions': [record['prediction'] for record in records],
+                           'posterior_losses': [record['loss'] for record in records],
+                           'optimizer_history': [[record['loss']] for record in records],
+                           'trial_errors': [[] for _ in records],
+                           'observations': observations, 'perturbed_observations': perturbed,
+                           'data_covariance': inflated, 'prior_mean': mean, 'prior_covariance': covariance,
+                           'dims': dims, 'spacing_ft': (dX, dY, dZ), 'shift_ft': dict(current_shift),
+                           'window_movement': movement, 'previous_index': previous_index,
+                           'logging_index': index, 'tools': tool_pairs, 'seed': args.seed,
+                           'mda_weight': used_weight, 'lower_fidelity_weight': used_weight - 1 / factor,
+                           'final_inflation_factor': factor,
+                            'optimized_2d': False, 'selected_fidelity': '1D', 'two_d_calls': two_d_evaluations[0],
+                            'prior_style': args.prior_style,
+                           'misfit': misfit, 'misfit_threshold': threshold,
+                           'posterior_misfit': posterior_misfit, 'final_iteration_worsened': worsened,
+                           'member_candidates': [int(rank) for rank in ranking], 'solver_failures': [],
+                           'substituted_members': 0,
+                            'observation_mask': obs_mask, 'masked_channels': masked_channels,
+                            'masked_components': masked_udar_components}
+                if escalation_abandoned is not None:
+                    results.update(solver_failures=solver_failures,
+                                   substituted_members=len(solver_failures),
+                                   escalation_abandoned=escalation_abandoned,
+                                   two_d_mode='abandoned')
+            linearized = escalate and args.single_update
+            kind = 'linearized' if linearized else 'forward'
+            results.update(parameter_units='natural_log', prior_projection=args.prior_projection,
+                           prior_units=manifest['prior_units'], posterior_prediction_kind=kind,
+                           posterior_misfit_kind=kind, posterior_forward_verified=not linearized,
+                           point_elapsed_seconds=time.monotonic() - point_started)
+            results.update(regularization=args.regularization, tv_weight=args.tv_weight,
+                           tv_epsilon=args.tv_epsilon, tv_iterations=args.tv_iterations,
+                           tv_history=tv_history, prior_projection_effective=projection,
+                           tv_strength_applied=sum(entry['strength'] for entry in tv_history),
+                           loss_kind='gaussian_diagnostic' if args.regularization == 'tv' else 'gaussian')
+            results['tv_weights_effective'] = manifest['tv_weights_effective']
+            if args.regularization == 'tv':
+                shape, spacing = ((nx, nz), (dX, dZ)) if escalate else ((nz,), (dZ,))
+                cells = int(np.prod(shape))
+                results['posterior_tv'] = [tv.value_and_gradient(np.asarray(param)[:cells], shape,
+                                                                spacing, args.tv_epsilon)[0]
+                                            for param in results['posterior_params']]
+            results['misfit']['after_final_kind'] = kind
+            if linearized:
+                results['prior_forward_predictions'] = [record['initial_prediction'] for record in records]
+                results['prior_forward_misfit'] = [measurement_misfit(record['initial_prediction'],
+                                                                      observations, Cd) for record in records]
+            with open(f'inversion_results_assim_{index}.pkl', 'xb') as stream:
+                pickle.dump(results, stream)
+            previous_index = index
+    finally:
+        os.chdir(previous_cwd)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -1,134 +1,82 @@
+"""Generate canonical UDAR observations and per-log-point variances."""
+
+import argparse
 import csv
-import pathlib
-import numpy as np
-import pickle
-import pandas as pd
-import h5py
-from ThreeDGiGEarth.common import h5_to_dict
 from pathlib import Path
-from collections import defaultdict
-#PROJECT_ROOT =  pathlib.Path(__file__).resolve().parents[1]
 
-data_index = [('6kHz','83ft'),('12kHz','83ft'),('24kHz','83ft'),('24kHz','43ft'),('48kHz','43ft'),('96kHz','43ft')]
+import h5py
+import numpy as np
+import pandas as pd
 
-datatyp = 'Bfield'
-
-BENCHMARK_ROOT = '/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3/'
-REFERENCE_MODEL = '/home/AD.NORCERESEARCH.NO/mlie/3DGiG/Jacobian/inversion/data/Benchmark-3/globalmodel.h5'
-
-#REFERENCE_MODEL = PROJECT_ROOT / 'inversion' / 'data' / 'Benchmark-3' / 'globalmodel.h5'
-#BENCHMARK_ROOT = PROJECT_ROOT / 'inversion-NN' / 'data' / 'Benchmark-3'
-
-with h5py.File(REFERENCE_MODEL, 'r') as f:
-    ref_model = h5_to_dict(f)
-
-tvd = ref_model['wellpath']['Z'][:, 0] * 3.28084  # feet
-
-#ED = T[:,5]
-
-#with open('../inputs/trajectory.DAT','r') as f:
-#    lines = f.readlines()
-#    tvd = [el.strip().split()[1] for el in lines][1:]
-
-k = open('assim_index.csv','w',newline='')
-#writer4 = csv.writer(k)
-l = open('datatyp.csv','w',newline='')
-writer5 = csv.writer(l)
-
-data = {}
-var={}
-
-# build a pandas dataframe with the data.
-# The tvd is the index and the tuple (freq,dist) is the columns
-abs_frac = 0.025
-min_floor = 1e-12
-ampl_fac = 1.0  # if you still need abs floor logic; otherwise ignore
-
-# First pass: accumulate sums and counts per step index
-sums_by_step = defaultdict(lambda: None)   # maps step_idx -> sum array
-counts_by_step = defaultdict(int)
-
-for di in data_index:
-    freq, dist = di
-    p = Path(f'{BENCHMARK_ROOT}/logdata/{datatyp}_{dist}_{freq}.las')
-    if not p.exists():
-        continue
-    with p.open('r') as f:
-        lines = f.readlines()[1:]
-        for step_idx, el in enumerate(lines):
-            vals = np.array(el.strip().split()[1:], dtype=np.float64)
-            if sums_by_step[step_idx] is None:
-                sums_by_step[step_idx] = np.zeros_like(vals)
-            sums_by_step[step_idx] += np.abs(vals)   # absolute values
-            counts_by_step[step_idx] += 1
-
-if not counts_by_step:
-    raise RuntimeError("No data found to compute per-step means")
-
-# Compute mean across all tool settings & data types for each step and measurement
-max_step = max(sums_by_step.keys())
-means_by_step = {}
-for step in range(max_step + 1):
-    if counts_by_step.get(step, 0) == 0:
-        raise RuntimeError(f"No data for step {step}")
-    means = sums_by_step[step] / counts_by_step[step]
-    means = np.maximum(means, min_floor)   # avoid zero
-    means_by_step[step] = means            # shape (n_meas,)
-
-# Optional: small absolute floor based on global minima if you still want an abs floor
-# (compute across all steps & channels if desired)
-# global_min = min(np.min(sums_by_step[s] / counts_by_step[s]) for s in means_by_step)
-# abs_floor = global_min * ampl_fac
-
-# Second pass: populate data and set relative-variance per row using the step mean
-for di in data_index:
-    freq, dist = di
-    try:
-        p = Path(f'{BENCHMARK_ROOT}/logdata/{datatyp}_{dist}_{freq}.las')
-        with p.open('r') as f:
-            lines = f.readlines()
-            values = [np.array(el.strip().split()[1:], dtype=np.float32) for el in lines[1:]]
-            data[(freq, dist)] = values
-
-            # Build var entries: for each row (step_idx) use the step mean to compute variance
-            per_row_vars = []
-            for step_idx, val in enumerate(values):
-                mean_step = means_by_step[step_idx]               # shape (n_meas,)
-                abs_err = abs_frac * mean_step                    # absolute error per channel for that step
-                abs_err = np.maximum(abs_err, min_floor)         # avoid zero
-                var_row = (abs_err ** 2).tolist()                # variance per channel for that row
-                per_row_vars.append(var_row)
-
-            # Choose structure expected downstream:
-            # Option A: single header then per-row lists: [['ABS'] + [var_row1, var_row2, ...]]
-            var[(freq, dist)] = [['ABS'] + per_row_vars]
-
-            # Option B (if downstream expects ['ABS', [v0,v1,...]] same for all rows):
-            # var[(freq, dist)] = ['ABS', list((abs_frac * np.mean(list(means_by_step.values()), axis=0))**2)]
-
-    except Exception:
-        data[(freq, dist)] = None
-        var[(freq, dist)] = None
-        continue
+from esmda_remote2d import UDAR_COMPONENTS
 
 
+def read_las(path):
+    lines = Path(path).read_text().splitlines()
+    names = lines[0].lstrip('%').split()
+    missing = set(UDAR_COMPONENTS) - set(names)
+    if missing:
+        raise ValueError(f'{path}: missing UDAR components {sorted(missing)}')
+    columns = [names.index(component) for component in UDAR_COMPONENTS]
+    values = np.array([[float(token.replace('D', 'E')) for token in line.split()]
+                       for line in lines[1:] if line.strip()], dtype=float)
+    return values[:, 0], values[:, columns]
 
 
-df = pd.DataFrame(data,columns=data_index,index=tvd)
-df.index.name = 'tvd'
-#df.to_csv('data.csv',index=True)
-df.to_pickle('data.pkl')
+def generate_data(benchmark, tools, output, abs_frac=.025):
+    benchmark, output = Path(benchmark), Path(output)
+    if not np.isfinite(abs_frac) or abs_frac <= 0:
+        raise ValueError('Noise fraction must be positive and finite')
+    with h5py.File(benchmark / 'globalmodel.h5', 'r') as handle:
+        tvd = handle['wellpath/Z'][:, 0] * 3.28084
+        expected_md = handle['wellpath/Distance'][:, 0] * 3.28084
+    values = []
+    for freq, sub in tools:
+        md, datum = read_las(benchmark / 'outputs_2D' / f'UDAR3D_{sub}_{freq}.las')
+        if md.shape != expected_md.shape or not np.allclose(md, expected_md, rtol=0, atol=.02):
+            raise ValueError(f'LAS trajectory does not match benchmark: {freq}, {sub}')
+        if not np.isfinite(datum).all():
+            raise ValueError(f'Non-finite observations: {freq}, {sub}')
+        values.append(datum)
+    values = np.stack(values, axis=1)
+    std = np.maximum(abs_frac * np.mean(np.abs(values), axis=1), 1e-12)
+    variances = std ** 2
+    data = pd.DataFrame({tool: [row.copy() for row in values[:, i]] for i, tool in enumerate(tools)}, index=tvd)
+    variance = pd.DataFrame({tool: [['ABS', row.tolist()] for row in variances] for tool in tools}, index=tvd)
+    data.index.name = variance.index.name = 'tvd'
+    data.attrs.update(components=UDAR_COMPONENTS, benchmark=str(benchmark.resolve()))
+    variance.attrs.update(components=UDAR_COMPONENTS, noise_fraction=abs_frac)
+    output.mkdir(parents=True, exist_ok=True)
+    data.to_pickle(output / 'data.pkl')
+    variance.to_pickle(output / 'var.pkl')
+    (output / 'assim_index.csv').write_text(''.join(f'{i}\n' for i in range(len(tvd))))
+    with (output / 'datatyp.csv').open('w', newline='') as stream:
+        csv.writer(stream).writerow([str(tool) for tool in tools])
+    return data, variance
 
-df = pd.DataFrame(var,columns=data_index,index=tvd)
-df.index.name = 'tvd'
-with open('var.pkl','wb') as f:
-    pickle.dump(df,f)
 
-#filt = [i*10 for i in range(50)]
-for c,_ in enumerate(tvd):
-    #if c in filt:
-    k.writelines(str(c) + '\n')
-k.close()
+def main(argv=None):
+    import re
+    here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--benchmark', type=Path, default=here.parent / 'Dashboard/benchmarks/Benchmark-3')
+    parser.add_argument('--output-dir', type=Path, required=True, help='Fresh directory for generated observations')
+    parser.add_argument('--noise-fraction', type=float, default=.025)
+    args = parser.parse_args(argv)
+    tools = []
+    for path in sorted((args.benchmark / 'outputs_2D').glob('UDAR3D_*.las')):
+        match = re.fullmatch(r'UDAR3D_(\d+)ft_(\d+)kHz', path.stem)
+        if match:
+            sub, freq = match.groups()
+            tools.append((f'{freq}kHz', f'{sub}ft'))
+    if not tools:
+        raise FileNotFoundError('No 2D benchmark UDAR LAS files found')
+    if args.output_dir.exists():
+        raise FileExistsError('Use a fresh output directory')
+    data, _ = generate_data(args.benchmark, tools, args.output_dir, args.noise_fraction)
+    print(f'Wrote {len(data)} rows, {len(tools)} tools, {len(UDAR_COMPONENTS)} channels/tool')
+    return 0
 
-writer5.writerow([str(el) for el in data_index])
-l.close()
+
+if __name__ == '__main__':
+    raise SystemExit(main())
