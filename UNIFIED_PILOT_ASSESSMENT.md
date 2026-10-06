@@ -65,6 +65,25 @@ Unified domain, `--nx 33 --ensemble-size 400`, TV `1D 0.1 / 2D 0.05 / step
 full run: none blocking; optionally confirm u33+400+invariant at index 80 in
 one forced diagnostic.
 
+## Confirmation at the recommended configuration
+
+`runs/unified-confirm-20261006T131623Z/` — forced index 80 with
+`--nx 33 --ensemble-size 400 --engagement-prior invariant`:
+
+- Prior forward misfits 88–133 (invariant prior consistent, zero substitutions).
+- Linearized posterior misfits 6.2–13.0; **forward-verified mean 35.7**
+  (all 5 members, 34 s check) vs staged 37.4 and u15+invariant 27.9.
+  Note the printed `gaussian_diagnostic_loss` (~3e7 here) is the
+  inflated-covariance plus prior-penalty diagnostic, not the data misfit.
+- The u15 variant fits this point slightly better but carries the
+  ±35 ft window-truncation error (up to 98σ, window-size study); the
+  recommended configuration trades that for boundary correctness at
+  near-equal per-point fit.
+
+No blockers remain for a full unified run with: `--nx 33
+--ensemble-size 400 --engagement-prior invariant`, TV `1D 0.1 / 2D 0.05 /
+step 0.25`, threshold 100, cap 8.
+
 ## Caveats
 
 One seed; three-point zones; one forced geometry; the nx=33 choice rests on
