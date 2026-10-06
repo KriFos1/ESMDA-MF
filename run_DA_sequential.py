@@ -220,6 +220,25 @@ def shift_window_state(state, movement, background, reservoir, mode_std, latent_
     return np.vstack([rh.reshape(cells, ne), latent.reshape(cells, ne)])
 
 
+def engagement_invariant_windows(members, dims):
+    """Per-member x-invariant engagement priors from each bit column.
+
+    The 1D evidence constrains only the bit column; extending it laterally
+    makes no untested lateral claims, unlike an ensemble whose flank
+    realizations can sit orders of magnitude from 2D-data consistency.
+    """
+    nx, _, nz = dims
+    values = np.asarray(members, dtype=float)
+    if values.ndim != 2 or values.shape[0] != 2 * nx * nz:
+        raise ValueError('Engagement members must have shape (2*nx*nz, members)')
+    ne = values.shape[1]
+    cells = nx * nz
+    column = values.reshape(2, nx, nz, ne)[:, nx // 2, :, :]
+    return np.vstack([np.repeat(column[field][:, None, :], nx, axis=1)
+                      .transpose(1, 0, 2).reshape(cells, ne)
+                      for field in (0, 1)])
+
+
 def _build_param_dict(param):
     n_cells = dims[0] * dims[2]
     param = np.asarray(param, dtype=float)
@@ -338,6 +357,10 @@ def parse_args(argv=None):
     parser.add_argument('--max-substitutions', type=int, default=8,
                         help='Per-point 2D member substitutions before escalation is abandoned '
                              'in favor of the final 1D update')
+    parser.add_argument('--engagement-prior', choices=['ensemble', 'invariant'], default='ensemble',
+                        help='2D engagement prior: the carried window ensemble, or per-member '
+                             'x-invariant extension of the bit column (no lateral claims beyond '
+                             'the 1D evidence)')
     parser.add_argument('--max-lm-trials', type=int, default=2)
     parser.add_argument('--misfit-threshold', type=float, default=4.,
                         help='Reduced measurement misfit below which 1D is deemed sufficient')
@@ -589,6 +612,8 @@ def main(argv=None):
             worsened = False
             if escalate:
                 prior = post_1d_state[:, ranking].copy()
+                if args.engagement_prior == 'invariant':
+                    prior = engagement_invariant_windows(prior, dims)
                 mean_2d = prior.mean(axis=1)
                 covariance_2d = np.diag(np.maximum(prior.var(axis=1), 1e-8))
                 perturbed = np.random.normal(observations[:, None], np.sqrt(inflated)[:, None],
@@ -625,6 +650,9 @@ def main(argv=None):
                     print(f'Index {index}, 2D slot {slot}: initial evaluation failed; '
                           f'substituting ensemble member {candidate}', flush=True)
                     prior[:, slot] = post_1d_state[:, candidate].copy()
+                    if args.engagement_prior == 'invariant':
+                        prior[:, slot] = engagement_invariant_windows(
+                            prior[:, slot:slot + 1], dims)[:, 0]
                     perturbed[:, slot] = np.random.normal(observations, np.sqrt(inflated))
                     member_candidates[slot] = candidate
                     return prior[:, slot], perturbed[:, slot]

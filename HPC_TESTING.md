@@ -43,6 +43,17 @@ posterior check succeeded for all five members: true mean misfit 95.31 versus
 linearized 91.40. No full inversion was relaunched. See the assessment for
 scope limits and acceptance decision.
 
+# Unified-domain pilot results — 2026-10-06 (afternoon)
+
+See `UNIFIED_PILOT_ASSESSMENT.md` for the full record. Headlines: unified 1D
+regime matches/beats the staged baseline; nx=33 requires ensemble 400 (rank);
+direct 2D engagement from the carried ensemble is structurally broken
+(laterally-honest priors sit 1e4–2e5 from 2D consistency; single-update and
+iterated LM both fail) and is fixed by the **x-invariant engagement prior**
+(`--engagement-prior invariant`): verified misfit 27.9 vs staged 37.4 at
+index 80, zero substitutions, 88 s. Parallel controller waves need pinned
+BLAS threads (`OMP_NUM_THREADS=1` in `pilot_unified.py`).
+
 # Window-size study and solver-domain mechanics — 2026-10-06
 
 `window_size_test.py` (artifacts `runs/window-size-20261006T{085521Z,091248Z}`,
