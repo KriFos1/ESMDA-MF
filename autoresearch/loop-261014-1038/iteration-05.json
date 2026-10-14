@@ -1,0 +1,35 @@
+{
+  "iteration": 5,
+  "description": "Test a milder downweighting of UADP/UADA channels",
+  "change": {
+    "variance_components": ["UADP", "UADA"],
+    "variance_multiplier": 2.0,
+    "previous_discarded_multiplier": 4.0,
+    "rationale": "The factor-4 arm substantially improved field RMSE but worsened data fit; factor 2 tests the intermediate tradeoff."
+  },
+  "variance_file": "autoresearch/loop-261014-1038/variance-uadp-uada-x2.pkl",
+  "variance_generation": "../Dashboard/.venv/bin/python -B autoresearch/loop-261014-1038/scale_variance.py --input runs/benchmark3-data-20261002/var.pkl --output autoresearch/loop-261014-1038/variance-uadp-uada-x2.pkl --components UADP UADA --factor 2",
+  "fixed_controls": {
+    "indices": [31, 32, 33, 34, 35],
+    "resume_checkpoint": "runs/benchmark3-lm-laplace-t75-lx10-5starts-20261013/inversion_results_assim_30.pkl",
+    "misfit_threshold": 75.0,
+    "one_d_budget": 0.25,
+    "final_stage": "lm-laplace",
+    "lm_laplace_iterations": 15,
+    "lm_laplace_starts": 5,
+    "lm_laplace_seconds": 1800.0,
+    "prior_style": "gaussian",
+    "prior_correlation_x_ft": 10.0,
+    "prior_latent_correlation_x_ft": 80.0,
+    "prior_correlation_z_ft": 75.0,
+    "prior_latent_correlation_z_ft": 35.0,
+    "ratio_bounds": [1.0, 3.0],
+    "rv_cap_ohmm": 80.0,
+    "regularization": "none",
+    "seed": 2026,
+    "effective_random_seed": 2057
+  },
+  "output_dir": "runs/autoresearch-261014-1038-i05-variance-uadp-uada-x2",
+  "verify": "../Dashboard/.venv/bin/python -B autoresearch/loop-261014-1038/score_transition.py --run-dir runs/autoresearch-261014-1038-i05-variance-uadp-uada-x2",
+  "guard": "../Dashboard/.venv/bin/python -B -m pytest -q -p no:cacheprovider tests/test_sequential.py tests/test_unified.py tests/test_lm_laplace.py tests/test_tv.py"
+}
