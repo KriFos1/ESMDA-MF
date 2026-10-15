@@ -1,0 +1,21 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-14T20:08:25Z",
+  "status": "COMPLETE",
+  "results_tsv": "autoresearch/loop-261014-1038/results.tsv",
+  "findings": [
+    "Best observed strategy: one_d_budget=0.25, lm_laplace_seconds=1800, tv_max_step=0.5, original data covariance, Gaussian prior, and TV off; all five new MAPs converged.",
+    "Observed composite score was 0.488758693431 versus initial baseline 1.0; the initial baseline used tv_max_step=0.25, so that cross-run comparison is confounded. Iteration 3 versus iteration 1 isolates the LM-time change because both used step 0.5.",
+    "Mean original-covariance reduced chi-square was 315.0210 to 85.3220; pooled Rh/Rv log10 RMSE was 0.6529911 to 0.5759367.",
+    "A 0.32 1D budget admitted one 1D MDA increment but index 34 did not converge; UADP/UADA variance multipliers 2 and 4 improved field RMSE while substantially worsening data fit.",
+    "See findings.md and mda-variants.md for existing prior/TV/2D-extension evidence and the MDA-family literature taxonomy."
+  ],
+  "config": {
+    "goal": "Find an optimal strategy for combining 0D, 1D and 2D simulations in the transition zone, index 30-35, using an MDA-type approach coupled with Laplace; lower data misfit and Rh/Rv field RMSE against benchmark truth.",
+    "scope": ["run_DA_sequential.py", "esmda_core.py", "lm_laplace.py", "tv_regularization.py", "pilot_*.py", "tests/**", "run/autoresearch configurations"],
+    "metric": "Equal-weight normalized geometric mean of mean original-covariance reduced chi-square and pooled Rh/Rv log10 RMSE across indices 30-35; nonconverged/missing MAPs receive a 1e6 + count penalty.",
+    "direction": "lower_is_better",
+    "verify": "../Dashboard/.venv/bin/python -B autoresearch/loop-261014-1038/score_transition.py --run-dir runs/autoresearch-261014-1038-i03-seconds1800"
+  }
+}

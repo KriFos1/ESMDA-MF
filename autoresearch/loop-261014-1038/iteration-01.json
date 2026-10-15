@@ -4,7 +4,13 @@
   "change": {
     "parameter": "one_d_budget",
     "baseline": 0.75,
-    "candidate": 0.25
+    "candidate": 0.25,
+    "uncontrolled_difference": {
+      "parameter": "tv_max_step",
+      "baseline_run": 0.25,
+      "candidate_run": 0.5,
+      "reason": "The candidate launch omitted this flag and used the CLI default."
+    }
   },
   "fixed_controls": {
     "indices": [31, 32, 33, 34, 35],
@@ -14,6 +20,7 @@
     "lm_laplace_iterations": 15,
     "lm_laplace_starts": 5,
     "lm_laplace_seconds": 900.0,
+    "tv_max_step": 0.5,
     "prior_style": "gaussian",
     "prior_correlation_x_ft": 10.0,
     "prior_latent_correlation_x_ft": 80.0,

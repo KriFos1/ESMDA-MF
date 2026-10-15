@@ -1,0 +1,8 @@
+# metric_direction: lower_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-14T10:38:32Z	2dce33773f8b892556e102a03573443ac0815a78	1.0	0.0	PASS	77	baseline	indices 30-35; equal-weight geometric mean of normalized mean reduced chi-square and pooled Rh/Rv log10 RMSE
+1	2026-10-14T11:57:56Z	ac4138f	0.604035837573	-0.395964162427	PASS	77	keep	one_d_budget 0.25; also tv_max_step 0.25->0.5 vs initial baseline; observed composite is confounded; 0D spent 0.271 so no 1D ES-MDA update at indices 31-35
+2	2026-10-14T13:23:47Z	ac7101d	1000001	1000000.395964162427	PASS	77	discard	one_d_budget 0.32 allowed one 1D increment; index 34 MAP did not converge (no_acceptable_trial), so success penalty applied; raw unconstrained composite 0.664
+3	2026-10-14T14:58:55Z	09f2dfe	0.488758693431	-0.115277144142	PASS	77	keep	lm_laplace_seconds 900->1800; index 35 converged at 2D with χ² 3.01, 3/5 starts converged; aggregate mean χ² 315.02->85.32 and pooled RMSE 0.6530->0.5759
+4	2026-10-14T16:27:41Z	e489e25	0.895507911761	0.406749218330	PASS	77	discard	UADP/UADA variance x4; pooled RMSE improved 0.6530->0.5082 but mean original-covariance χ² rose 315.02->324.58; fixed-covariance composite worsened vs best
+5	2026-10-14T20:08:25Z	9353a2b	1.40229324464	0.913534551209	PASS	77	discard	UADP/UADA variance x2; pooled RMSE 0.6530->0.5589 but mean original-covariance χ² 315.02->723.70, worse than the current best composite

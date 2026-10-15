@@ -15,6 +15,8 @@
     "final_stage": "lm-laplace",
     "lm_laplace_iterations": 15,
     "lm_laplace_starts": 5,
+    "tv_max_step": 0.5,
+    "initial_baseline_tv_max_step": 0.25,
     "prior_style": "gaussian",
     "prior_correlation_x_ft": 10.0,
     "prior_latent_correlation_x_ft": 80.0,

@@ -1,0 +1,29 @@
+{
+  "iteration": 5,
+  "decision": "discard",
+  "commit": "9353a2b",
+  "change": "multiply UADP and UADA variances by 2",
+  "run_settings_note": "Compared with the best candidate using the same tv_max_step=0.5.",
+  "candidate_run": "runs/autoresearch-261014-1038-i05-variance-uadp-uada-x2",
+  "run_status": "COMPLETED",
+  "guard": {
+    "command": "../Dashboard/.venv/bin/python -B -m pytest -q -p no:cacheprovider tests/test_sequential.py tests/test_unified.py tests/test_lm_laplace.py tests/test_tv.py",
+    "result": "77 passed"
+  },
+  "metric": {
+    "baseline_best_score": 0.488758693431,
+    "candidate_score": 1.40229324464,
+    "mean_reduced_chi_square": {"baseline": 315.02103395013614, "candidate": 723.6975030596028},
+    "pooled_rmse_log10": {"baseline": 0.652991136841895, "candidate": 0.558942906241657},
+    "all_new_maps_converged": true
+  },
+  "per_index": {
+    "30": {"fidelity": "1D", "chi_square": 24.011529265145835, "rmse_rh_log10": 0.430821380954275, "rmse_rv_log10": 0.4034857817190215, "source": "fixed baseline checkpoint"},
+    "31": {"fidelity": "1D", "chi_square": 177.9014874605018, "rmse_rh_log10": 0.498736736596255, "rmse_rv_log10": 0.4394116162249997, "converged": true},
+    "32": {"fidelity": "2D", "chi_square": 1245.9460983031345, "rmse_rh_log10": 0.5718523505453748, "rmse_rv_log10": 0.5074412862319277, "converged": true},
+    "33": {"fidelity": "1D", "chi_square": 2506.538626238055, "rmse_rh_log10": 0.5904211408599507, "rmse_rv_log10": 0.5236160947036268, "converged": true},
+    "34": {"fidelity": "1D", "chi_square": 110.9852930510386, "rmse_rh_log10": 0.6166972855420257, "rmse_rv_log10": 0.5577199211923836, "converged": true},
+    "35": {"fidelity": "1D", "chi_square": 276.80198403974106, "rmse_rh_log10": 0.7764787524124674, "rmse_rv_log10": 0.6761718099505036, "converged": true}
+  },
+  "interpretation": "Factor 2 preserves more original-covariance fit than factor 4 but is still a poor tradeoff against the unmodified covariance strategy: mean original-covariance chi-square rises to 723.7 even as field RMSE improves. The data-type downweighting variants are not selected."
+}

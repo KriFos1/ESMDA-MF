@@ -1,0 +1,35 @@
+{
+  "iteration": 1,
+  "decision": "keep",
+  "commit": "ac4138f",
+  "change": "one_d_budget 0.75 -> 0.25",
+  "comparison_confounds": ["tv_max_step was 0.25 in the starting baseline and 0.5 in this candidate"],
+  "candidate_run": "runs/autoresearch-261014-1038-i01-budget025",
+  "run_status": "COMPLETED",
+  "guard": {
+    "command": "../Dashboard/.venv/bin/python -B -m pytest -q -p no:cacheprovider tests/test_sequential.py tests/test_unified.py tests/test_lm_laplace.py tests/test_tv.py",
+    "result": "77 passed"
+  },
+  "metric": {
+    "definition": "sqrt((candidate mean original-covariance reduced chi-square / baseline mean) * (candidate pooled Rh/Rv log10 RMSE / baseline pooled RMSE)); lower is better",
+    "baseline_score": 1.0,
+    "candidate_score": 0.604035837573,
+    "mean_reduced_chi_square": {
+      "baseline": 315.02103395013614,
+      "candidate": 130.0615233621535
+    },
+    "pooled_rmse_log10": {
+      "baseline": 0.652991136841895,
+      "candidate": 0.5770632469608051
+    }
+  },
+  "per_index": {
+    "30": {"fidelity": "1D", "chi_square": 24.011529265145835, "rmse_rh_log10": 0.430821380954275, "rmse_rv_log10": 0.4034857817190215, "source": "fixed baseline checkpoint"},
+    "31": {"fidelity": "2D", "chi_square": 196.56099261336385, "rmse_rh_log10": 0.4541216794340833, "rmse_rv_log10": 0.40790305902184437, "converged": true},
+    "32": {"fidelity": "2D", "chi_square": 150.57646707803042, "rmse_rh_log10": 0.5624065735721311, "rmse_rv_log10": 0.5081915701717022, "converged": true},
+    "33": {"fidelity": "2D", "chi_square": 130.13766613939757, "rmse_rh_log10": 0.5950996449689401, "rmse_rv_log10": 0.5399617638617494, "converged": true},
+    "34": {"fidelity": "2D", "chi_square": 7.636938449177928, "rmse_rh_log10": 0.6286088675456211, "rmse_rv_log10": 0.5672050871721332, "converged": true},
+    "35": {"fidelity": "1D", "chi_square": 271.44554662780547, "rmse_rh_log10": 0.8768341619962549, "rmse_rv_log10": 0.7543431987543939, "converged": true}
+  },
+  "interpretation": "All five new MAPs converged. The lower 1D budget improved the aggregate objectives; at 0D's observed 0.271 cumulative MDA weight, a 0.25 cap suppresses the 1D ES-MDA update, so the selected strategy is 0D -> 1D prediction/gate -> 2D LM/Laplace when gated, with 1D LM/Laplace at index 35. Index 35 Rh RMSE is effectively tied/slightly worse (+0.00012); the aggregate Rh/Rv field RMSE improves."
+}

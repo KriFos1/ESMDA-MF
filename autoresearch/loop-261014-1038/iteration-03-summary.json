@@ -1,0 +1,36 @@
+{
+  "iteration": 3,
+  "decision": "keep",
+  "commit": "09f2dfe",
+  "change": "lm_laplace_seconds 900 -> 1800",
+  "run_settings_note": "Both iterations 1 and 3 used tv_max_step=0.5; the initial baseline used 0.25. Iteration 3 vs 1 isolates the LM-time change, but the best score vs initial baseline is confounded by step size.",
+  "candidate_run": "runs/autoresearch-261014-1038-i03-seconds1800",
+  "run_status": "COMPLETED",
+  "guard": {
+    "command": "../Dashboard/.venv/bin/python -B -m pytest -q -p no:cacheprovider tests/test_sequential.py tests/test_unified.py tests/test_lm_laplace.py tests/test_tv.py",
+    "result": "77 passed"
+  },
+  "metric": {
+    "baseline_score": 1.0,
+    "previous_best_score": 0.604035837573,
+    "candidate_score": 0.488758693431,
+    "mean_reduced_chi_square": {
+      "baseline": 315.02103395013614,
+      "candidate": 85.32201277477104
+    },
+    "pooled_rmse_log10": {
+      "baseline": 0.652991136841895,
+      "candidate": 0.5759366784965388
+    },
+    "all_new_maps_converged": true
+  },
+  "per_index": {
+    "30": {"fidelity": "1D", "chi_square": 24.011529265145835, "rmse_rh_log10": 0.430821380954275, "rmse_rv_log10": 0.4034857817190215, "source": "fixed baseline checkpoint"},
+    "31": {"fidelity": "2D", "chi_square": 196.56099261336385, "rmse_rh_log10": 0.4541216794340833, "rmse_rv_log10": 0.40790305902184437, "converged": true},
+    "32": {"fidelity": "2D", "chi_square": 150.57646707803042, "rmse_rh_log10": 0.5624065735721311, "rmse_rv_log10": 0.5081915701717022, "converged": true},
+    "33": {"fidelity": "2D", "chi_square": 130.13766613939757, "rmse_rh_log10": 0.5950996449689401, "rmse_rv_log10": 0.5399617638617494, "converged": true},
+    "34": {"fidelity": "2D", "chi_square": 7.636938449177928, "rmse_rh_log10": 0.6286088675456211, "rmse_rv_log10": 0.5672050871721332, "converged": true},
+    "35": {"fidelity": "2D", "chi_square": 3.0084831035105757, "rmse_rh_log10": 0.8695708742594367, "rmse_rv_log10": 0.7524168416021172, "converged": true, "converged_2d_starts": 3}
+  },
+  "interpretation": "Doubling the LM time budget made an additional 2D start converge at index 35, replacing the 1D fallback with a converged 2D MAP. The aggregate field RMSE is slightly lower than the 0.25-budget candidate and substantially lower than the initial six-point baseline."
+}

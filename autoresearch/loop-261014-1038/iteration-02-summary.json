@@ -1,0 +1,31 @@
+{
+  "iteration": 2,
+  "decision": "discard",
+  "commit": "ac7101d",
+  "change": "one_d_budget 0.25 -> 0.32",
+  "run_settings_note": "Both this candidate and iteration 1 used tv_max_step=0.5, whereas the initial baseline used 0.25.",
+  "candidate_run": "runs/autoresearch-261014-1038-i02-budget032",
+  "run_status": "COMPLETED",
+  "guard": {
+    "command": "../Dashboard/.venv/bin/python -B -m pytest -q -p no:cacheprovider tests/test_sequential.py tests/test_unified.py tests/test_lm_laplace.py tests/test_tv.py",
+    "result": "77 passed"
+  },
+  "metric": {
+    "definition": "Successful MAP at all five new indices is required; otherwise score is 1000000 + nonconverged_or_missing_count. On successful runs, use the equal-weight normalized geometric mean of mean original-covariance reduced chi-square and pooled Rh/Rv log10 RMSE.",
+    "score": 1000001.0,
+    "raw_objective_without_success_gate": 0.6628132612470872,
+    "baseline_best_score": 0.604035837573,
+    "mean_reduced_chi_square": 159.22870376095332,
+    "pooled_rmse_log10": 0.5675548738281713,
+    "nonconverged_indices": [34]
+  },
+  "per_index": {
+    "30": {"fidelity": "1D", "chi_square": 24.011529265145835, "rmse_rh_log10": 0.430821380954275, "rmse_rv_log10": 0.4034857817190215, "source": "fixed baseline checkpoint"},
+    "31": {"fidelity": "1D", "chi_square": 124.0063317297007, "rmse_rh_log10": 0.4739600876175357, "rmse_rv_log10": 0.4273637314867749, "converged": true},
+    "32": {"fidelity": "1D", "chi_square": 320.03553984342034, "rmse_rh_log10": 0.5493048185177307, "rmse_rv_log10": 0.49586030905410994, "converged": true},
+    "33": {"fidelity": "1D", "chi_square": 164.65924150324494, "rmse_rh_log10": 0.5984840134753413, "rmse_rv_log10": 0.5397712266495996, "converged": true},
+    "34": {"fidelity": "1D", "chi_square": 84.79959153185212, "rmse_rh_log10": 0.6324715366895188, "rmse_rv_log10": 0.585726532605165, "converged": false, "termination": "no_acceptable_trial"},
+    "35": {"fidelity": "1D", "chi_square": 237.85998869235596, "rmse_rh_log10": 0.8094794111336105, "rmse_rv_log10": 0.7171015281507681, "converged": true}
+  },
+  "interpretation": "One 1D MDA increment often made the gate choose the cheaper 1D final fit. Field RMSE improved at most points, but data misfit at index 32 worsened and the index-34 MAP could not find an acceptable trial. This budget is not a successful transition-zone strategy."
+}
