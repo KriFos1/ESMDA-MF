@@ -8,6 +8,7 @@ whenever new checkpoints appear, so the curtain grows during a run.
 """
 
 import argparse
+import colorsys
 import pickle
 import re
 import time
@@ -18,10 +19,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.patches import Patch
 import numpy as np
 from scipy.stats import norm
 
-from run_DA_sequential import max_ratio, meter_to_feet, min_ratio
+from run_DA_sequential import meter_to_feet
 
 CHECKPOINT_RE = re.compile(r"inversion_results_assim_(\d+)\.pkl$")
 
@@ -35,11 +39,26 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path, default=None, help="Output image (default <run-dir>/curtain.png)")
     parser.add_argument("--margin-ft", type=float, default=50., help="Curtain margin around the well")
     parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument('--log10-limits', type=float, nargs=2, default=None)
+    parser.add_argument('--shared-extents', action='store_true')
+    parser.add_argument('--estimate-label', default='Estimated')
+    parser.add_argument('--uncertainty-lightness', action='store_true',
+                        help='Map posterior field variance into estimate-color lightness')
+    parser.add_argument('--uncertainty-percentile', type=float, default=95.,
+                        help='Per-render percentile used to normalize ensemble variance')
+    parser.add_argument('--uncertainty-strength', type=float, default=.75,
+                        help='Maximum HLS lightness wash, from 0 (off) to 1 (white)')
+    parser.add_argument('--uncertainty-white-threshold', type=float, default=.35,
+                        help='Set cells above this normalized variance to pure white')
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
-    if args.dpi < 20 or args.interval <= 0 or args.margin_ft < 0:
-        parser.error("Require dpi >= 20, interval > 0 and margin >= 0")
+    if (args.dpi < 20 or args.interval <= 0 or args.margin_ft < 0
+            or not 0 < args.uncertainty_percentile <= 100
+            or not 0 <= args.uncertainty_strength <= 1
+            or not 0 <= args.uncertainty_white_threshold <= 1):
+        parser.error("Require dpi >= 20, interval > 0, margin >= 0, percentile in (0, 100] "
+                     "and uncertainty strength/white threshold in [0, 1]")
     return args
 
 
@@ -72,7 +91,7 @@ def prediction_kind(result):
                       'linearized' if result.get('two_d_mode') == 'single-update' else 'forward')
 
 
-def member_fields(params, dims):
+def member_fields(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None):
     """One member's (ln Rh, ln Rv) on the window; 1D members return columns."""
     nx, _, nz = dims
     params = np.asarray(params, dtype=float)
@@ -80,33 +99,97 @@ def member_fields(params, dims):
     if params.size == 2 * n:
         log_rh = params[:n].reshape(nx, nz)
         latent = params[n:].reshape(nx, nz)
-        log_ratio = np.log(min_ratio) + np.log(max_ratio / min_ratio) * norm.cdf(latent)
-        return log_rh, log_rh + log_ratio, True
+        ratio_min, ratio_max = ratio_bounds
+        log_ratio = np.log(ratio_min) + np.log(ratio_max / ratio_min) * norm.cdf(latent)
+        log_rv = log_rh + log_ratio
+        if rv_cap_ohmm is not None:
+            log_rv = np.minimum(log_rv, np.log(rv_cap_ohmm))
+        return log_rh, log_rv, True
     log_rh = params[:nz]
     latent = params[nz:]
-    log_ratio = np.log(min_ratio) + np.log(max_ratio / min_ratio) * norm.cdf(latent)
-    return log_rh, log_rh + log_ratio, False
+    ratio_min, ratio_max = ratio_bounds
+    log_ratio = np.log(ratio_min) + np.log(ratio_max / ratio_min) * norm.cdf(latent)
+    log_rv = log_rh + log_ratio
+    if rv_cap_ohmm is not None:
+        log_rv = np.minimum(log_rv, np.log(rv_cap_ohmm))
+    return log_rh, log_rv, False
 
 
-def paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing):
+def posterior_moments(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None):
+    """Return posterior means and sample variances in log10 resistivity units."""
+    members = [member_fields(param, dims, ratio_bounds, rv_cap_ohmm) for param in params]
+    rh_samples = np.asarray([member[0] for member in members], dtype=float)
+    rv_samples = np.asarray([member[1] for member in members], dtype=float)
+    if rh_samples.shape[0] > 1:
+        rh_variance = np.var(rh_samples / np.log(10.), axis=0, ddof=1)
+        rv_variance = np.var(rv_samples / np.log(10.), axis=0, ddof=1)
+    else:
+        rh_variance = np.zeros_like(rh_samples[0])
+        rv_variance = np.zeros_like(rv_samples[0])
+    return (rh_samples.mean(axis=0), rv_samples.mean(axis=0),
+            rh_variance, rv_variance, members[0][2])
+
+
+def hls_lightness_rgb(rgb, normalized_variance, strength=.75, white_threshold=.35):
+    """Preserve hue/saturation while washing uncertain colors toward white."""
+    level = float(np.clip(normalized_variance, 0., 1.))
+    if level > white_threshold:
+        return 1., 1., 1.
+    hue, lightness, saturation = colorsys.rgb_to_hls(*rgb)
+    lightness += strength * level * (1. - lightness)
+    return colorsys.hls_to_rgb(hue, min(lightness, 1.), saturation)
+
+
+def uncertainty_rgba(field, variance, cmap, norm, variance_scale, strength=.75,
+                     white_threshold=.35):
+    """Map a mean field to its value colors, then encode variance in HLS lightness."""
+    field = np.asarray(field, dtype=float)
+    variance = np.asarray(variance, dtype=float)
+    rgba = np.zeros((*field.shape, 4), dtype=float)
+    valid_field = np.isfinite(field)
+    rgba[valid_field] = cmap(norm(field[valid_field]))
+    valid_variance = valid_field & np.isfinite(variance) & (variance >= 0.)
+    if variance_scale > 0 and strength > 0:
+        normalized = np.clip(variance[valid_variance] / variance_scale, 0., 1.)
+        flat_rgba = rgba.reshape(-1, 4)
+        for index, level in zip(np.flatnonzero(valid_variance), normalized):
+            flat_rgba[index, :3] = hls_lightness_rgb(
+                flat_rgba[index, :3], level, strength, white_threshold)
+    return rgba
+
+
+def paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing,
+                variance_canvas_rh=None, variance_canvas_rv=None):
     """Write one checkpoint's ensemble-mean fields into the world canvas."""
     x0, z0 = origin
     dx, dz = spacing
     nx, _, nz = result["dims"]
-    members = [member_fields(params, result["dims"]) for params in result["posterior_params"]]
-    rh = np.mean([member[0] for member in members], axis=0)
-    rv = np.mean([member[1] for member in members], axis=0)
+    ratio_bounds = result.get('rv_ratio_bounds', (1., 5.))
+    rv_cap_ohmm = result.get('rv_hard_cap_ohmm')
+    include_variance = variance_canvas_rh is not None and variance_canvas_rv is not None
+    if include_variance:
+        rh, rv, variance_rh, variance_rv, is_2d = posterior_moments(
+            result["posterior_params"], result["dims"], ratio_bounds, rv_cap_ohmm)
+    else:
+        members = [member_fields(params, result["dims"], ratio_bounds, rv_cap_ohmm)
+                   for params in result["posterior_params"]]
+        rh = np.mean([member[0] for member in members], axis=0)
+        rv = np.mean([member[1] for member in members], axis=0)
+        is_2d = members[0][2]
     ix = int(round((result["shift_ft"]["x"] - x0) / dx))
     iz = int(round((result["shift_ft"]["z"] - z0) / dz))
-    if not members[0][2]:
+    if not is_2d:
         ix += nx // 2
         nx = 1
     canvas_rh[ix:ix + nx, iz:iz + nz] = rh.reshape(nx, nz)
     canvas_rv[ix:ix + nx, iz:iz + nz] = rv.reshape(nx, nz)
     coverage[ix:ix + nx, iz:iz + nz] += 1
+    if include_variance:
+        variance_canvas_rh[ix:ix + nx, iz:iz + nz] = variance_rh.reshape(nx, nz)
+        variance_canvas_rv[ix:ix + nx, iz:iz + nz] = variance_rv.reshape(nx, nz)
 
 
-def build_curtain(checkpoints):
+def build_curtain(checkpoints, include_variance=False):
     spacing = (checkpoints[0][1]["spacing_ft"][0], checkpoints[0][1]["spacing_ft"][2])
     xs, zs, xe, ze = [], [], [], []
     for _, result in checkpoints:
@@ -121,8 +204,13 @@ def build_curtain(checkpoints):
     canvas_rh = np.full((n_x, n_z), np.nan)
     canvas_rv = np.full((n_x, n_z), np.nan)
     coverage = np.zeros((n_x, n_z))
+    variance_rh = np.full((n_x, n_z), np.nan) if include_variance else None
+    variance_rv = np.full((n_x, n_z), np.nan) if include_variance else None
     for _, result in checkpoints:
-        paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing)
+        paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing,
+                    variance_rh, variance_rv)
+    if include_variance:
+        return canvas_rh, canvas_rv, coverage, origin, spacing, variance_rh, variance_rv
     return canvas_rh, canvas_rv, coverage, origin, spacing
 
 
@@ -152,7 +240,20 @@ def load_reference(benchmark, extent_ft):
 
 
 def render(checkpoints, args):
-    canvas_rh, canvas_rv, coverage, origin, spacing = build_curtain(checkpoints)
+    uncertainty_enabled = getattr(args, 'uncertainty_lightness', False)
+    if uncertainty_enabled:
+        (canvas_rh, canvas_rv, coverage, origin, spacing,
+         variance_rh, variance_rv) = build_curtain(checkpoints, include_variance=True)
+        finite_variances = np.concatenate([
+            variance_rh[np.isfinite(variance_rh)],
+            variance_rv[np.isfinite(variance_rv)],
+        ])
+        variance_scale = (float(np.percentile(finite_variances, args.uncertainty_percentile))
+                          if finite_variances.size else 0.)
+    else:
+        canvas_rh, canvas_rv, coverage, origin, spacing = build_curtain(checkpoints)
+        variance_rh = variance_rv = None
+        variance_scale = 0.
     n_x, n_z = coverage.shape
     x_edges = origin[0] + np.arange(n_x + 1) * spacing[0]
     z_edges = origin[1] + np.arange(n_z + 1) * spacing[1]
@@ -172,15 +273,29 @@ def render(checkpoints, args):
     true_field = reference["rh"] if reference else None
     scale = np.log10(true_field) if true_field is not None else np.log10(np.exp(canvas_rh))
     vmin, vmax = np.nanpercentile(scale, [2, 98])
+    if getattr(args, 'log10_limits', None) is not None:
+        vmin, vmax = args.log10_limits
     shared = dict(cmap="viridis", vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap("viridis")
+    value_norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
 
     panels = [("Reference log10 Rh", np.log10(true_field), reference["x_edges"], reference["z_edges"]) if reference
               else ("Reference log10 Rh (unavailable)", None, x_edges, z_edges),
-              ("Estimated log10 Rh", np.log10(np.exp(canvas_rh)).T, x_edges, z_edges),
-              ("Estimated log10 Rv", np.log10(np.exp(canvas_rv)).T, x_edges, z_edges)]
-    for axis, (title, field, xedge, zedge) in zip(axes, panels):
+               (f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rh", np.log10(np.exp(canvas_rh)).T, x_edges, z_edges),
+               (f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rv", np.log10(np.exp(canvas_rv)).T, x_edges, z_edges)]
+    for panel_index, (axis, (title, field, xedge, zedge)) in enumerate(zip(axes, panels)):
         if field is None:
             axis.text(.5, .5, "no benchmark", ha="center", va="center", transform=axis.transAxes)
+        elif uncertainty_enabled and panel_index in (1, 2):
+            variance = (variance_rh if panel_index == 1 else variance_rv).T
+            rgba = uncertainty_rgba(field, variance, cmap, value_norm, variance_scale,
+                                    args.uncertainty_strength,
+                                    args.uncertainty_white_threshold)
+            axis.imshow(rgba, extent=(xedge[0], xedge[-1], zedge[0], zedge[-1]),
+                        origin="lower", interpolation="nearest", aspect="auto")
+            value_map = ScalarMappable(norm=value_norm, cmap=cmap)
+            value_map.set_array([])
+            fig.colorbar(value_map, ax=axis, fraction=0.046, pad=0.02)
         else:
             mesh = axis.pcolormesh(xedge, zedge, field, shading="auto", **shared)
             fig.colorbar(mesh, ax=axis, fraction=0.046, pad=0.02)
@@ -195,8 +310,23 @@ def render(checkpoints, args):
         axis.set_xlabel("X [ft]")
         axis.set_aspect("equal", adjustable="box")
         axis.invert_yaxis()
+        if getattr(args, 'shared_extents', False):
+            axis.set_xlim(x_edges[0], x_edges[-1])
+            axis.set_ylim(z_edges[-1], z_edges[0])
     axes[0].set_ylabel("TVD [ft]")
     axes[0].legend(loc="upper right", fontsize=8, framealpha=.7)
+    if uncertainty_enabled:
+        mid_color = cmap(value_norm((vmin + vmax) / 2.))[:3]
+        levels = (0., .5, 1.)
+        labels = ("low variance", "mid variance", "high variance / lighter")
+        handles = [Patch(facecolor=hls_lightness_rgb(
+            mid_color, level, args.uncertainty_strength,
+            args.uncertainty_white_threshold), edgecolor="none", label=label)
+                   for level, label in zip(levels, labels)]
+        fig.legend(handles=handles, title=(f"Relative posterior variance (p{args.uncertainty_percentile:g} "
+                                           f"recomputed per render; >{args.uncertainty_white_threshold:g} white)"),
+                   loc="upper center", bbox_to_anchor=(.5, .95), ncol=3,
+                   fontsize=8, title_fontsize=8, frameon=False)
 
     indices, before, after, thresholds, kinds = [], [], [], [], []
     fidelity_by_index = {index: fidelity_of(result) for index, result in checkpoints}
@@ -205,14 +335,14 @@ def render(checkpoints, args):
         posterior = result.get("posterior_misfit")
         if misfit.get("before_final") is not None or posterior:
             indices.append(index)
-            before.append(misfit.get("before_final"))
+            before.append(result.get('best_member_data_misfit', misfit.get("before_final")))
             after.append(float(np.mean(posterior)) if posterior else None)
             thresholds.append(result.get("misfit_threshold"))
             kinds.append(prediction_kind(result))
     if indices:
         before = np.array([np.nan if value is None else value for value in before])
         after = np.array([np.nan if value is None else value for value in after])
-        misfit_axis.semilogy(indices, before, "o", ms=4, color="0.4", label="after 1D (gate)")
+        misfit_axis.semilogy(indices, before, "o", ms=4, color="0.4", label="pre-final gate misfit")
         valid = np.isfinite(after)
         for kind, marker, label in [('forward', 'o', 'posterior: forward evaluated'),
                                      ('linearized', 'x', 'posterior: linearized estimate')]:
@@ -232,7 +362,7 @@ def render(checkpoints, args):
     counts = {fidelity: fidelities.count(fidelity) for fidelity in ("1D", "2D")}
     fig.suptitle(f"Inversion curtain - {len(checkpoints)} points "
                  f"(1D: {counts['1D']}, 2D: {counts['2D']}) - {args.run_dir.name}", y=0.98)
-    fig.subplots_adjust(top=0.92)
+    fig.subplots_adjust(top=0.87 if uncertainty_enabled else 0.92)
 
     output = args.output or (args.run_dir / "curtain.png")
     fig.savefig(output, dpi=args.dpi)
