@@ -18,10 +18,16 @@ def summarize(output):
                          if point['gate_misfit'] > threshold
                          else point['branches']['0']) for point in points]
             valid = [(point, row) for point, row in selected if row['status'] == 'ok']
+            gated = [row for point, row in selected if point['gate_misfit'] > threshold
+                     and steps > 0]
             misfits = [row['data_misfit'] for _, row in valid]
             table.append({'threshold': threshold, '2d_steps': steps,
                           'gated_points': sum(point['gate_misfit'] > threshold for point in points),
                           'valid_points': len(valid),
+                          'reliable_gated_points': sum(row['status'] == 'ok'
+                                                       and row['survivors'] >= 20 for row in gated),
+                          'min_gated_survivors': (min(row['survivors'] for row in gated)
+                                                  if gated else None),
                           'failed_points': [point['index'] for point, row in selected
                                             if row['status'] != 'ok'],
                           'mean_rmse_log10_rh': (float(np.mean([row['rmse_log10_rh']
@@ -44,7 +50,8 @@ def summarize(output):
                                         for k in range(1, 6)}})
     return {'table': table, 'points': best,
             'misfit_goal': 'Original uninflated reduced chi-square <= 75; '
-                           'no failed point may contribute to a scored configuration',
+                           'no failed point may contribute to a scored configuration; '
+                           '>=20/25 survivors at every gated point for reliable comparison',
             'interpretation': 'Independent pointwise replay, not a chained inversion; '
                               'thresholds evaluated on the shared step-5 1D ensemble.'}
 
@@ -58,13 +65,16 @@ def main():
     (output / 'summary.json').write_text(json.dumps(result, indent=2))
     lines = ['# Ten-step transition ES-MDA: matched threshold and 2D-step study', '',
              result['interpretation'], '', result['misfit_goal'], '',
-             '| Gate | 2D steps | Gated points | Valid / 16 | Mean Rh RMSE (log10) | '
+             '| Gate | 2D steps | Gated points | Valid / 16 | Reliable gated | '
+             'Min 2D survivors | Mean Rh RMSE (log10) | '
              'Mean reduced misfit | Points <=75 | HPC 2D calls |',
-             '|---:|---:|---:|---:|---:|---:|---:|---:|']
+             '|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for row in result['table']:
         fmt = lambda value: f'{value:.4g}' if value is not None else 'invalid'
         lines.append(f"| {row['threshold']:g} | {row['2d_steps']} | {row['gated_points']} | "
-                     f"{row['valid_points']}/16 | {fmt(row['mean_rmse_log10_rh'])} | "
+                     f"{row['valid_points']}/16 | {row['reliable_gated_points']} | "
+                     f"{row['min_gated_survivors'] if row['min_gated_survivors'] is not None else '-'} | "
+                     f"{fmt(row['mean_rmse_log10_rh'])} | "
                      f"{fmt(row['mean_reduced_misfit'])} | {row['points_misfit_le_75']} | "
                      f"{row['2d_calls']} |")
     lines.extend(['', '## Pointwise minimum steps reaching reduced misfit <= 75', '',
