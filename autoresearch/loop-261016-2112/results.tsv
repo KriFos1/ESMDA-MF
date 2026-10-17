@@ -1,3 +1,5 @@
 # metric_direction: lower_is_better
 iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
 0	2026-10-16T21:12:00Z	52109a2d467341fe720c96a768c1927c0cb0ae8f	0.663540092905	0.0	pass	-	baseline	Reference indices 25-40 post-1D ensemble mean log10 Rh RMSE; guard 67 passed
+1	2026-10-17T02:53:38Z	-	0.668222373052	0.004682280147	pass	-	discard	Threshold 75 with 2D steps 2; parameter candidate worse than baseline and only 2/25 survived at worst gated index; study code retained
+2	2026-10-17T02:53:38Z	-	-	-	pass	-	crash	Threshold 75 with 2D steps 5; index 31 lost all 25 selected 1D members; no aggregate RMSE is defined

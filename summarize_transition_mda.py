@@ -48,7 +48,12 @@ def summarize(output):
                      'one_d_misfit': point['branches']['0']['data_misfit'],
                      'two_d_failures': {str(k): point['branches'][str(k)]['failed_evaluations']
                                         for k in range(1, 6)}})
+    total_calls = sum(point['branches'][str(k)]['2d_calls']
+                      for point in points for k in range(1, 6))
+    failed_evaluations = sum(len(point['branches'][str(k)]['failed_evaluations'])
+                             for point in points for k in range(1, 6))
     return {'table': table, 'points': best,
+            'total_2d_calls': total_calls, 'failed_2d_evaluations': failed_evaluations,
             'misfit_goal': 'Original uninflated reduced chi-square <= 75; '
                            'no failed point may contribute to a scored configuration; '
                            '>=20/25 survivors at every gated point for reliable comparison',
@@ -65,6 +70,9 @@ def main():
     (output / 'summary.json').write_text(json.dumps(result, indent=2))
     lines = ['# Ten-step transition ES-MDA: matched threshold and 2D-step study', '',
              result['interpretation'], '', result['misfit_goal'], '',
+             f"HPC evaluations: {result['total_2d_calls']} 2D forwards, "
+             f"{result['failed_2d_evaluations']} non-finite solver evaluations. "
+             'The same branches are reused for all six offline thresholds.', '',
              '| Gate | 2D steps | Gated points | Valid / 16 | Reliable gated | '
              'Min 2D survivors | Mean Rh RMSE (log10) | '
              'Mean reduced misfit | Points <=75 | HPC 2D calls |',

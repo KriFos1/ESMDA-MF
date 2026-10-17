@@ -1,0 +1,25 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-17T02:53:38Z",
+  "status": "COMPLETE",
+  "results_tsv": "autoresearch/loop-261016-2112/results.tsv",
+  "findings": [
+    "16 matched pointwise inversions completed at indices 25-40, with 5743 HPC 2D forwards and 976 non-finite responses.",
+    "All tested gate thresholds 50-250 make identical decisions; 25 additionally escalates two points that already pass with 1D.",
+    "No tested 2D step count 1-5 reaches original-covariance reduced misfit <=75 at any point 31-40.",
+    "The threshold-75/two-step candidate scores Rh RMSE 0.668222373052 versus reference 0.663540092905, with mean data misfit 9211 and only two survivors at the weakest gated point.",
+    "The threshold-75/five-step branch fails at index 31; no aggregate RMSE is defined."
+  ],
+  "config": {
+    "goal": "Study 10-step linear-taper 0D/1D/2D ES-MDA gating and 2D step counts for indices 25-40",
+    "scope": "transition_mda_study.py, summarize_transition_mda.py, tests/test_transition_mda_study.py, autoresearch/loop-261016-2112/*",
+    "metric": "mean benchmark log10 Rh RMSE (only complete, forward-verified configurations)",
+    "direction": "lower_is_better",
+    "verify": "../Dashboard/.venv/bin/python -B transition_mda_study.py --output-dir runs/transition-mda-261016-2112 --score --score-threshold 75 --score-2d-steps 2",
+    "guard": "../Dashboard/.venv/bin/python -B -m pytest -q tests/test_transition_mda_study.py tests/test_sequential.py tests/test_unified.py tests/test_curtain.py",
+    "iterations_requested": 25,
+    "candidate_parameter_grid": "six offline gate thresholds x five 2D step counts, plus the 1D-only control",
+    "results": "runs/transition-mda-261016-2112/summary.md"
+  }
+}
