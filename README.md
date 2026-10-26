@@ -162,6 +162,189 @@ fidelity) and the per-point reduced misfit with the escalation threshold.
 (`--interval`, default 60 s), so the curtain grows during a run. 1D-only
 points appear as single-cell columns at the bit.
 
+## Gated EnIF-MDA chain with a 2D MAP/Laplace stage (Benchmark-3)
+
+This is the production inversion. A 1D EnIF-MDA chain runs on a moving 33 × 80 window of
+5-ft cells, using the 8 in-plane UDAR channels and a sparse Matérn prior. After each 1D
+update, a probe-and-revert gate checks the member-median reduced χ². If it exceeds the
+threshold (25), the 1D update is discarded. That point is then solved in 2D on HPC: a
+trust-region LM finds the MAP, Laplace samples are drawn around it, and they become the
+point's posterior ensemble. The chain then continues in 1D.
+
+The pieces:
+
+| Script | Role |
+|---|---|
+| `sequential_matern_1d.py` | 1D chain (local); exports gate points |
+| `run_chain_laplace_loop.py` | Controller: runs the 1D chain, sends each gate point to the 2D stage, writes the result back |
+| `pilot_rml_index45.py` | The 2D MAP stage on HPC |
+| `chain_laplace.py` | Laplace sampling into the chain checkpoint |
+| `plot_curtain.py` | Curtain follower |
+
+[FWD2D_SOURCE_CHANGES.md](FWD2D_SOURCE_CHANGES.md) documents the patched `fwd2D` builds that
+the 2D stage needs.
+
+### Prerequisites
+
+- **Local chain interpreter: `../venv-pet-latest`.** It holds the latest PET and
+  graphite-maps, which EnIF needs. The older Dashboard venv lacks
+  `pipt.update_schemes.analysis`. `pxwf` comes from `../Dashboard/src`.
+- **Tests and plots:** `../Dashboard/.venv`.
+- **HPC:**
+  - An SSH host alias `HPC`.
+  - A Python venv for the MAP members built from `rml-hpc-requirements.txt`
+    (default `/cluster/home/krfo/rml-index45-20261019/.venv/bin/python`).
+  - The orientation-capable discrete-adjoint build
+    `/cluster/home/krfo/adjoint-2d-v1-orient`, which has `adjoint-spec.json` next to `fwd2D`.
+- **Data:** the Benchmark-3 `outputs_2D` must be the **bedding-mode** regeneration
+  (`Dashboard/benchmarks/Benchmark-3/OUTPUTS_2D_PROVENANCE.md`). The chain runs
+  `fwd2D` with `--orientation bedding`, and the old gradient-mode data do not match that
+  forward model.
+
+Set the environment once per shell, from this repository root:
+
+```bash
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONPATH=../Dashboard/src
+PY=../venv-pet-latest/bin/python
+```
+
+### 1. Data and variance
+
+```bash
+$PY -B write_data.py --benchmark ../Dashboard/benchmarks/Benchmark-3 \
+  --output-dir runs/benchmark3-data-bedding
+```
+
+This writes `data.pkl`, `var.pkl`, `assim_index.csv` and `datatyp.csv`, as described in
+*Generate observations* above. Each tool's σ is 2.5 % of the mean absolute signal across tools at
+that logging point (`--noise-fraction`). The chain then masks channels with σ below 1e-3. It
+floors the directional channels USDP/USDA at 0.5° / 0.25 dB (`--directional-sigma-floor`).
+
+### 2. Reference manifest
+
+The chain reads its window, prior moments and data paths from a reference `run.json`.
+`references/benchmark3-bedding/run.json` is a template. Write a local copy with an absolute
+benchmark path and your data folder:
+
+```bash
+$PY - <<'EOF'
+import json
+from pathlib import Path
+m = json.loads(Path('references/benchmark3-bedding/run.json').read_text())
+m['benchmark'] = str(Path('../Dashboard/benchmarks/Benchmark-3').resolve())
+m['data'], m['variance'] = 'runs/benchmark3-data-bedding/data.pkl', 'runs/benchmark3-data-bedding/var.pkl'
+Path('runs/benchmark3-reference-bedding').mkdir(parents=True, exist_ok=True)
+Path('runs/benchmark3-reference-bedding/run.json').write_text(json.dumps(m, indent=2))
+EOF
+```
+
+`data` and `variance` are relative to the repository root.
+
+### 3. Start the chain
+
+The first driver call creates the chain directory and `study.json`. It then runs the 1D chain
+until the first gate opens:
+
+```bash
+NAME=gated-enif-t25-bedding
+$PY -B -u sequential_matern_1d.py --reference runs/benchmark3-reference-bedding \
+  --output-dir runs/$NAME --stop 281 --ensemble-size 250 --seed 2031 --mda-steps 10 \
+  --tempering linear-inflation --anisotropy log_clipped --anisotropy-mean 0.5 --anisotropy-std 0.5 \
+  --memory-ft 50 --gate-threshold 25 --on-gate stop --analysis enif \
+  --two-d-prior ensemble_precision --directional-sigma-floor 0.5 0.25
+```
+
+`--stop` is exclusive (281 = the whole Benchmark-3 well).
+
+### 4. Run the controller
+
+The controller loops over three steps until the checkpoint for `--stop - 1` exists:
+
+1. resume the driver;
+2. when the driver stops at a gate, run the 2D MAP and Laplace stage on HPC;
+3. write the checkpoint for that point.
+
+It rebuilds the driver arguments from `study.json`.
+
+```bash
+$PY -B -u run_chain_laplace_loop.py --chain runs/$NAME --stop 281 \
+  --source references/map-source --label $(date +%Y%m%d) --map-starts 1 \
+  --optimizer-setting stagnation_tolerance=0.01 --optimizer-setting stagnation_iterations=1 \
+  --optimizer-setting max_rounds=2 \
+  --binary-dir /cluster/home/krfo/adjoint-2d-v1-orient --orientation bedding \
+  --hpc-root /cluster/home/krfo/rml-index45-20261019 \
+  --hpc-python /cluster/home/krfo/rml-index45-20261019/.venv/bin/python
+```
+
+The settings:
+
+- **`--source`:** supplies the simulator and optimizer defaults (`references/map-source/study.json`).
+- **`--map-starts 1`:** the MAP starts from the prior mean and one carried member; the lowest
+  objective is resampled.
+- **`--optimizer-setting` (3×):** the faster convergence used in production. The LM stops after
+  one iteration with less than 1 % relative decrease, or after two rejected rounds.
+- **`--count`:** the number of Laplace samples, 250 by default. It must equal `--ensemble-size`.
+
+To run it unattended and restartable, use a user service with the status supervisor:
+
+```bash
+systemd-run --user --unit=esmda-$NAME --working-directory=$PWD -p Restart=on-failure \
+  --setenv=PYTHONPATH=../Dashboard/src --setenv=OPENBLAS_NUM_THREADS=1 \
+  --setenv=MKL_NUM_THREADS=1 --setenv=OMP_NUM_THREADS=1 \
+  $PY -B -u supervise_run.py runs/$NAME.status.json $PY -B -u run_chain_laplace_loop.py \
+  --chain runs/$NAME --stop 281 --source references/map-source --label $(date +%Y%m%d) --map-starts 1 \
+  --optimizer-setting stagnation_tolerance=0.01 --optimizer-setting stagnation_iterations=1 \
+  --optimizer-setting max_rounds=2 --binary-dir /cluster/home/krfo/adjoint-2d-v1-orient \
+  --orientation bedding
+```
+
+**Pausing and restarting:**
+- `touch runs/$NAME/PAUSE` stops the chain at the next point boundary. Remove the file and
+  rerun the same command to continue.
+- A restarted controller adopts a MAP job that is still queued, running or finished, rather
+  than submitting a second one.
+- On a node without Slurm, add `--executor node --host <node> --hpc-root <dir> --hpc-python <venv
+  python> --node-threads 3 --node-concurrency 4 --node-hdfql <dir with libHDFql.so>`, and
+  point `--binary-dir` at that node's build.
+
+### Outputs
+
+**In `runs/$NAME`:**
+- `inversion_results_assim_<i>.pkl`: the per-point posterior. `selected_fidelity` is `1D` or `2D`.
+- `history.json`
+- `gate-<i>.json` and `laplace-problem-<i>.npz`: the exported gate points.
+- `laplace-<i>.json`: the 2D summaries.
+- `study.json`
+
+**MAP stages:** each runs in `runs/chain-laplace-idx<i>-<label>`, with members, `selected-member.json`
+and the Laplace inputs. Solver scratch on HPC is deleted after each pull.
+
+### 5. Curtain follower
+
+```bash
+systemd-run --user --unit=esmda-$NAME-curtain --working-directory=$PWD -p Restart=on-failure \
+  ../Dashboard/.venv/bin/python -B -u plot_curtain.py --run-dir runs/$NAME --follow --interval 180 \
+  --paint nearest-bit --colormap hue --output runs/$NAME/curtain.png
+```
+
+- `--paint nearest-bit` shows the at-drilling estimate: each cell comes from the window in which
+  it was laterally closest to the bit.
+- `--colormap hue` keeps lightness free for `--uncertainty-lightness`, which washes
+  high-variance cells towards white.
+- Leave out `--follow` for a single render.
+
+### Tests
+
+```bash
+../Dashboard/.venv/bin/python -B -m pytest -q tests/test_sequential_matern.py tests/test_chain_laplace.py \
+  tests/test_pilot_rml_index45.py tests/test_graded_grid.py tests/test_matern_prior.py \
+  tests/test_sparse_precision.py tests/test_rml_standalone.py tests/test_lm_laplace.py tests/test_curtain.py
+../venv-pet-latest/bin/python -B -m pytest -q tests/test_enif_mda.py
+```
+
+`test_enif_mda.py` needs the latest PET. `test_chain_laplace.py` needs the older one that ships in
+the Dashboard venv.
+
 ## Backend options
 
 CLI flags override the corresponding `DA_SIM_*` environment variables.
