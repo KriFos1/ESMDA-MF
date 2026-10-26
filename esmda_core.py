@@ -106,12 +106,55 @@ def shift_posterior_1d(posterior, nz, movement):
     return fields[:, :, z].reshape(values.shape)
 
 
-def optimizer_jacobian(j_log_rh, j_log_rv, latent, min_ratio=1.0, max_ratio=5.0):
+ANISOTROPY_PARAMETERIZATIONS = ("probit", "log_clipped")
+
+
+def log_ratio_from_latent(latent, min_ratio=1.0, max_ratio=5.0, anisotropy="probit"):
+    """ln(Rv/Rh) from the anisotropy state.
+
+    probit: ln(min) + ln(max/min) Phi(latent) (bounded ratio, isotropy only at -inf);
+    log_clipped: the state is ln(Rv/Rh) itself, clipped at 0 (any latent <= 0 is
+    isotropic, so Rv = Rh is reachable at finite prior values).
+    """
+    latent = np.asarray(latent, dtype=float)
+    if anisotropy == "probit":
+        return np.log(min_ratio) + np.log(max_ratio / min_ratio) * norm.cdf(latent)
+    if anisotropy == "log_clipped":
+        return np.maximum(latent, 0.)
+    raise ValueError(f"Unknown anisotropy parameterization {anisotropy!r}")
+
+
+def log_rv_from_latent(log_rh, latent, min_ratio=1.0, max_ratio=5.0, log_rv_cap=None,
+                       anisotropy="probit"):
+    log_rv = np.asarray(log_rh, dtype=float) + log_ratio_from_latent(latent, min_ratio, max_ratio,
+                                                                       anisotropy)
+    return log_rv if log_rv_cap is None else np.minimum(log_rv, log_rv_cap)
+
+
+def latent_slope(latent, min_ratio=1.0, max_ratio=5.0, anisotropy="probit"):
+    """d ln(Rv/Rh) / d latent (before the Rv cap)."""
+    latent = np.asarray(latent, dtype=float)
+    if anisotropy == "probit":
+        return np.log(max_ratio / min_ratio) * norm.pdf(latent)
+    if anisotropy == "log_clipped":
+        return (latent > 0.).astype(float)
+    raise ValueError(f"Unknown anisotropy parameterization {anisotropy!r}")
+
+
+def optimizer_jacobian(j_log_rh, j_log_rv, latent, min_ratio=1.0, max_ratio=5.0,
+                       log_rv_cap=None, log_rh=None, anisotropy="probit"):
     latent = np.asarray(latent, dtype=float).ravel(order="C")
     if j_log_rh.shape != j_log_rv.shape or j_log_rh.shape[1] != latent.size:
         raise ValueError("Jacobian blocks and latent field do not match")
-    dlog_ratio = np.log(max_ratio / min_ratio) * norm.pdf(latent)
-    return np.hstack([j_log_rh + j_log_rv, j_log_rv * dlog_ratio[None, :]])
+    dlog_ratio = latent_slope(latent, min_ratio, max_ratio, anisotropy)
+    rv_active = np.ones(latent.size, dtype=bool)
+    if log_rv_cap is not None and log_rh is not None:
+        log_rh = np.asarray(log_rh, dtype=float).ravel(order="C")
+        log_rv = log_rv_from_latent(log_rh, latent, min_ratio, max_ratio, None, anisotropy)
+        rv_active = log_rv < log_rv_cap
+        dlog_ratio = np.where(rv_active, dlog_ratio, 0.0)
+    return np.hstack([j_log_rh + j_log_rv * rv_active[None, :],
+                      j_log_rv * dlog_ratio[None, :]])
 
 
 def observation_vectors(data, variances, index, tools, width=8):
@@ -133,6 +176,32 @@ def observation_vectors(data, variances, index, tools, width=8):
         observations.append(datum)
         covariance.append(variance)
     return np.concatenate(observations), np.concatenate(covariance)
+
+
+def phase_channels(mask, components):
+    """Phase flags of the retained channels: per-tool UDAR components whose name ends in 'P'."""
+    mask = np.asarray(mask, dtype=bool).ravel()
+    if mask.size % len(components):
+        raise ValueError("Channel mask must cover whole tools")
+    return np.tile([name.endswith("P") for name in components], mask.size // len(components))[mask]
+
+
+def align_phases(predictions, observations, phase, axis=0):
+    """Move predicted phases (degrees) to the branch nearest the observation.
+
+    Phase residuals ``observation - prediction`` then lie in [-180, 180], so
+    misfits, ensemble innovations and least-squares objectives are continuous
+    across the +-180 degree cut; derivatives are unchanged (the shift is a
+    multiple of 360 degrees) and predictions already on the observed branch
+    are returned bit for bit. Channels run along ``axis`` of ``predictions``.
+    """
+    predictions = np.array(predictions, dtype=float, copy=True)
+    shape = [1] * predictions.ndim
+    shape[axis] = -1
+    observations = np.asarray(observations, dtype=float).reshape(shape)
+    phase = np.asarray(phase, dtype=bool).reshape(shape)
+    turns = np.where(phase, np.round((predictions - observations) / 360.), 0.)
+    return predictions - 360. * turns
 
 
 def measurement_misfit(prediction, observations, data_covariance):

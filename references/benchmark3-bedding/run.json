@@ -1,0 +1,211 @@
+{
+  "sim_backend": "slurm",
+  "host": "HPC",
+  "root": "pxwf-runs",
+  "sim_python": "pxwf-runtime/.venv/bin/python",
+  "partition": "comp",
+  "account": "energytech",
+  "qos": "normal",
+  "nodes": 1,
+  "ranks": 1,
+  "cpus": 5,
+  "memory": 16,
+  "walltime": "00:05:00",
+  "concurrency": 10,
+  "chunk": 1,
+  "workers": 8,
+  "oneapi": "",
+  "hdfql": "",
+  "binary_dir": "/cluster/home/krfo/adjoint-2d-v1",
+  "mpi": "pmi2",
+  "pmi": "/usr/lib64/libpmi2.so",
+  "scratch": "",
+  "solver_tolerance": 1e-06,
+  "poll_max_delay": 5.0,
+  "solver_grid": "20,4,40,30,20,30,2,1,2",
+  "benchmark": "../Dashboard/benchmarks/Benchmark-3",
+  "data": "runs/benchmark3-data-bedding/data.pkl",
+  "variance": "runs/benchmark3-data-bedding/var.pkl",
+  "output_dir": "runs/benchmark3-full-two-step-esmda-b025-t75-20261015-r2",
+  "start": 0,
+  "stop": 281,
+  "resume_checkpoint": null,
+  "frequency": 1,
+  "nx": 33,
+  "nz": 80,
+  "y_layers": 5,
+  "dx_ft": 5.0,
+  "dz_ft": 5.0,
+  "ensemble_size": 400,
+  "opt_members": 5,
+  "max_iterations": 5,
+  "max_substitutions": 8,
+  "engagement_prior": "ensemble",
+  "max_lm_trials": 2,
+  "misfit_threshold": 75.0,
+  "one_d_budget": 0.25,
+  "seed": 2026,
+  "force_2d": false,
+  "single_update": false,
+  "final_stage": "two-step-esmda",
+  "final_2d_members": 10,
+  "final_2d_localization_threshold": 0.7,
+  "lm_laplace_iterations": 12,
+  "lm_laplace_starts": 5,
+  "lm_laplace_seconds": 1200.0,
+  "lm_relative_data_improvement": 0.05,
+  "fd_step": 0.001,
+  "prior_style": "gaussian",
+  "prior_background": 0.17609125905568124,
+  "prior_reservoir": 1.4771212547196624,
+  "prior_mode_std": 0.1,
+  "prior_reservoir_fraction": 0.15,
+  "prior_switch_prob": 0.05,
+  "prior_min_block_ft": 50.0,
+  "prior_fault_fraction": 0.15,
+  "prior_fault_min_block_ft": 15.0,
+  "prior_within_block_std": 0.02,
+  "prior_interface_jitter": 0.01,
+  "prior_value_correlation": 0.98,
+  "prior_correlation_x_ft": 10.0,
+  "prior_latent_correlation_x_ft": 80.0,
+  "prior_correlation_z_ft": 75.0,
+  "prior_latent_correlation_z_ft": 35.0,
+  "prior_ratio_max": 3.0,
+  "prior_rv_cap_ohmm": 80.0,
+  "prior_projection": "off",
+  "regularization": "none",
+  "tv_weight": 0.05,
+  "tv_weight_1d": null,
+  "tv_weight_2d": null,
+  "tv_epsilon": 0.001,
+  "tv_iterations": 8,
+  "tv_max_step": 0.5,
+  "tv_amplitude_std": 2.302585092994046,
+  "simulator": {
+    "backend": "slurm",
+    "host": "HPC",
+    "root": "pxwf-runs",
+    "python": "pxwf-runtime/.venv/bin/python",
+    "partition": "comp",
+    "account": "energytech",
+    "qos": "normal",
+    "nodes": 1,
+    "ranks": 1,
+    "cpus": 5,
+    "memory": 16,
+    "walltime": "00:05:00",
+    "concurrency": 10,
+    "chunk": 1,
+    "workers": 8,
+    "oneapi": "",
+    "hdfql": "",
+    "binary_dir": "/cluster/home/krfo/adjoint-2d-v1",
+    "mpi": "pmi2",
+    "pmi": "/usr/lib64/libpmi2.so",
+    "scratch": "",
+    "jobs_dir": "",
+    "solver_tolerance": 1e-06,
+    "poll_max_delay_seconds": 5.0,
+    "solver_grid": [
+      20,
+      4,
+      40,
+      30,
+      20,
+      30,
+      2,
+      1,
+      2
+    ]
+  },
+  "runtime": {
+    "protocol": 1,
+    "python": "3.12.15 (main, Oct  7 2026, 04:52:47) [GCC 8.5.0 20210514 (Red Hat 8.5.0-29)]",
+    "numpy": "2.5.3",
+    "h5py": "3.16.0",
+    "runtime": {
+      "binary": "/cluster/home/krfo/adjoint-2d-v1/fwd2D",
+      "oneapi": "/cluster/home/krfo/intel/oneapi/2026.1/oneapi-vars.sh",
+      "hdfql": "/cluster/home/krfo/adjoint-2d-v1",
+      "binary_size": 28871264,
+      "binary_mtime_ns": 1790020983000000000,
+      "adjoint_spec": "/cluster/home/krfo/adjoint-2d-v1/adjoint-spec.json",
+      "adjoint_spec_sha256": "fa45a832ed8deb1303d606d557282b4a7c2ec09fb3e53537ca72c76446ce737f"
+    }
+  },
+  "resume_checkpoint_sha256": null,
+  "effective_random_seed": 2026,
+  "tools": [
+    [
+      "12kHz",
+      "43ft"
+    ],
+    [
+      "24kHz",
+      "43ft"
+    ],
+    [
+      "48kHz",
+      "43ft"
+    ],
+    [
+      "96kHz",
+      "43ft"
+    ],
+    [
+      "12kHz",
+      "83ft"
+    ],
+    [
+      "24kHz",
+      "83ft"
+    ],
+    [
+      "2kHz",
+      "83ft"
+    ],
+    [
+      "6kHz",
+      "83ft"
+    ]
+  ],
+  "dims": [
+    33,
+    5,
+    80
+  ],
+  "spacing_ft": [
+    5.0,
+    5.0,
+    5.0
+  ],
+  "covariance_bytes": 223027200,
+  "parameter_units": "[ln(Rh / Ohm m), anisotropy latent]",
+  "rv_parameterization": {
+    "ratio_bounds": [
+      1.0,
+      3.0
+    ],
+    "latent_std": 0.12,
+    "hard_cap_ohmm": 80.0
+  },
+  "unified_domain": true,
+  "prior_projection_effective": false,
+  "tv_weights_effective": {
+    "1D": 0.05,
+    "2D": 0.05
+  },
+  "prior_units": {
+    "cli": "log10",
+    "internal": "natural_log",
+    "background_ohm_m": 1.5,
+    "reservoir_ohm_m": 30.000000000000004,
+    "background_ln": 0.4054651081081644,
+    "reservoir_ln": 3.4011973816621555,
+    "mode_std_ln": 0.2302585092994046,
+    "projection_radius_ln": 0.4605170185988092
+  },
+  "reference_note": "Copy of runs/benchmark3-full-two-step-esmda-b025-t75-20261015-r2/run.json with data/variance switched to the bedding-mode Benchmark-3 outputs_2D (regenerated 2026-10-23, see Dashboard/benchmarks/Benchmark-3/OUTPUTS_2D_PROVENANCE.md); only run.json is used by the sequential chain.",
+  "note": "Template reference for the gated EnIF chain (Benchmark-3, bedding-mode outputs_2D). The chain reads benchmark, data, variance, dims, spacing_ft/dx_ft/dz_ft and the prior_* moments from it; see README."
+}

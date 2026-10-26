@@ -30,15 +30,55 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 
 # The UDAR geo-signal layout the worker returns per tool, in the solver's
 # canonical order (matches ``pxwf.execution.worker.COMPONENTS``).
 UDAR_COMPONENTS = ("USDP", "USDA", "UADP", "UADA", "UHRP", "UHRA", "UHAP", "UHAA")
+
+
+def classify_solver_start_failure(exc):
+    """Classify confirmed single-field 2D solver failures from saved receipts."""
+    if not isinstance(exc, RuntimeError):
+        return None
+    match = re.fullmatch(r"Batch ([0-9a-f]{32}): FAILED\. Details: (.+/status\.json)", str(exc))
+    if match is None:
+        return None
+    batch_id, status_path = match.groups()
+    try:
+        status = json.loads(Path(status_path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(status, dict):
+        return None
+    evaluations = status.get('evaluations', [])
+    if not isinstance(evaluations, list) or len(evaluations) != 1 or not isinstance(evaluations[0], dict):
+        return None
+    error = evaluations[0].get('error')
+    if (status.get('batch_id') != batch_id or status.get('state') != 'FAILED'
+            or not status.get('connected', True)
+            or evaluations[0].get('batch_id') != batch_id
+            or evaluations[0].get('state') != 'FAILED' or not isinstance(error, str)):
+        return None
+    if error.startswith('CalledProcessError:'):
+        exit_code = re.search(r'\bexit status (174|135|139)\b', error)
+        if exit_code is not None:
+            return f'exit_{exit_code.group(1)}'
+    if error == 'RuntimeError: Solver reported a convergence error; see convergence_error.txt':
+        return 'solver_convergence'
+    return None
+
+
+def is_solver_exit_174(exc):
+    return classify_solver_start_failure(exc) == 'exit_174'
+
 
 def _env(name, default=None):
     value = os.environ.get(name)
@@ -79,7 +119,20 @@ class SimBackendConfig:
     jobs_dir: str = ""
     solver_tolerance: float = 1e-6
     poll_max_delay_seconds: float = 5.
+    reconnect_grace_seconds: float = 180.
     solver_grid: tuple = (20, 4, 40, 30, 20, 30, 2, 1, 2)
+    # Local backend inside a Slurm allocation: run each solve as an `srun` job
+    # step with `ranks` MPI ranks x `cpus` CPUs, MKL-threaded DGEMM and a
+    # pinned MKL code path. These change the floating-point forward result,
+    # so they are part of a study's identity.
+    mkl_threads: int = 1
+    mkl_cbwr: str = ""
+    srun_steps: bool = False
+    physical_cores: bool = False
+    # Material TI axis of the solver's inner grid: "gradient" (legacy: dominant
+    # gradient of -2 ln Rh - ln Rv per solver cell) or "bedding" (well-dip/bedding
+    # axis everywhere; needs a build whose adjoint spec declares the input).
+    orientation: str = "gradient"
 
     @classmethod
     def from_env(cls):
@@ -108,8 +161,10 @@ class SimBackendConfig:
             jobs_dir=_env("DA_SIM_JOBS_DIR", ""),
             solver_tolerance=float(_env("DA_SIM_TOLERANCE", 1e-6)),
             poll_max_delay_seconds=float(_env("DA_SIM_POLL_MAX_DELAY", 5.)),
+            reconnect_grace_seconds=float(_env("DA_SIM_RECONNECT_GRACE", 180.)),
             solver_grid=tuple(int(v) for v in
                               _env("DA_SIM_SOLVER_GRID", "20,4,40,30,20,30,2,1,2").split(",")),
+            orientation=_env("DA_SIM_ORIENTATION", "gradient"),
         )
 
     def add_cli(self, parser):
@@ -147,10 +202,15 @@ class SimBackendConfig:
         parser.add_argument("--solver-tolerance", type=float, default=self.solver_tolerance)
         parser.add_argument("--poll-max-delay", type=float, default=self.poll_max_delay_seconds,
                             help="Maximum array-job polling sleep, seconds")
+        parser.add_argument("--reconnect-grace", type=float, default=self.reconnect_grace_seconds,
+                            help="Seconds a poll may stay disconnected before manual reconnect")
         parser.add_argument("--solver-grid", default=",".join(str(v) for v in self.solver_grid),
                             metavar="UX,UY,UZ,OX,OY,OZ,AX,AY,AZ",
                             help="fwd2D custom grid: uniform and optimal node counts and "
                                  "material averaging (default: %(default)s)")
+        parser.add_argument("--orientation", choices=["gradient", "bedding"], default=self.orientation,
+                            help="Material TI axis: legacy per-cell gradient axis, or the bedding axis "
+                                 "everywhere (needs an orientation-capable build)")
 
     def from_args(self, args):
         kwargs = dict(
@@ -177,10 +237,63 @@ class SimBackendConfig:
             scratch=args.scratch,
             solver_tolerance=args.solver_tolerance,
             poll_max_delay_seconds=args.poll_max_delay,
+            reconnect_grace_seconds=args.reconnect_grace,
             solver_grid=tuple(int(v) for v in args.solver_grid.split(",")),
+            orientation=args.orientation,
         )
         return SimBackendConfig(**{**asdict(self), **kwargs})
 
+    def to_env(self):
+        """Environment mapping that reproduces this config via ``from_env``.
+
+        Lets a parent harness (e.g. ``validate_gate.py``) drive the backend and
+        every slurm knob for child ``run_DA_sequential`` processes through the
+        environment instead of repeating per-run CLI flags.
+        """
+        values = {
+            "backend": self.backend, "host": self.host, "root": self.root,
+            "python": self.python, "partition": self.partition,
+            "account": self.account, "qos": self.qos, "nodes": self.nodes,
+            "ranks": self.ranks, "cpus": self.cpus, "memory": self.memory,
+            "walltime": self.walltime, "concurrency": self.concurrency,
+            "chunk": self.chunk, "workers": self.workers, "oneapi": self.oneapi,
+            "hdfql": self.hdfql, "binary_dir": self.binary_dir, "mpi": self.mpi,
+            "pmi": self.pmi, "scratch": self.scratch, "jobs_dir": self.jobs_dir,
+            "solver_tolerance": self.solver_tolerance,
+            "poll_max_delay_seconds": self.poll_max_delay_seconds,
+            "reconnect_grace_seconds": self.reconnect_grace_seconds,
+            "solver_grid": ",".join(str(v) for v in self.solver_grid),
+            "orientation": self.orientation,
+        }
+        return {
+            "DA_SIM_BACKEND": values["backend"],
+            "DA_SIM_HOST": values["host"],
+            "DA_SIM_ROOT": values["root"],
+            "DA_SIM_PYTHON": values["python"],
+            "DA_SIM_PARTITION": values["partition"],
+            "DA_SIM_ACCOUNT": values["account"],
+            "DA_SIM_QOS": values["qos"],
+            "DA_SIM_NODES": str(values["nodes"]),
+            "DA_SIM_RANKS": str(values["ranks"]),
+            "DA_SIM_CPUS": str(values["cpus"]),
+            "DA_SIM_MEMORY": str(values["memory"]),
+            "DA_SIM_WALLTIME": values["walltime"],
+            "DA_SIM_CONCURRENCY": str(values["concurrency"]),
+            "DA_SIM_CHUNK": str(values["chunk"]),
+            "DA_SIM_WORKERS": str(values["workers"]),
+            "DA_SIM_ONEAPI": values["oneapi"],
+            "DA_SIM_HDFQL": values["hdfql"],
+            "DA_SIM_BINARY_DIR": values["binary_dir"],
+            "DA_SIM_MPI": values["mpi"],
+            "DA_SIM_PMI": values["pmi"],
+            "DA_SIM_SCRATCH": values["scratch"],
+            "DA_SIM_JOBS_DIR": values["jobs_dir"],
+            "DA_SIM_TOLERANCE": str(values["solver_tolerance"]),
+            "DA_SIM_POLL_MAX_DELAY": str(values["poll_max_delay_seconds"]),
+            "DA_SIM_RECONNECT_GRACE": str(values["reconnect_grace_seconds"]),
+            "DA_SIM_SOLVER_GRID": values["solver_grid"],
+            "DA_SIM_ORIENTATION": values["orientation"],
+        }
 
 class Remote2D:
     """Drive ESMDA-MF 2D forward/Jacobian calls through the Dashboard worker."""
@@ -237,12 +350,18 @@ class Remote2D:
                 overrides["hdfql"] = cfg.hdfql
             if cfg.binary_dir:
                 overrides["binary_dir"] = cfg.binary_dir
-            self._backend = LocalBackend(store=store,
-                                         resources=SlurmResources(cpus_per_rank=cfg.cpus,
-                                                                  concurrency=1,
-                                                                  chunk_size=cfg.chunk),
+            if not cfg.srun_steps and (cfg.ranks != 1 or cfg.physical_cores):
+                raise ValueError("Multiple MPI ranks or core binding need srun_steps")
+            options = (("--exact", "--mem=0") + (("--hint=nomultithread",) if cfg.physical_cores else ())
+                       if cfg.srun_steps else ())
+            resources = SlurmResources(nodes=1, ranks=cfg.ranks, cpus_per_rank=cfg.cpus,
+                                       concurrency=1, chunk_size=cfg.chunk,
+                                       mkl_threads=cfg.mkl_threads, srun_options=options,
+                                       solver_environment=({"MKL_CBWR": cfg.mkl_cbwr}
+                                                           if cfg.mkl_cbwr else {}))
+            self._backend = LocalBackend(store=store, resources=resources,
                                          overrides=overrides or None,
-                                         workers=cfg.concurrency)
+                                         workers=cfg.concurrency, srun_steps=cfg.srun_steps)
         elif cfg.backend == "slurm":
             profile = RemoteProfile(cfg.host, cfg.root, cfg.python, cfg.oneapi, cfg.hdfql,
                                     cfg.binary_dir, cfg.mpi, cfg.pmi, cfg.scratch)
@@ -314,7 +433,9 @@ class Remote2D:
             "evaluation_timeout_seconds": 180.0,
             "solver_tolerance": self.config.solver_tolerance,
             "poll_max_delay_seconds": self.config.poll_max_delay_seconds,
+            "reconnect_grace_seconds": self.config.reconnect_grace_seconds,
             "solver_grid": list(self.config.solver_grid),
+            "orientation": self.config.orientation,
         }
 
     # -- field / result mapping --------------------------------------------

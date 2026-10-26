@@ -1,4 +1,5 @@
 from pathlib import Path
+import pickle
 import subprocess
 import sys
 
@@ -99,13 +100,306 @@ def test_field_layout_and_log_chain_rule_against_finite_difference(monkeypatch):
         return weights[0] @ np.exp(rh) + weights[1] @ np.exp(rv)
 
     log_rh = parameters[:12]
-    log_rv = log_rh + np.log(5) * norm.cdf(parameters[12:])
+    log_rv = log_rh + np.log(sequential.max_ratio / sequential.min_ratio) * norm.cdf(parameters[12:])
     jac = optimizer_jacobian((weights[0] * np.exp(log_rh))[None],
-                             (weights[1] * np.exp(log_rv))[None], latent)
+                             (weights[1] * np.exp(log_rv))[None], latent,
+                             sequential.min_ratio, sequential.max_ratio,
+                             log_rv_cap=sequential.log_rv_cap, log_rh=log_rh)
     direction = np.random.default_rng(17).normal(size=24)
     step = 1e-5
     fd = (response(parameters + step * direction) - response(parameters - step * direction)) / (2 * step)
     np.testing.assert_allclose(jac @ direction, [fd], rtol=1e-7)
+
+
+def test_rv_parameterization_uses_tighter_ratio_and_hard_cap(monkeypatch):
+    monkeypatch.setattr(sequential, 'dims', (1, 1, 2))
+    params = np.r_[np.full(2, 4.), np.full(2, 4.)]
+    fields, log_rh, latent = sequential._build_param_dict(params)
+    assert sequential.max_ratio == 3.
+    np.testing.assert_allclose(np.exp(fields['rv']), 80.)
+    jac = optimizer_jacobian(np.ones((1, 2)), np.ones((1, 2)), latent,
+                             sequential.min_ratio, sequential.max_ratio,
+                             log_rv_cap=sequential.log_rv_cap, log_rh=log_rh)
+    np.testing.assert_array_equal(jac[:, 2:], 0.)
+    np.testing.assert_array_equal(jac[:, :2], 1.)
+
+
+def test_gaussian_prior_can_be_drawn_without_bit_center_conditioning():
+    arguments = (4, None, np.log(1.5), np.log(30.), .1, .15, 3, 5, 5., 5.,
+                 80., 75., 35., .12)
+    np.random.seed(53)
+    unconditioned = sequential.sample_gaussian_prior_2d(*arguments)
+    target = np.full(4, .7)
+    np.random.seed(53)
+    conditioned = sequential.sample_gaussian_prior_2d(
+        4, target, *arguments[2:])
+    n = 3 * 5
+    center = (3 // 2) * 5 + 5 // 2
+    assert not np.allclose(unconditioned[center], target)
+    np.testing.assert_allclose(conditioned[center], target)
+    np.testing.assert_array_equal(unconditioned[n:], conditioned[n:])
+
+
+def test_gaussian_prior_uses_separate_rh_and_latent_lateral_scales():
+    base = (4, None, np.log(1.5), np.log(30.), .1, .15, 3, 5, 5., 5.,
+            10., 75., 35., .12)
+    np.random.seed(71)
+    short_latent = sequential.sample_gaussian_prior_2d(*base, latent_corr_x_ft=20.)
+    np.random.seed(71)
+    long_latent = sequential.sample_gaussian_prior_2d(*base, latent_corr_x_ft=80.)
+    cells = 3 * 5
+    np.testing.assert_array_equal(short_latent[:cells], long_latent[:cells])
+    assert not np.allclose(short_latent[cells:], long_latent[cells:])
+
+
+def test_new_lateral_and_multistart_defaults_are_point31_settings(tmp_path):
+    args, _ = sequential.parse_args(['--output-dir', str(tmp_path / 'run')])
+    assert args.prior_correlation_x_ft == 10.
+    assert args.prior_latent_correlation_x_ft == 80.
+    assert args.lm_laplace_starts == 5
+
+
+def test_two_step_esmda_updates_only_valid_ranked_members_twice():
+    state = np.array([[.2, .4, .6, .8, 1.],
+                      [1., 1.2, 1.4, 1.6, 1.8],
+                      [.1, .2, .3, .4, .5],
+                      [.6, .7, .8, .9, 1.]])
+    selected = np.array([4, 1, 3])
+    batch_sizes, update_shapes = [], []
+
+    def forward_batch(models):
+        batch_sizes.append(len(models))
+        return [None if np.isclose(model[0], .4)
+                else np.array([model[0], model[2]]) for model in models]
+
+    def update_step(enX, enY, enE, inflated, threshold):
+        update_shapes.append(enX.shape)
+        assert threshold == .7
+        np.testing.assert_allclose(inflated, [4., 8.])
+        return np.full_like(enX, .1)
+
+    result = sequential._run_two_step_esmda(
+        state, selected, np.array([1., 2.]), np.array([1., 2.]), .5,
+        forward_batch, update_step, np.random.default_rng(13), .7)
+
+    assert result['member_indices'].tolist() == [4, 3]
+    assert result['alpha'] == [4., 4.]
+    assert result['failures'][0]['member'] == 1
+    assert batch_sizes == [3, 2, 2]
+    assert update_shapes == [(4, 2), (4, 2)]
+    np.testing.assert_allclose(result['state'][:, [4, 3]], state[:, [4, 3]] + .2)
+    np.testing.assert_array_equal(result['state'][:, [0, 1, 2]], state[:, [0, 1, 2]])
+
+
+def test_paired_mean_correction_shifts_remaining_members_and_preserves_their_covariance():
+    ensemble_1d = np.array([[.2, .4, .6, .8],
+                            [1.0, 1.2, 1.4, 1.6],
+                            [.1, .2, .3, .4],
+                            [.5, .6, .7, .8]])
+    selected = np.array([0, 2])
+    selected_2d = ensemble_1d[:, selected] + np.array([[.3], [-.2], [.1], [.4]])
+    remaining = np.array([1, 3])
+    covariance_before = np.cov(ensemble_1d[:, remaining])
+
+    corrected, delta, damping = sequential._paired_mean_correction(
+        ensemble_1d, selected, ensemble_1d[:, selected], selected_2d, rh_cells=2)
+
+    np.testing.assert_allclose(delta, [.3, -.2, .1, .4])
+    np.testing.assert_array_equal(damping, np.ones(4))
+    np.testing.assert_allclose(corrected[:, selected], selected_2d)
+    np.testing.assert_allclose(corrected[:, remaining],
+                               ensemble_1d[:, remaining] + delta[:, None])
+    np.testing.assert_allclose(np.cov(corrected[:, remaining]), covariance_before)
+
+
+def test_paired_mean_correction_damps_only_to_respect_rh_bounds():
+    ensemble_1d = np.array([[.2, 3.9, .6, 3.8],
+                            [1.0, 1.2, 1.4, 1.6],
+                            [.1, .2, .3, .4],
+                            [.5, .6, .7, .8]])
+    selected = np.array([0, 2])
+    selected_2d = ensemble_1d[:, selected] + np.array([[1.], [0.], [0.], [0.]])
+
+    corrected, delta, damping = sequential._paired_mean_correction(
+        ensemble_1d, selected, ensemble_1d[:, selected], selected_2d, rh_cells=2)
+
+    assert damping[0] == pytest.approx(.1)
+    np.testing.assert_array_equal(damping[1:], np.ones(3))
+    assert np.max(corrected[:2]) <= sequential.LOG_RH_LIMITS[1]
+    assert np.min(corrected[:2]) >= sequential.LOG_RH_LIMITS[0]
+    np.testing.assert_allclose(corrected[2:, [1, 3]],
+                               ensemble_1d[2:, [1, 3]]
+                               + damping[2:, None] * delta[2:, None])
+
+
+def test_auto_adaloc_sigmoid_midpoint_is_requested_threshold():
+    from pipt.misc_tools.cov_regularization import localization
+
+    config = sequential._auto_adaloc_config(.7, 12)
+    assert config == {'field': [12, 1, 1], 'autoadaloc': .3, 'type': 'sigm'}
+    localizer = localization(config, [], [], ['rh', 'rv'], 4)
+    correlations = np.array([[.69], [.7], [.71]])
+    taper = localizer.tapering_function(correlations, np.zeros_like(correlations))
+    assert taper[0, 0] < .5 < taper[2, 0]
+    assert taper[1, 0] == pytest.approx(.5)
+
+
+def test_two_step_esmda_slurm_raises_batch_concurrency_to_member_count(tmp_path):
+    args, config = sequential.parse_args([
+        '--output-dir', str(tmp_path / 'run'), '--final-stage', 'two-step-esmda',
+        '--sim-backend', 'slurm', '--concurrency', '4'])
+    assert args.final_2d_members == 10
+    assert args.final_2d_localization_threshold == .8
+    assert config.concurrency == 10
+
+
+def test_adaptive_localization_flag_keeps_final_2d_alias(tmp_path):
+    args, _ = sequential.parse_args([
+        '--output-dir', str(tmp_path / 'run'), '--adaptive-localization-threshold', '.65'])
+    assert args.final_2d_localization_threshold == .65
+    args, _ = sequential.parse_args([
+        '--output-dir', str(tmp_path / 'run2'), '--final-2d-localization-threshold', '.55'])
+    assert args.final_2d_localization_threshold == .55
+
+
+def test_two_step_esmda_controller_runs_gated_forward_only_batches(
+        tmp_path, monkeypatch, controller_environment):
+    _, benchmark = controller_environment
+    calls = {'batches': [], 'jacobian': 0}
+
+    def fake_pred(param, index, simfidelity='2D'):
+        return np.ones(8) if simfidelity == '0D' else np.full(8, 5.)
+
+    class Backend:
+        def trusts_ad(self, fidelity):
+            return True
+
+    class Adapter:
+        def backend(self):
+            return Backend()
+
+        def runtime_identity(self):
+            return {'test': True}
+
+        def run_pred_multi(self, param_dicts, index, shift, well, timeout=None):
+            calls['batches'].append(len(param_dicts))
+            return np.asarray([
+                np.full(8, float(np.mean(parameters['rh'])))
+                for parameters in param_dicts])
+
+    monkeypatch.setattr(sequential, 'simulate_pred_only', fake_pred)
+    monkeypatch.setattr(sequential, 'make_remote2d', lambda *args: Adapter())
+    output = tmp_path / 'two-step'
+    sequential.main(['--benchmark', str(benchmark), '--data', str(tmp_path / 'data.pkl'),
+                     '--variance', str(tmp_path / 'var.pkl'), '--output-dir', str(output),
+                     '--stop', '1', '--nx', '3', '--nz', '4', '--ensemble-size', '4',
+                     '--opt-members', '3',
+                     '--final-stage', 'two-step-esmda', '--final-2d-members', '3',
+                     '--prior-style', 'gaussian', '--prior-projection', 'off'])
+
+    result = pd.read_pickle(output / 'inversion_results_assim_0.pkl')
+    assert result['final_stage'] == 'two-step-esmda'
+    assert result['misfit']['before_final'] > result['misfit_threshold']
+    assert len(result['final_2d_ranked_candidates']) == 3
+    assert result['final_2d_alpha'][0] == result['final_2d_alpha'][1]
+    assert result['final_2d_localization'] == {
+        'type': 'sigm', 'correlation_threshold': .8, 'autoadaloc': .2}
+    assert result['adaptive_localization'] == result['final_2d_localization']
+    assert result['mean_correction_method'] == 'paired_selected_2d_minus_1d'
+    assert len(result['mean_correction_delta']) == 24
+    assert np.asarray(result['mean_correction_damping']).mean() > 0.
+    assert calls['batches'] == [3, 3, 3]
+    assert result['two_d_calls'] == 9
+    assert result['simulator_calls']['jacobian_2D'] == 0
+    assert np.shape(result['posterior_params']) == (3, 24)
+    assert np.shape(result['posterior_ensemble_params']) == (4, 24)
+
+
+def test_two_step_esmda_respects_closed_1d_to_2d_gate(
+        tmp_path, monkeypatch, controller_environment):
+    _, benchmark = controller_environment
+    prior_covariance_shapes = []
+    original_loss = sequential.custom_loss
+
+    def track_loss(predictions, observations, theta, theta_mean, covariance, data_covariance):
+        prior_covariance_shapes.append(np.asarray(covariance).shape)
+        return original_loss(predictions, observations, theta, theta_mean,
+                             covariance, data_covariance)
+
+    monkeypatch.setattr(sequential, 'simulate_pred_only',
+                        lambda *args: np.ones(8))
+    monkeypatch.setattr(sequential, 'custom_loss', track_loss)
+    output = tmp_path / 'gate-closed'
+    sequential.main(['--benchmark', str(benchmark), '--data', str(tmp_path / 'data.pkl'),
+                     '--variance', str(tmp_path / 'var.pkl'), '--output-dir', str(output),
+                     '--stop', '1', '--nx', '3', '--nz', '4', '--ensemble-size', '4',
+                     '--opt-members', '3', '--final-stage', 'two-step-esmda',
+                     '--prior-style', 'gaussian', '--prior-projection', 'off'])
+
+    result = pd.read_pickle(output / 'inversion_results_assim_0.pkl')
+    assert result['selected_fidelity'] == '1D'
+    assert result['two_d_calls'] == 0
+    assert result['final_stage_skipped'] == '1D-to-2D threshold gate remained closed'
+    assert prior_covariance_shapes
+    assert all(len(shape) == 1 for shape in prior_covariance_shapes)
+
+
+def test_resume_state_restores_previous_posterior_and_window_offset(tmp_path):
+    dims, spacing = (3, 5, 4), (5., 5., 5.)
+    tools = [('6kHz', '83ft')]
+    wx, wy, tvd = np.array([0., 5., 10.]), np.zeros(3), np.array([100., 100., 100.])
+    window = LocalWindow(dims, spacing)
+    window.update((wx[0], wy[0], tvd[0]))
+    shift, _ = window.update((wx[1], wy[1], tvd[1]))
+    posterior = np.arange(2 * np.prod(dims[::2]) * 2., dtype=float).reshape(2, -1)
+    saved = {'logging_index': 1, 'dims': dims, 'spacing_ft': spacing,
+             'tools': tools, 'prior_style': 'gaussian',
+             'rv_ratio_bounds': (1., 3.), 'rv_hard_cap_ohmm': 80.,
+             'laplace_correlation_ft': [(10., 75.), (80., 35.)],
+             'posterior_params': list(posterior), 'shift_ft': shift}
+    checkpoint = tmp_path / 'inversion_results_assim_1.pkl'
+    with checkpoint.open('wb') as stream:
+        pickle.dump(saved, stream)
+
+    restored, previous_index, digest = sequential.load_resume_state(
+        checkpoint, dims, spacing, 2, 2, tools, 'gaussian', (1., 3.), 80.,
+        ((10., 75.), (80., 35.)), LocalWindow(dims, spacing), wx, wy, tvd)
+    np.testing.assert_array_equal(restored, posterior.T)
+    assert previous_index == 1
+    assert len(digest) == 64
+
+
+def test_controller_warm_resumes_from_previous_checkpoint(tmp_path, monkeypatch,
+                                                          controller_environment):
+    base, benchmark = controller_environment
+    dims, spacing = (3, 5, 4), (5., 5., 5.)
+    wx, wy = np.arange(3) * 5., np.zeros(3)
+    tvd = np.array([100., 101.524, 103.048]) * sequential.meter_to_feet
+    window = LocalWindow(dims, spacing)
+    shift, movement = window.update((wx[0], wy[0], tvd[0]))
+    assert movement == (0, 0)
+    ensemble = np.zeros((2 * dims[0] * dims[2], 6))
+    checkpoint = base / 'inversion_results_assim_0.pkl'
+    with checkpoint.open('wb') as stream:
+        pickle.dump({'logging_index': 0, 'dims': dims, 'spacing_ft': spacing,
+                     'tools': [('6kHz', '83ft')], 'prior_style': 'gaussian',
+                     'rv_ratio_bounds': (1., 3.), 'rv_hard_cap_ohmm': 80.,
+                     'laplace_correlation_ft': [(10., 75.), (80., 35.)],
+                     'posterior_params': list(ensemble.T), 'shift_ft': shift}, stream)
+    monkeypatch.setattr(sequential, 'simulate_pred_only', lambda *args: np.ones(8))
+    output = base / 'resumed'
+    sequential.main(['--benchmark', str(benchmark), '--data', str(base / 'data.pkl'),
+                     '--variance', str(base / 'var.pkl'), '--output-dir', str(output),
+                     '--start', '1', '--stop', '3', '--nx', '3', '--nz', '4',
+                     '--ensemble-size', '6', '--prior-style', 'gaussian',
+                     '--prior-projection', 'off', '--resume-checkpoint', str(checkpoint)])
+    first = pd.read_pickle(output / 'inversion_results_assim_1.pkl')
+    assert first['previous_index'] == 0
+    assert first['window_movement'] == (1, 1)
+    assert first['effective_random_seed'] == 2027
+    manifest = __import__('json').loads((output / 'run.json').read_text())
+    assert manifest['resume_checkpoint'] == str(checkpoint.resolve())
+    assert len(manifest['resume_checkpoint_sha256']) == 64
 
 
 def test_metadata_uses_current_orientation_and_origin():
@@ -118,6 +412,23 @@ def test_metadata_uses_current_orientation_and_origin():
     assert meta['well']['Azimuth'] == 15
     np.testing.assert_allclose(meta['origin'], np.array([10, 20, 30]) / 3.28084)
     assert meta['solver_tolerance'] == 1e-6
+    assert meta['orientation'] == 'gradient'
+
+
+def test_material_orientation_flows_from_cli_and_environment_into_metadata(monkeypatch):
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    SimBackendConfig().add_cli(parser)
+    config = SimBackendConfig().from_args(parser.parse_args(['--orientation', 'bedding']))
+    assert config.orientation == 'bedding' and config.to_env()['DA_SIM_ORIENTATION'] == 'bedding'
+    with pytest.raises(SystemExit):
+        parser.parse_args(['--orientation', 'tilted'])
+    monkeypatch.setenv('DA_SIM_ORIENTATION', 'bedding')
+    assert SimBackendConfig.from_env().orientation == 'bedding'
+    adapter = Remote2D(config, (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')])
+    well = {key: np.array([[0.]]) for key in ('X', 'Y', 'Z', 'Distance', 'Inclination', 'Azimuth')}
+    assert adapter.build_metadata(0, {'x': 0., 'y': 0., 'z': 0.}, well)['orientation'] == 'bedding'
 
 
 def test_local_backend_honors_cpu_and_worker_requests(tmp_path):
@@ -138,6 +449,19 @@ def test_measurement_misfit_is_reduced_chi_square():
         measurement_misfit(prediction, observations, np.zeros(3))
     with pytest.raises(ValueError):
         measurement_misfit(np.ones(2), observations, covariance)
+
+
+def test_custom_loss_vector_diagonal_covariance_matches_matrix():
+    predictions = np.array([1., 3.])
+    observations = np.array([2., 2.])
+    theta = np.array([1., -1., .5])
+    mean = np.array([0., 0., 0.])
+    diagonal = np.array([2., 4., 8.])
+    cd = np.array([1., 2.])
+    vector_loss = sequential.custom_loss(predictions, observations, theta, mean, diagonal, cd)
+    matrix_loss = sequential.custom_loss(predictions, observations, theta, mean,
+                                         np.diag(diagonal), cd)
+    assert vector_loss == pytest.approx(matrix_loss)
 
 
 def test_variance_selection_handles_rowwise_and_legacy_envelopes():
@@ -749,6 +1073,14 @@ def test_cli_rejects_invalid_and_full_benchmark_grids():
         sequential.parse_args(['--output-dir', 'unused', '--typo'])
 
 
+def test_one_d_budget_reserves_final_likelihood_weight():
+    args, _ = sequential.parse_args(['--output-dir', 'unused', '--one-d-budget', '.25'])
+    assert args.one_d_budget == pytest.approx(.25)
+    for bad in ('0', '-.1', '.8', 'nan'):
+        with pytest.raises(SystemExit):
+            sequential.parse_args(['--output-dir', 'unused', '--one-d-budget', bad])
+
+
 @pytest.mark.parametrize('force_2d', [False, True])
 def test_three_point_controller_carries_window_and_checkpoints(tmp_path, monkeypatch, force_2d):
     benchmark = tmp_path / 'benchmark'
@@ -764,6 +1096,7 @@ def test_three_point_controller_carries_window_and_checkpoints(tmp_path, monkeyp
         monkeypatch.setattr(sequential, 'TVD', depths, raising=False)
         monkeypatch.setattr(sequential, 'WX', np.arange(3) * 5., raising=False)
         monkeypatch.setattr(sequential, 'WY', np.zeros(3), raising=False)
+        monkeypatch.setattr(sequential, 'wellpath', {}, raising=False)
 
     class Backend:
         def trusts_ad(self, fidelity):
@@ -775,6 +1108,10 @@ def test_three_point_controller_carries_window_and_checkpoints(tmp_path, monkeyp
 
         def runtime_identity(self):
             return {'test': True}
+
+        def run_pred_multi(self, param_dicts, index, shift, well, timeout=None):
+            return np.full((len(param_dicts), len(sequential.UDAR_COMPONENTS) * len(sequential.tools)),
+                           np.nan)
 
     monkeypatch.setattr(sequential, 'setup_simulators', setup)
     monkeypatch.setattr(sequential, '_set_logging_point_state', lambda index: None)
@@ -823,6 +1160,7 @@ def controller_environment(tmp_path, monkeypatch):
         monkeypatch.setattr(sequential, 'TVD', depths, raising=False)
         monkeypatch.setattr(sequential, 'WX', np.arange(3) * 5., raising=False)
         monkeypatch.setattr(sequential, 'WY', np.zeros(3), raising=False)
+        monkeypatch.setattr(sequential, 'wellpath', {}, raising=False)
 
     class Backend:
         def trusts_ad(self, fidelity):
@@ -835,10 +1173,45 @@ def controller_environment(tmp_path, monkeypatch):
         def runtime_identity(self):
             return {'test': True}
 
+        def run_pred_multi(self, param_dicts, index, shift, well, timeout=None):
+            return np.full((len(param_dicts), len(sequential.UDAR_COMPONENTS) * len(sequential.tools)),
+                           np.nan)
+
     monkeypatch.setattr(sequential, 'setup_simulators', setup)
     monkeypatch.setattr(sequential, '_set_logging_point_state', lambda index: None)
     monkeypatch.setattr(sequential, 'make_remote2d', lambda *args: Adapter())
     return tmp_path, benchmark
+
+
+def test_lm_laplace_controller_checkpoints_after_five_batched_2d_start_failures(
+        tmp_path, monkeypatch, controller_environment):
+    _, benchmark = controller_environment
+
+    def fake_pred(param, index, simfidelity='2D'):
+        if simfidelity == '2D':
+            raise AssertionError('LM 2D starts should use the batched remote adapter')
+        return np.ones(8) * 5.
+
+    monkeypatch.setattr(sequential, 'simulate_pred_only', fake_pred)
+    output = tmp_path / 'run'
+    sequential.main(['--benchmark', str(benchmark), '--data', str(tmp_path / 'data.pkl'),
+                     '--variance', str(tmp_path / 'var.pkl'), '--output-dir', str(output),
+                     '--nx', '3', '--nz', '4', '--ensemble-size', '6', '--opt-members', '2',
+                     '--max-iterations', '0', '--lm-laplace-iterations', '1',
+                     '--prior-style', 'gaussian', '--prior-projection', 'off',
+                     '--final-stage', 'lm-laplace'])
+    for index in range(3):
+        result = pd.read_pickle(output / f'inversion_results_assim_{index}.pkl')
+        assert result['gate_selected_fidelity'] == '2D'
+        assert result['selected_fidelity'] == '1D'
+        assert result['two_d_calls'] == 5
+        assert len(result['solver_failures']) == 5
+        assert not result['invariant_start_attempted']
+        assert result['solver_failures'] == result['two_d_initial_failures']
+        assert result['solver_failures'][0]['start_kind'] == 'ranked_member'
+        assert result['solver_failures'][0]['reason'] == 'batch_forward_failure'
+        assert result['posterior_forward_verified']
+        assert result['previous_index'] == (index - 1 if index else None)
 
 
 def test_adaptive_gate_skips_2d_and_runs_final_1d_update(tmp_path, monkeypatch, controller_environment):

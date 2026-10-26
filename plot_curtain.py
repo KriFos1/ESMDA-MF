@@ -20,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
+from matplotlib.colors import ListedColormap, Normalize
 from matplotlib.patches import Patch
 import numpy as np
 from scipy.stats import norm
@@ -28,6 +28,21 @@ from scipy.stats import norm
 from run_DA_sequential import meter_to_feet
 
 CHECKPOINT_RE = re.compile(r"inversion_results_assim_(\d+)\.pkl$")
+HUE_RANGE = (240., 0.)          # degrees: blue (conductive) to red (resistive)
+
+
+def hue_colormap(samples=256):
+    """Constant-lightness hue scale: HLS lightness 0.5 and full saturation, blue to red.
+
+    The value lives only in the hue, so ``hls_lightness_rgb`` can encode the
+    posterior variance in lightness without shifting the apparent value.
+    """
+    hues = np.linspace(*HUE_RANGE, samples) / 360.
+    return ListedColormap([colorsys.hls_to_rgb(hue, .5, 1.) for hue in hues], name='hls_hue')
+
+
+def value_colormap(name):
+    return hue_colormap() if name == 'hue' else plt.get_cmap(name)
 
 
 def parse_args(argv=None):
@@ -42,6 +57,9 @@ def parse_args(argv=None):
     parser.add_argument('--log10-limits', type=float, nargs=2, default=None)
     parser.add_argument('--shared-extents', action='store_true')
     parser.add_argument('--estimate-label', default='Estimated')
+    parser.add_argument('--colormap', choices=['viridis', 'hue'], default='viridis',
+                        help="Value colours of all panels: 'viridis', or 'hue' (constant HLS lightness, "
+                             'blue to red), which leaves lightness free for the uncertainty wash')
     parser.add_argument('--uncertainty-lightness', action='store_true',
                         help='Map posterior field variance into estimate-color lightness')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.,
@@ -50,6 +68,9 @@ def parse_args(argv=None):
                         help='Maximum HLS lightness wash, from 0 (off) to 1 (white)')
     parser.add_argument('--uncertainty-white-threshold', type=float, default=.35,
                         help='Set cells above this normalized variance to pure white')
+    parser.add_argument('--paint', choices=['last', 'nearest-bit'], default='last',
+                        help='last: later windows overwrite earlier ones; nearest-bit: each cell comes from '
+                             'the window in which it was laterally closest to the bit (at-drilling estimate)')
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
@@ -62,19 +83,44 @@ def parse_args(argv=None):
     return args
 
 
-def load_checkpoints(run_dir):
+# Checkpoint entries the curtain uses; the other ensembles (prior, post-MDA, ...) are
+# dropped at load time, so memory grows by one ensemble per point, not four.
+RENDER_KEYS = ('dims', 'spacing_ft', 'shift_ft', 'posterior_ensemble_params', 'posterior_params',
+               'rv_ratio_bounds', 'rv_hard_cap_ohmm', 'anisotropy', 'selected_fidelity', 'optimized_2d',
+               'posterior_prediction_kind', 'two_d_mode', 'misfit', 'posterior_misfit',
+               'best_member_data_misfit', 'misfit_threshold')
+
+
+def trim_checkpoint(result):
+    """Keep only what ``render`` reads, with a single posterior ensemble."""
+    trimmed = {key: result[key] for key in RENDER_KEYS if key in result}
+    if 'posterior_ensemble_params' in trimmed:
+        trimmed['posterior_params'] = trimmed['posterior_ensemble_params']
+    return trimmed
+
+
+def load_checkpoints(run_dir, cache=None):
+    """Trimmed checkpoints in index order; ``cache`` (a dict) reuses unchanged files across calls."""
     checkpoints = []
     for path in sorted(run_dir.glob("inversion_results_assim_*.pkl")):
         match = CHECKPOINT_RE.search(path.name)
         if match is None:
             continue
+        stat = path.stat()
+        key = (stat.st_size, stat.st_mtime_ns)
+        if cache is not None and path in cache and cache[path][0] == key:
+            checkpoints.append((int(match.group(1)), cache[path][1]))
+            continue
         try:
             with path.open("rb") as stream:
-                result = pickle.load(stream)
+                result = trim_checkpoint(pickle.load(stream))
         except (pickle.UnpicklingError, EOFError, AttributeError):
             continue
-        if not np.isfinite(np.asarray(result["posterior_params"], dtype=float)).all():
+        ensemble_params = result.get('posterior_ensemble_params', result['posterior_params'])
+        if not np.isfinite(np.asarray(ensemble_params, dtype=float)).all():
             continue
+        if cache is not None:
+            cache[path] = (key, result)
         checkpoints.append((int(match.group(1)), result))
     return sorted(checkpoints, key=lambda item: item[0])
 
@@ -91,8 +137,9 @@ def prediction_kind(result):
                       'linearized' if result.get('two_d_mode') == 'single-update' else 'forward')
 
 
-def member_fields(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None):
+def member_fields(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None, anisotropy='probit'):
     """One member's (ln Rh, ln Rv) on the window; 1D members return columns."""
+    from esmda_core import log_ratio_from_latent
     nx, _, nz = dims
     params = np.asarray(params, dtype=float)
     n = nx * nz
@@ -100,24 +147,22 @@ def member_fields(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None):
         log_rh = params[:n].reshape(nx, nz)
         latent = params[n:].reshape(nx, nz)
         ratio_min, ratio_max = ratio_bounds
-        log_ratio = np.log(ratio_min) + np.log(ratio_max / ratio_min) * norm.cdf(latent)
-        log_rv = log_rh + log_ratio
+        log_rv = log_rh + log_ratio_from_latent(latent, ratio_min, ratio_max, anisotropy)
         if rv_cap_ohmm is not None:
             log_rv = np.minimum(log_rv, np.log(rv_cap_ohmm))
         return log_rh, log_rv, True
     log_rh = params[:nz]
     latent = params[nz:]
     ratio_min, ratio_max = ratio_bounds
-    log_ratio = np.log(ratio_min) + np.log(ratio_max / ratio_min) * norm.cdf(latent)
-    log_rv = log_rh + log_ratio
+    log_rv = log_rh + log_ratio_from_latent(latent, ratio_min, ratio_max, anisotropy)
     if rv_cap_ohmm is not None:
         log_rv = np.minimum(log_rv, np.log(rv_cap_ohmm))
     return log_rh, log_rv, False
 
 
-def posterior_moments(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None):
+def posterior_moments(params, dims, ratio_bounds=(1., 5.), rv_cap_ohmm=None, anisotropy='probit'):
     """Return posterior means and sample variances in log10 resistivity units."""
-    members = [member_fields(param, dims, ratio_bounds, rv_cap_ohmm) for param in params]
+    members = [member_fields(param, dims, ratio_bounds, rv_cap_ohmm, anisotropy) for param in params]
     rh_samples = np.asarray([member[0] for member in members], dtype=float)
     rv_samples = np.asarray([member[1] for member in members], dtype=float)
     if rh_samples.shape[0] > 1:
@@ -159,37 +204,54 @@ def uncertainty_rgba(field, variance, cmap, norm, variance_scale, strength=.75,
 
 
 def paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing,
-                variance_canvas_rh=None, variance_canvas_rv=None):
-    """Write one checkpoint's ensemble-mean fields into the world canvas."""
+                variance_canvas_rh=None, variance_canvas_rv=None, distance_canvas=None):
+    """Write one checkpoint's ensemble-mean fields into the world canvas.
+
+    With ``distance_canvas`` a cell is only written when its lateral distance to
+    this window's bit column does not exceed the distance of the window that
+    painted it before (ties go to the later window).
+    """
     x0, z0 = origin
     dx, dz = spacing
     nx, _, nz = result["dims"]
     ratio_bounds = result.get('rv_ratio_bounds', (1., 5.))
     rv_cap_ohmm = result.get('rv_hard_cap_ohmm')
+    anisotropy = result.get('anisotropy', 'probit')
+    posterior_params = result.get('posterior_ensemble_params', result['posterior_params'])
     include_variance = variance_canvas_rh is not None and variance_canvas_rv is not None
     if include_variance:
         rh, rv, variance_rh, variance_rv, is_2d = posterior_moments(
-            result["posterior_params"], result["dims"], ratio_bounds, rv_cap_ohmm)
+            posterior_params, result["dims"], ratio_bounds, rv_cap_ohmm, anisotropy)
     else:
-        members = [member_fields(params, result["dims"], ratio_bounds, rv_cap_ohmm)
-                   for params in result["posterior_params"]]
+        members = [member_fields(params, result["dims"], ratio_bounds, rv_cap_ohmm, anisotropy)
+                   for params in posterior_params]
         rh = np.mean([member[0] for member in members], axis=0)
         rv = np.mean([member[1] for member in members], axis=0)
         is_2d = members[0][2]
     ix = int(round((result["shift_ft"]["x"] - x0) / dx))
     iz = int(round((result["shift_ft"]["z"] - z0) / dz))
+    lateral = np.abs(np.arange(nx) - nx // 2).astype(float)
     if not is_2d:
         ix += nx // 2
         nx = 1
-    canvas_rh[ix:ix + nx, iz:iz + nz] = rh.reshape(nx, nz)
-    canvas_rv[ix:ix + nx, iz:iz + nz] = rv.reshape(nx, nz)
-    coverage[ix:ix + nx, iz:iz + nz] += 1
+        lateral = np.zeros(1)
+    region = (slice(ix, ix + nx), slice(iz, iz + nz))
+    write = np.ones((nx, nz), dtype=bool)
+    if distance_canvas is not None:
+        distance = np.repeat(lateral[:, None], nz, axis=1)
+        write = distance <= distance_canvas[region]
+        distance_canvas[region] = np.where(write, distance, distance_canvas[region])
+    canvas_rh[region] = np.where(write, rh.reshape(nx, nz), canvas_rh[region])
+    canvas_rv[region] = np.where(write, rv.reshape(nx, nz), canvas_rv[region])
+    coverage[region] += 1
     if include_variance:
-        variance_canvas_rh[ix:ix + nx, iz:iz + nz] = variance_rh.reshape(nx, nz)
-        variance_canvas_rv[ix:ix + nx, iz:iz + nz] = variance_rv.reshape(nx, nz)
+        variance_canvas_rh[region] = np.where(write, variance_rh.reshape(nx, nz), variance_canvas_rh[region])
+        variance_canvas_rv[region] = np.where(write, variance_rv.reshape(nx, nz), variance_canvas_rv[region])
 
 
-def build_curtain(checkpoints, include_variance=False):
+def build_curtain(checkpoints, include_variance=False, paint='last'):
+    if paint not in ('last', 'nearest-bit'):
+        raise ValueError(f'Unknown paint mode {paint!r}')
     spacing = (checkpoints[0][1]["spacing_ft"][0], checkpoints[0][1]["spacing_ft"][2])
     xs, zs, xe, ze = [], [], [], []
     for _, result in checkpoints:
@@ -206,9 +268,10 @@ def build_curtain(checkpoints, include_variance=False):
     coverage = np.zeros((n_x, n_z))
     variance_rh = np.full((n_x, n_z), np.nan) if include_variance else None
     variance_rv = np.full((n_x, n_z), np.nan) if include_variance else None
+    distance = np.full((n_x, n_z), np.inf) if paint == 'nearest-bit' else None
     for _, result in checkpoints:
         paint_point(canvas_rh, canvas_rv, coverage, result, origin, spacing,
-                    variance_rh, variance_rv)
+                    variance_rh, variance_rv, distance)
     if include_variance:
         return canvas_rh, canvas_rv, coverage, origin, spacing, variance_rh, variance_rv
     return canvas_rh, canvas_rv, coverage, origin, spacing
@@ -241,9 +304,10 @@ def load_reference(benchmark, extent_ft):
 
 def render(checkpoints, args):
     uncertainty_enabled = getattr(args, 'uncertainty_lightness', False)
+    paint = getattr(args, 'paint', 'last')
     if uncertainty_enabled:
         (canvas_rh, canvas_rv, coverage, origin, spacing,
-         variance_rh, variance_rv) = build_curtain(checkpoints, include_variance=True)
+         variance_rh, variance_rv) = build_curtain(checkpoints, include_variance=True, paint=paint)
         finite_variances = np.concatenate([
             variance_rh[np.isfinite(variance_rh)],
             variance_rv[np.isfinite(variance_rv)],
@@ -251,7 +315,7 @@ def render(checkpoints, args):
         variance_scale = (float(np.percentile(finite_variances, args.uncertainty_percentile))
                           if finite_variances.size else 0.)
     else:
-        canvas_rh, canvas_rv, coverage, origin, spacing = build_curtain(checkpoints)
+        canvas_rh, canvas_rv, coverage, origin, spacing = build_curtain(checkpoints, paint=paint)
         variance_rh = variance_rv = None
         variance_scale = 0.
     n_x, n_z = coverage.shape
@@ -275,8 +339,8 @@ def render(checkpoints, args):
     vmin, vmax = np.nanpercentile(scale, [2, 98])
     if getattr(args, 'log10_limits', None) is not None:
         vmin, vmax = args.log10_limits
-    shared = dict(cmap="viridis", vmin=vmin, vmax=vmax)
-    cmap = plt.get_cmap("viridis")
+    cmap = value_colormap(getattr(args, 'colormap', 'viridis'))
+    shared = dict(cmap=cmap, vmin=vmin, vmax=vmax)
     value_norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
 
     panels = [("Reference log10 Rh", np.log10(true_field), reference["x_edges"], reference["z_edges"]) if reference
@@ -328,6 +392,24 @@ def render(checkpoints, args):
                    loc="upper center", bbox_to_anchor=(.5, .95), ncol=3,
                    fontsize=8, title_fontsize=8, frameon=False)
 
+    draw_misfit(misfit_axis, checkpoints)
+    counts = {fidelity: fidelities.count(fidelity) for fidelity in ("1D", "2D")}
+    painted = ' - at-drilling (nearest-bit) estimate' if paint == 'nearest-bit' else ''
+    fig.suptitle(f"Inversion curtain - {len(checkpoints)} points "
+                 f"(1D: {counts['1D']}, 2D: {counts['2D']}) - {args.run_dir.name}{painted}", y=0.98)
+    fig.subplots_adjust(top=0.87 if uncertainty_enabled else 0.92)
+
+    output = args.output or (args.run_dir / "curtain.png")
+    fig.savefig(output, dpi=args.dpi)
+    plt.close(fig)
+    return output
+
+
+def draw_misfit(misfit_axis, checkpoints, position=None, position_label="Logging point index"):
+    """Per-point gate misfit and posterior misfit (1D blue, 2D orange).
+
+    Plotted against the logging index, or against ``position[index]`` (e.g. bit x) when given.
+    """
     indices, before, after, thresholds, kinds = [], [], [], [], []
     fidelity_by_index = {index: fidelity_of(result) for index, result in checkpoints}
     for index, result in checkpoints:
@@ -342,6 +424,10 @@ def render(checkpoints, args):
     if indices:
         before = np.array([np.nan if value is None else value for value in before])
         after = np.array([np.nan if value is None else value for value in after])
+        fidelity_by_index = {(position[index] if position else index): fidelity
+                             for index, fidelity in fidelity_by_index.items()}
+        if position is not None:
+            indices = [position[index] for index in indices]
         misfit_axis.semilogy(indices, before, "o", ms=4, color="0.4", label="pre-final gate misfit")
         valid = np.isfinite(after)
         for kind, marker, label in [('forward', 'o', 'posterior: forward evaluated'),
@@ -356,18 +442,9 @@ def render(checkpoints, args):
         if threshold is not None:
             misfit_axis.axhline(threshold, color="red", ls="--", lw=1, label=f"threshold {threshold:g}")
         misfit_axis.legend(fontsize=8, loc="best")
-    misfit_axis.set_xlabel("Logging point index")
+    misfit_axis.set_xlabel(position_label)
     misfit_axis.set_ylabel("Reduced misfit")
     misfit_axis.grid(alpha=.25)
-    counts = {fidelity: fidelities.count(fidelity) for fidelity in ("1D", "2D")}
-    fig.suptitle(f"Inversion curtain - {len(checkpoints)} points "
-                 f"(1D: {counts['1D']}, 2D: {counts['2D']}) - {args.run_dir.name}", y=0.98)
-    fig.subplots_adjust(top=0.87 if uncertainty_enabled else 0.92)
-
-    output = args.output or (args.run_dir / "curtain.png")
-    fig.savefig(output, dpi=args.dpi)
-    plt.close(fig)
-    return output
 
 
 def main(argv=None):
@@ -380,9 +457,9 @@ def main(argv=None):
             raise RuntimeError("No complete checkpoints found yet")
         print(f"Rendered {len(checkpoints)} points -> {render(checkpoints, args)}")
         return 0
-    signature = None
+    signature, cache = None, {}
     while True:
-        checkpoints = load_checkpoints(args.run_dir)
+        checkpoints = load_checkpoints(args.run_dir, cache)
         current = tuple(index for index, _ in checkpoints)
         if checkpoints and current != signature:
             signature = current

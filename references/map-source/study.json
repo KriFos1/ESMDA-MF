@@ -1,0 +1,165 @@
+{
+  "method": "standalone_original_prior_rml",
+  "index": 45,
+  "count": 25,
+  "seed": 2045,
+  "dims": [
+    33,
+    5,
+    80
+  ],
+  "spacing_ft": [
+    5.0,
+    5.0,
+    5.0
+  ],
+  "shift_ft": {
+    "x": 142.5,
+    "y": -12.5,
+    "z": 16830.000544399998
+  },
+  "tools": [
+    [
+      "12kHz",
+      "43ft"
+    ],
+    [
+      "24kHz",
+      "43ft"
+    ],
+    [
+      "48kHz",
+      "43ft"
+    ],
+    [
+      "96kHz",
+      "43ft"
+    ],
+    [
+      "12kHz",
+      "83ft"
+    ],
+    [
+      "24kHz",
+      "83ft"
+    ],
+    [
+      "2kHz",
+      "83ft"
+    ],
+    [
+      "6kHz",
+      "83ft"
+    ]
+  ],
+  "prior": {
+    "shape": [
+      33,
+      80
+    ],
+    "spacing": [
+      5.0,
+      5.0
+    ],
+    "lengths": [
+      [
+        50.0,
+        50.0
+      ],
+      [
+        80.0,
+        35.0
+      ]
+    ],
+    "means": [
+      0.8548249491412631,
+      0.0
+    ],
+    "stds": [
+      1.0941921643813015,
+      0.12
+    ]
+  },
+  "ratio_min": 1.0,
+  "ratio_max": 3.0,
+  "rh_limits": [
+    -1.0,
+    3.6888794541139363
+  ],
+  "log_rv_cap": 3.6888794541139363,
+  "parameterization": "raw Gaussian state; Rh clipped only in physical forward map",
+  "covariance_note": "squared-exponential Rh 50/50 ft; exponential latent; axis nugget 1e-10",
+  "source_manifest_sha256": "7873424c7b9a4a2e1748ab16cf37be8943fd1758ad41e269414de568bfd82f01",
+  "source_sha256": {
+    "pilot_rml_index45.py": "03256197e6e643764896c52af3b35c82ee60661b91cb2b84885a1738afe3c09a",
+    "rml_standalone.py": "2b52b388a9f49a2565339dfc8c2bc86d56e345c06d19dcaeb48d81e2c5297b00",
+    "background_prior.py": "272e3eb60639c935959357cd4e66fed5d159af45afda07a3106d1b20615eaf50",
+    "lm_laplace.py": "13509c325992b2e73c4a4ae4f51210aa3102a43523542badd19d1728c431c59c",
+    "rolling_prior.py": "0e62b0f37a203856630ccef8270c6d4cf2278d0f7a6e295b177c87c545a49ea6",
+    "esmda_core.py": "1749f835137356001dff5ee2b0613e4a5c0683d60b59ba72e2aa01d3893a3def",
+    "esmda_remote2d.py": "7cbe0dba7e110cbc29b00913942db03257c0cf3877ead0daef6e4271bf9746f7",
+    "run_DA_sequential.py": "d51064c46ec27f0251f2f2be399f53872ab3a233576b8e90a328c8e1f77d4cac",
+    "tv_regularization.py": "5e99fed91b0eff828677f33602c7ce78ff4370289e4dba98815dfeed3e734eda"
+  },
+  "optimizer_method": "whitened_parallel_trust_region_lm_v1",
+  "optimizer": {
+    "candidates": 4,
+    "initial_trust": 0.3,
+    "max_trust": 2.0,
+    "min_trust": 0.001,
+    "max_iterations": 150,
+    "max_rounds": 4,
+    "max_seconds": 3300.0,
+    "stagnation_tolerance": 0.001,
+    "stagnation_iterations": 2,
+    "relative_gradient_tolerance": 1e-06
+  },
+  "resources": {
+    "memory_gib": 48,
+    "walltime": "01:00:00"
+  },
+  "simulator": {
+    "backend": "local",
+    "host": "HPC",
+    "root": "pxwf-runs",
+    "python": "pxwf-runtime/.venv/bin/python",
+    "partition": "comp",
+    "account": "",
+    "qos": "",
+    "nodes": 1,
+    "ranks": 2,
+    "cpus": 8,
+    "memory": 16,
+    "walltime": "01:00:00",
+    "concurrency": 4,
+    "chunk": 1,
+    "workers": 1,
+    "oneapi": "",
+    "hdfql": "",
+    "binary_dir": "/cluster/home/krfo/adjoint-2d-v1",
+    "mpi": "pmi2",
+    "pmi": "/usr/lib64/libpmi2.so",
+    "scratch": "",
+    "jobs_dir": "",
+    "solver_tolerance": 1e-06,
+    "poll_max_delay_seconds": 5.0,
+    "reconnect_grace_seconds": 180.0,
+    "solver_grid": [
+      20,
+      4,
+      40,
+      30,
+      20,
+      30,
+      2,
+      1,
+      2
+    ],
+    "mkl_threads": 8,
+    "mkl_cbwr": "AVX2,STRICT",
+    "srun_steps": true,
+    "physical_cores": true
+  },
+  "reused_inputs_sha256": "4f0cdda36077d435aea54c17b4f8f77fa042998500d3835d1452d9e4cf737db4",
+  "inputs_sha256": "4f0cdda36077d435aea54c17b4f8f77fa042998500d3835d1452d9e4cf737db4"
+}

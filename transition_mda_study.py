@@ -104,7 +104,7 @@ def score_study(output, threshold, count):
     return float(np.mean(scores))
 
 
-def updater_for(state, cells, threshold):
+def updater_for(state, cells, threshold, distance_localization=None):
     from pipt.update_schemes.update_methods_ns.approx_update import approx_update
 
     ne = state.shape[1]
@@ -114,15 +114,18 @@ def updater_for(state, cells, threshold):
     updater.list_states = ['rh', 'rv']
     updater.state_scaling = np.ones(state.shape[0])
     updater.prior_info = {name: {'active': state.shape[0] // 2} for name in updater.list_states}
-    if threshold is not None:
+    if distance_localization is not None:
+        distance_localization.configure(updater)
+    elif threshold is not None:
         sequential._configure_auto_adaloc(updater, threshold, cells, ne)
     else:
         updater.keys_da = {}
     return updater
 
 
-def update(state, predicted, observed, covariance, alpha, rng, cells, threshold):
-    updater = updater_for(state, cells, threshold)
+def update(state, predicted, observed, covariance, alpha, rng, cells, threshold,
+           distance_localization=None):
+    updater = updater_for(state, cells, threshold, distance_localization)
     inflated = covariance * alpha
     updater.scale_data = np.sqrt(inflated)
     perturbed = rng.normal(observed[:, None], np.sqrt(inflated)[:, None], predicted.shape)
