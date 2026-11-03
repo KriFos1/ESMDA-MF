@@ -27,7 +27,7 @@
   },
   "solver": {
     "grid": null,
-    "tolerance": 1e-05,
+    "tolerance": 0.0001,
     "timeout": 60.0,
     "threads": 8,
     "concurrency": 4
