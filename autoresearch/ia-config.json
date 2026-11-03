@@ -2,7 +2,7 @@
   "method": "map",
   "noise": {
     "rule": "cross-tool-signal",
-    "fraction": 0.025
+    "fraction": 0.01
   },
   "mask": {
     "short_uhr": false,
