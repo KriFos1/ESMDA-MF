@@ -1,19 +1,43 @@
 {
   "method": "map",
-  "noise": {"rule": "cross-tool-signal", "fraction": 0.025},
-  "mask": {"short_uhr": false, "components": [], "tools": []},
+  "noise": {
+    "rule": "cross-tool-signal",
+    "fraction": 0.025
+  },
+  "mask": {
+    "short_uhr": false,
+    "components": [],
+    "tools": []
+  },
   "prior": {
     "mode": "section-global",
     "rh_mean_offset": 0.0,
     "rh_std": null,
-    "rh_ranges_ft": [50.0, 50.0],
-    "latent_ranges_ft": [80.0, 35.0],
+    "rh_ranges_ft": [
+      50.0,
+      50.0
+    ],
+    "latent_ranges_ft": [
+      80.0,
+      35.0
+    ],
     "ratio_mean": 1.2,
     "ratio_std": 0.3,
     "dip_std_degrees": 10.0
   },
-  "solver": {"grid": null, "tolerance": 1e-05, "timeout": 60.0, "threads": 8, "concurrency": 4},
-  "optimizer": {"candidates": 4, "initial_trust": 0.3, "max_trust": 2.0, "min_trust": 0.001},
+  "solver": {
+    "grid": null,
+    "tolerance": 1e-05,
+    "timeout": 60.0,
+    "threads": 8,
+    "concurrency": 4
+  },
+  "optimizer": {
+    "candidates": 4,
+    "initial_trust": 2.0,
+    "max_trust": 2.0,
+    "min_trust": 0.001
+  },
   "ensemble": 250,
   "seed": 2045
 }

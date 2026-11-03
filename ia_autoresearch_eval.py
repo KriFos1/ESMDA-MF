@@ -163,7 +163,8 @@ def solver_failures(host, remote):
     """(timeouts, crashes) among the member's solver evaluations, from the job receipts."""
     text = ssh(host, f"cd {remote}/run/member-000/jobs 2>/dev/null || exit 0; "
                      f"cat */results/*.json 2>/dev/null | grep -c TimeoutExpired; "
-                     f"cat */results/*.json 2>/dev/null | grep -v TimeoutExpired | grep -c '\"state\": \"FAILED\"'",
+                     f"cat */results/*.json 2>/dev/null | grep -v TimeoutExpired | grep -c '\"state\": \"FAILED\"'; "
+                     f"true",
                capture=True).split()
     return (int(text[0]), int(text[1])) if len(text) == 2 else (0, 0)
 
@@ -206,6 +207,8 @@ def main(argv=None):
     parser.add_argument('--label', default=None)
     parser.add_argument('--host', default='HPC')
     parser.add_argument('--prepare-only', action='store_true')
+    parser.add_argument('--resume', action='store_true',
+                        help='Score the finished jobs of --label without preparing or submitting again')
     parser.add_argument('--summary', type=Path, default=ROOT / 'autoresearch/ia-last-eval.json')
     args = parser.parse_args(argv)
     config = json.loads(args.config.read_text())
@@ -221,21 +224,25 @@ def main(argv=None):
         run_dir = base / f'idx{index:03d}'
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         problem = base / f'laplace-problem-{index:03d}.npz'
+        if args.resume:
+            problem = base / f'laplace-problem-{index:03d}-rescore.npz'
         infos[index] = build_problem(config, index, problem)
         infos[index]['score_variance'] = score_sigma[index].ravel() ** 2
-        prepare_study(config, problem, run_dir, args.budget)
+        if not args.resume:
+            prepare_study(config, problem, run_dir, args.budget)
         run_dirs[index] = run_dir
+        remotes[index] = f'{HPC_ROOT}/{label}-idx{index:03d}'
         log(f'index {index}: prepared ({infos[index]["retained"]} channels, prior ln Rh '
             f'{infos[index]["rh_mean"]:.3f} +- {infos[index]["rh_std"]:.3f})')
     if args.prepare_only:
         print('prepared')
         return 0
-    minutes = int(np.ceil(args.budget / 60.)) + 8
-    for index in args.indices:
-        remotes[index] = f'{HPC_ROOT}/{label}-idx{index:03d}'
-        jobs[index] = submit(args.host, run_dirs[index], remotes[index], f'{label}-{index}', minutes)
-        log(f'index {index}: job {jobs[index]}')
-    wait(args.host, jobs)
+    if not args.resume:
+        minutes = int(np.ceil(args.budget / 60.)) + 8
+        for index in args.indices:
+            jobs[index] = submit(args.host, run_dirs[index], remotes[index], f'{label}-{index}', minutes)
+            log(f'index {index}: job {jobs[index]}')
+        wait(args.host, jobs)
     summary = {'label': label, 'config': config, 'budget': args.budget, 'indices': {}, 'solver_timeouts': 0,
                'solver_crashes': 0}
     scores = []
