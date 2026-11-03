@@ -108,11 +108,13 @@ def build_problem(config, index, output, inputs=INPUTS):
                                               for key in ('X', 'Y', 'Z')))
     probe = {'threshold': 0., 'open': True, 'reverted': True, 'pre_update_mean_prediction_misfit': 0.,
              'post_mean_prediction_misfit': 0., 'post_member_median_misfit': 0.}
+    fixed = bool(prior_cfg.get('fix_dip', False))      # zero apparent dip, no dip parameter or FD solves
     export_problem(output, index=index, state=state, observations=observations[keep], variance=variance[keep],
                    mask=keep, shift=shift, movement=movement, dims=(nx, 5, nz), spacing=(cell, cell, cell),
                    tools=labels, anisotropy='log', anisotropy_moments=(np.log(prior_cfg['ratio_mean']),
                    prior_cfg['ratio_std']), ranges=ranges, probe=probe, well=well,
-                   prior_type='ensemble_precision', dip_latent=dip, dip_bounds=dip_bounds)
+                   prior_type='ensemble_precision', dip_latent=None if fixed else dip, dip_bounds=dip_bounds,
+                   fixed_zero_dip=fixed)
     return {'rh_mean': rh_mean, 'rh_std': rh_std, 'retained': int(keep.sum()),
             'observations_full': observations, 'keep': keep}
 

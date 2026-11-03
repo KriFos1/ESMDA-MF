@@ -23,7 +23,8 @@
     ],
     "ratio_mean": 1.2,
     "ratio_std": 0.3,
-    "dip_std_degrees": 10.0
+    "dip_std_degrees": 10.0,
+    "fix_dip": true
   },
   "solver": {
     "grid": null,
