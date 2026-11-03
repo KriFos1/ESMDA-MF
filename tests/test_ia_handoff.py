@@ -347,6 +347,20 @@ def test_prior_ranges_and_warm_start_settings_reach_the_chain_and_the_controller
     assert loop_command[loop_command.index('--first-map-seconds') + 1] == '1200.0'
     assert loop_command.count('--optimizer-setting') == 2
     assert '-s' in loop_command[loop_command.index('--label') + 1]      # the MAP label records the settings
+    assert '--accept-time-limit' not in loop_command
+    assert run_ia_case.main(['--run-dir', str(case), '--stop', '5', '--ensemble-size', '8', '--accept-time-limit']) == 0
+    assert len(commands) == 3 and '--accept-time-limit' in commands[2]
+
+
+def test_budget_limited_map_is_final_only_when_accepted(tmp_path):
+    import run_chain_laplace_loop as loop
+    member = tmp_path / 'member-000'
+    member.mkdir()
+    (member / 'laplace.npz').write_bytes(b'')
+    (member / 'result.json').write_text(json.dumps({'reason': 'time_limit', 'history': [{'objective': 3.}]}))
+    assert loop.select_member(tmp_path, 1) is None
+    assert loop.select_member(tmp_path, 1, accept_time_limit=True) == 0
+    assert 'time_limit' in loop.final_reasons(True) and 'time_limit' not in loop.final_reasons()
 
 
 def test_launcher_refuses_legacy_chain_when_global_prior_is_requested(tmp_path):

@@ -60,6 +60,8 @@ def main(argv=None):
                              '2-rank srun steps, which deadlock on a convergence error')
     parser.add_argument('--first-map-seconds', type=float, default=None,
                         help="Optimizer budget of the chain's first (cold-start) MAP")
+    parser.add_argument('--accept-time-limit', action='store_true',
+                        help='A MAP stopped on its budget is final (resampled), not resubmitted')
     parser.add_argument('--optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
                         help='MAP optimizer override, e.g. max_seconds=120 or initial_trust=2.0 (repeatable)')
     parser.add_argument('--rh-ranges', type=float, nargs=2, default=None, metavar=('X_FT', 'Z_FT'),
@@ -100,8 +102,8 @@ def main(argv=None):
             raise ValueError(f'Existing chain uses a different {name}')
     binary_id = hashlib.sha256(args.binary_dir.encode()).hexdigest()[:8]
     solver = [args.solver_grid, args.solver_tolerance, args.evaluation_timeout, args.node_sbatch,
-              args.first_map_seconds, args.optimizer_setting]
-    solver_id = ('' if solver == [None] * 6 else
+              args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None]
+    solver_id = ('' if solver == [None] * 7 else
                  '-s' + hashlib.sha256(json.dumps(solver).encode()).hexdigest()[:6])
     label = args.label or f'ia-{run_dir.name}-{implementation_id()}-b{binary_id}-m{args.map_starts}{solver_id}'
     if not label or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for character in label):
@@ -124,6 +126,8 @@ def main(argv=None):
         command += ['--first-map-seconds', str(args.first_map_seconds)]
     for setting in args.optimizer_setting or []:
         command += ['--optimizer-setting', setting]
+    if args.accept_time_limit:
+        command += ['--accept-time-limit']
     print(f'{time.strftime("%H:%M:%S")} starting IA controller for {run_dir}', flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
     return 0

@@ -205,14 +205,19 @@ def wait_for_node(args, remote, index):
     log(f'index {index}: node launcher finished')
 
 
-def select_member(run_dir, count):
+def final_reasons(accept_time_limit=False):
+    """Stop reasons after which a member's model is used: with a fixed budget, the time limit too."""
+    return (*TERMINAL_REASONS, 'time_limit') if accept_time_limit else TERMINAL_REASONS
+
+
+def select_member(run_dir, count, accept_time_limit=False):
     """Lowest final objective among the finished members (same prior and data, so comparable)."""
     objectives = {}
     for member in range(count):
         report, laplace = run_dir / f'member-{member:03d}' / 'result.json', run_dir / f'member-{member:03d}' / 'laplace.npz'
         if report.exists() and laplace.exists():
             result = json.loads(report.read_text())
-            if result.get('reason') in TERMINAL_REASONS and result.get('history'):
+            if result.get('reason') in final_reasons(accept_time_limit) and result.get('history'):
                 objectives[member] = float(result['history'][-1]['objective'])
     if not objectives:
         return None
@@ -248,8 +253,10 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
         report = run_dir / f'member-{member:03d}' / 'result.json'
         return json.loads(report.read_text()) if report.exists() else {}
 
+    accept_time_limit = bool(getattr(args, 'accept_time_limit', False))
+
     def finished(member):
-        return (result_of(member).get('reason') in TERMINAL_REASONS
+        return (result_of(member).get('reason') in final_reasons(accept_time_limit)
                 and (run_dir / f'member-{member:03d}' / 'laplace.npz').exists())
 
     fresh = not run_dir.exists()
@@ -317,7 +324,7 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                     # The member reruns from its checkpoint on resubmission; solver crashes are
                     # usually transient (node, I/O), persistent ones end in the fallback below.
                     log(f"index {index}: member {member} execution failure ({str(result.get('error'))[:200]})")
-    best = select_member(run_dir, count)
+    best = select_member(run_dir, count, accept_time_limit)
     if best is None:
         raise RuntimeError(f'index {index}: no MAP member finished within {args.max_submissions} submissions')
     if count > 1:
@@ -368,6 +375,9 @@ def main(argv=None):
     parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                         help='slurm: single-rank node solves inside each MAP job (threads per solve, solves at '
                              'once; the job gets threads x concurrency CPUs) instead of 2-rank srun steps')
+    parser.add_argument('--accept-time-limit', action='store_true',
+                        help='Treat a MAP that stopped on its optimizer budget as finished (its best model is '
+                             'resampled) instead of resubmitting it: the budget is the design, not an accident')
     parser.add_argument('--first-map-seconds', type=float, default=None,
                         help="Optimizer budget of the chain's first MAP (later points keep --optimizer-setting "
                              'max_seconds): a cold start needs more iterations than warm-started points')
