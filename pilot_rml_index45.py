@@ -938,28 +938,6 @@ def forward_start(args):
     print(f'Member {args.member}: forward in {time.monotonic() - started:.1f} s')
 
 
-def forward_batch(args):
-    """Forward-only predictions (every channel) of all ``start_models`` at once; NaN rows mark failed solves.
-
-    The ensemble forward of a 2D EnIF-MDA step: the update itself runs where PET is
-    installed, so only the solves happen inside the allocation.
-    """
-    directory = args.run_dir.resolve()
-    study, inputs = read_study(directory)
-    if 'start_models' not in inputs:
-        raise ValueError('No start models to evaluate')
-    output = directory / f'forward-batch-{args.member:03d}'
-    output.mkdir(exist_ok=True)
-    started = time.monotonic()
-    adapter, well, physical_parameters = evaluation_setup(study, inputs, output)
-    parameters = [physical_parameters(model)[0] for model in inputs['start_models']]
-    predictions = np.asarray(adapter.run_pred_multi(parameters, study['index'], study['shift_ft'], well), dtype=float)
-    atomic_npz(output / 'forward-batch.npz', predictions_full=predictions)
-    atomic_json(output / 'forward-batch.json', {'count': len(parameters), 'seconds': time.monotonic() - started,
-                                                'finite': int(np.isfinite(predictions).all(axis=1).sum())})
-    print(f'Forward batch of {len(parameters)} models in {time.monotonic() - started:.1f} s')
-
-
 def gradient_check(args):
     directory = args.run_dir.resolve()
     study, inputs = read_study(directory)
@@ -1224,12 +1202,11 @@ def main(argv=None):
                 ('prepare-laplace', laplace_parser),
                 ('member', sub.add_parser('member')),
                 ('forward-start', sub.add_parser('forward-start')),
-                ('forward-batch', sub.add_parser('forward-batch')),
                 ('gradient-check', sub.add_parser('gradient-check')),
                 ('collect', sub.add_parser('collect')), ('bundle', sub.add_parser('bundle'))]
     for name, command in commands:
         command.add_argument('--run-dir', type=Path, required=True)
-        if name in ('member', 'gradient-check', 'forward-start', 'forward-batch'):
+        if name in ('member', 'gradient-check', 'forward-start'):
             command.add_argument('--member', type=int, required=True)
         if name == 'collect':
             command.add_argument('--verify-mean', action='store_true',
@@ -1245,7 +1222,7 @@ def main(argv=None):
             or not np.isfinite(args.max_seconds + args.max_trust + args.solver_tolerance)):
         parser.error('Require 25 members and positive finite resource/optimizer settings')
     {'prepare': prepare, 'prepare-cascade': prepare_cascade, 'prepare-laplace': prepare_laplace,
-     'member': member, 'forward-start': forward_start, 'forward-batch': forward_batch,
+     'member': member, 'forward-start': forward_start,
      'gradient-check': gradient_check, 'collect': collect, 'bundle': bundle}[args.command](args)
 
 
