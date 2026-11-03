@@ -1,5 +1,5 @@
 {
-  "method": "map",
+  "method": "enif2d",
   "noise": {
     "rule": "cross-tool-signal",
     "fraction": 0.025
@@ -50,5 +50,9 @@
     "min_trust": 0.001
   },
   "ensemble": 250,
-  "seed": 2045
+  "seed": 2045,
+  "enif": {
+    "members": 50,
+    "steps": 3
+  }
 }
