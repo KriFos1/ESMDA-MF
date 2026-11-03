@@ -134,14 +134,93 @@ def prepare_study(config, problem, run_dir, budget):
     rml.bundle(SimpleNamespace(run_dir=run_dir))
 
 
-def submit(host, run_dir, remote, name, minutes):
+def submit(host, run_dir, remote, name, minutes, action='member'):
     ssh(host, f'mkdir -p {remote}')
     retry(lambda: run(['scp', '-q', run_dir / 'deployment.tar.gz', f'{host}:{remote}/']))
     return ssh(host, f'cd {remote} && tar xzf deployment.tar.gz && rm deployment.tar.gz && '
-                     f'export RML_PROJECT={remote}/code RML_RUN={remote}/run RML_PYTHON={HPC_PYTHON} RML_NODE=1 && '
+                     f'export RML_PROJECT={remote}/code RML_RUN={remote}/run RML_PYTHON={HPC_PYTHON} RML_NODE=1 '
+                     f'RML_ACTION={action} && '
                      f'sbatch --parsable --job-name={name} --array=0-0 --ntasks=1 --cpus-per-task=32 --mem=64G '
                      f'--time=00:{minutes:02d}:00 --export=ALL --chdir=$RML_RUN $RML_RUN/rml-array.sbatch',
                capture=True).strip()
+
+
+def enif2d(config, index, run_dir, remote, info, host, label, budget):
+    """Forward-only 2D EnIF-MDA: PET's update locally, each ensemble forward as one HPC job.
+
+    ``config['enif']``: members (<= 50), steps. The prior precision is the prepared study's
+    ensemble-precision prior; the score model is the final ensemble mean. The wall clock
+    (jobs included) is capped at ``budget`` seconds: a step that cannot start in time is
+    skipped and the mean of the current ensemble is scored.
+    """
+    import shutil
+    from enif_mda import EnIFProbe
+    from esmda_core import align_phases, phase_channels
+    from esmda_remote2d import UDAR_COMPONENTS
+    from pilot_cascade_laplace_index34 import cascade_inflation
+
+    enif = config.get('enif', {})
+    members, steps = int(enif.get('members', 50)), int(enif.get('steps', 3))
+    if not 1 <= members <= 50:
+        raise ValueError('The 2D EnIF-MDA uses at most 50 members')
+    study = json.loads((run_dir / 'study.json').read_text())
+    with np.load(run_dir / 'inputs.npz', allow_pickle=False) as saved:
+        inputs = {key: saved[key].copy() for key in saved.files}
+    prior = rml.load_prior(study, run_dir)
+    observations, variance, mask = inputs['observations'], inputs['variance'], inputs['mask']
+    phase = phase_channels(mask, UDAR_COMPONENTS)
+    inflation = cascade_inflation(steps, 'linear-inflation', 1.)
+    rng = np.random.default_rng(int(config.get('seed', 2045)) + 1000 * index)
+    state = prior.sample(members, int(rng.integers(2 ** 31 - 1)))
+    probe = EnIFProbe(prior.precision(), observations, variance, inflation, int(rng.integers(2 ** 31 - 1)))
+    started = time.monotonic()
+    trace = []
+
+    def forward(models, step):
+        """Full predictions (k, 72) of ``models`` (k, n) through one HPC job."""
+        step_dir = run_dir / f'step-{step:02d}'
+        shutil.copytree(run_dir, step_dir, ignore=shutil.ignore_patterns('step-*', 'deployment.*', 'member-*'))
+        np.savez(step_dir / 'inputs.npz', **{**inputs, 'start_models': np.asarray(models, dtype=float)})
+        step_study = {**study, 'inputs_sha256': rml.digest(step_dir / 'inputs.npz')}
+        (step_dir / 'study.json').write_text(json.dumps(step_study, indent=2) + '\n')
+        rml.bundle(SimpleNamespace(run_dir=step_dir))
+        job = submit(host, step_dir, f'{remote}-step{step:02d}', f'{label}-{index}-s{step}', 10, 'forward-batch')
+        wait(host, {index: job})
+        retry(lambda: run(['rsync', '-a', f'{host}:{remote}-step{step:02d}/run/forward-batch-000/',
+                           f'{step_dir}/forward-batch-000/']))
+        ssh(host, f'rm -rf {remote}-step{step:02d}/run/forward-batch-000/jobs')
+        with np.load(step_dir / 'forward-batch-000' / 'forward-batch.npz') as saved:
+            return saved['predictions_full']
+
+    for step, alpha in enumerate(inflation):
+        if time.monotonic() - started > budget - 60.:
+            log(f'index {index}: budget leaves no time for EnIF step {step}; stopping')
+            break
+        full = forward(state.T, step)
+        finite = np.isfinite(full).all(axis=1)
+        predicted = np.full((mask.sum(), members), np.nan)
+        predicted[:, finite] = align_phases(full[finite][:, mask], observations, phase, axis=1).T
+        if finite.sum() < 3:
+            raise RuntimeError(f'Only {int(finite.sum())} members solved at step {step}')
+        predicted[:, ~finite] = predicted[:, finite].mean(axis=1, keepdims=True)   # no innovation for failed members
+        misfit = np.mean((predicted - observations[:, None]) ** 2 / variance[:, None], axis=0)
+        trace.append({'step': step, 'alpha': float(alpha), 'failed': int((~finite).sum()),
+                      'misfit_median': float(np.median(misfit[finite])), 'seconds': time.monotonic() - started})
+        log(f'index {index}: EnIF step {step}: {int(finite.sum())}/{members} solved, member median chi2 '
+            f'{trace[-1]["misfit_median"]:.1f}, {trace[-1]["seconds"]:.0f} s')
+        perturbed = rng.normal(observations[:, None], np.sqrt(alpha * variance)[:, None], predicted.shape)
+        state = state + probe.step(state, predicted, perturbed)
+    mean = state.mean(axis=1)
+    full = forward(mean[None, :], len(trace))[0]
+    member_dir = run_dir / 'member-000'
+    member_dir.mkdir(exist_ok=True)
+    np.savez(member_dir / 'fit.npz', model=mean, prediction=align_phases(full[mask], observations, phase),
+             prediction_full=full)
+    (member_dir / 'result.json').write_text(json.dumps({
+        'reason': 'enif2d', 'accepted_iterations': len(trace), 'seconds_this_attempt': time.monotonic() - started,
+        'trial_history': [], 'history': [{'likelihood_loss': .5 * float(np.sum((align_phases(full[mask], observations, phase)
+                                                                             - observations) ** 2 / variance))}],
+        'steps': trace, 'members': members}, indent=1) + '\n')
 
 
 def wait(host, jobs, poll=30.):
@@ -214,8 +293,9 @@ def main(argv=None):
     parser.add_argument('--summary', type=Path, default=ROOT / 'autoresearch/ia-last-eval.json')
     args = parser.parse_args(argv)
     config = json.loads(args.config.read_text())
-    if config.get('method', 'map') != 'map':
-        raise ValueError(f"Unsupported method {config.get('method')!r}")
+    method = config.get('method', 'map')
+    if method not in ('map', 'enif2d'):
+        raise ValueError(f"Unsupported method {method!r}")
     label = args.label or f'ia-ar-{time.strftime("%y%m%d-%H%M%S")}'
     base = ROOT / 'autoresearch' / 'ia-eval' / label
     prepare = ia_prepare_data()
@@ -239,7 +319,11 @@ def main(argv=None):
     if args.prepare_only:
         print('prepared')
         return 0
-    if not args.resume:
+    if method == 'enif2d' and not args.resume:
+        # Sequential per index: each MDA step is one forward job, the update runs here.
+        for index in args.indices:
+            enif2d(config, index, run_dirs[index], remotes[index], infos[index], args.host, label, args.budget)
+    elif not args.resume:
         minutes = int(np.ceil(args.budget / 60.)) + 8
         for index in args.indices:
             jobs[index] = submit(args.host, run_dirs[index], remotes[index], f'{label}-{index}', minutes)
@@ -249,9 +333,15 @@ def main(argv=None):
                'solver_crashes': 0}
     scores = []
     for index in args.indices:
-        retry(lambda: run(['rsync', '-a', '--include=fit.npz', '--include=result.json', '--exclude=*',
-                           f'{args.host}:{remotes[index]}/run/member-000/', f'{run_dirs[index]}/member-000/']))
-        timeouts, crashes = solver_failures(args.host, remotes[index])
+        if method == 'enif2d':
+            # Local member directory; failed ensemble solves (NaN rows) count as crashes for the guard.
+            report = run_dirs[index] / 'member-000' / 'result.json'
+            steps = json.loads(report.read_text()).get('steps', []) if report.exists() else []
+            timeouts, crashes = 0, sum(int(step['failed']) for step in steps)
+        else:
+            retry(lambda: run(['rsync', '-a', '--include=fit.npz', '--include=result.json', '--exclude=*',
+                               f'{args.host}:{remotes[index]}/run/member-000/', f'{run_dirs[index]}/member-000/']))
+            timeouts, crashes = solver_failures(args.host, remotes[index])
         value, detail = score(run_dirs[index], infos[index])
         scores.append(value)
         summary['indices'][str(index)] = {'score': value, 'timeouts': timeouts, 'crashes': crashes, **detail}
