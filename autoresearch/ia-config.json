@@ -22,7 +22,7 @@
       35.0
     ],
     "ratio_mean": 1.2,
-    "ratio_std": 0.6,
+    "ratio_std": 1.0,
     "dip_std_degrees": 10.0,
     "fix_dip": true
   },
