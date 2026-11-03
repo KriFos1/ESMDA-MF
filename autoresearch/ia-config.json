@@ -38,7 +38,7 @@
       1,
       2
     ],
-    "tolerance": 0.001,
+    "tolerance": 0.0001,
     "timeout": 60.0,
     "threads": 8,
     "concurrency": 4
