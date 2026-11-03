@@ -235,6 +235,9 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
     remote = f'{args.hpc_root}/chain-laplace-idx{index:03d}-{args.label}{suffix}'
     starts = getattr(args, 'map_starts', 0)
     node = getattr(args, 'executor', 'slurm') == 'node'
+    node_sbatch = getattr(args, 'node_sbatch', None)      # (threads, concurrency): node solves inside sbatch
+    first_seconds = getattr(args, 'first_map_seconds', None)
+    first_point = first_seconds is not None and not list(Path(chain).glob('laplace-*.json'))
 
     def pull():
         retry(lambda: run(['rsync', '-a', '--exclude', 'jobs/', '--exclude', 'deployment.tar.gz',
@@ -256,8 +259,15 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                      *(['--starts', str(starts), '--start-seed', str(args.seed_base + index), '--include-mean-start']
                        if starts else []),
                      *(['--node-solver', str(args.node_threads), str(args.node_concurrency)] if node else []),
+                     *(['--node-solver', *map(str, node_sbatch)] if node_sbatch else []),
                      *(item for setting in (getattr(args, 'optimizer_setting', None) or [])
                        for item in ('--optimizer-setting', setting)),
+                     *(['--optimizer-setting', f'max_seconds={first_seconds}'] if first_point else []),
+                     *(['--solver-grid', *map(str, args.solver_grid)] if getattr(args, 'solver_grid', None) else []),
+                     *(['--solver-tolerance', str(args.solver_tolerance)]
+                       if getattr(args, 'solver_tolerance', None) is not None else []),
+                     *(['--evaluation-timeout', str(args.evaluation_timeout)]
+                       if getattr(args, 'evaluation_timeout', None) is not None else []),
                      *(['--hdfql', args.node_hdfql] if node and args.node_hdfql else [])]
         run([PYTHON, '-B', ROOT / 'pilot_rml_index45.py', 'prepare-laplace', '--problem',
              chain / problem, '--source', args.source, '--run-dir', run_dir, *overrides])
@@ -286,8 +296,11 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                 job = 'node'
                 log(f'index {index}: MAP members {pending} started on {args.host} (submission {submission + 1})')
             else:
+                # Node solves inside the allocation: one task with threads x concurrency CPUs, RML_NODE set.
+                layout = (f' RML_NODE=1 && sbatch --parsable --ntasks=1 --cpus-per-task={node_sbatch[0] * node_sbatch[1]} '
+                          f'--mem=64G' if node_sbatch else ' && sbatch --parsable')
                 job = ssh(args.host, f'cd {remote} && export RML_PROJECT={remote}/code RML_RUN={remote}/run '
-                                     f'RML_PYTHON={args.hpc_python} && sbatch --parsable --export=ALL '
+                                     f'RML_PYTHON={args.hpc_python}{layout} --export=ALL '
                                      f'--array={",".join(map(str, pending))} --chdir=$RML_RUN '
                                      f'$RML_RUN/rml-array.sbatch', capture=True).strip()
                 log(f'index {index}: MAP job {job} submitted for members {pending} (submission {submission + 1})')
@@ -330,6 +343,13 @@ def main(argv=None):
     parser.add_argument('--binary-dir', default=None, help='fwd2D build for the MAP stages (default: source study)')
     parser.add_argument('--orientation', choices=['gradient', 'bedding'], default=None,
                         help='Material orientation for the MAP stages (default: source study)')
+    parser.add_argument('--solver-grid', type=int, nargs=9, default=None,
+                        metavar=('UX', 'UY', 'UZ', 'OX', 'OY', 'OZ', 'AX', 'AY', 'AZ'),
+                        help="Solver grid for the MAP stages (default: the solver's built-in grid)")
+    parser.add_argument('--solver-tolerance', type=float, default=None,
+                        help='Solver tolerance for the MAP stages (default: source study)')
+    parser.add_argument('--evaluation-timeout', type=float, default=None,
+                        help='Seconds one MAP-stage solver evaluation may run (default: 180)')
     parser.add_argument('--host', default='HPC')
     parser.add_argument('--hpc-root', default='/cluster/home/krfo/rml-index45-20261019')
     parser.add_argument('--hpc-python', default='/cluster/home/krfo/rml-index45-20261019/.venv/bin/python')
@@ -345,6 +365,12 @@ def main(argv=None):
     parser.add_argument('--node-threads', type=int, default=3, help='node: threads per single-rank solve')
     parser.add_argument('--node-concurrency', type=int, default=4, help='node: candidate solves at once per member')
     parser.add_argument('--node-hdfql', default=None, help='node: directory with libHDFql.so')
+    parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
+                        help='slurm: single-rank node solves inside each MAP job (threads per solve, solves at '
+                             'once; the job gets threads x concurrency CPUs) instead of 2-rank srun steps')
+    parser.add_argument('--first-map-seconds', type=float, default=None,
+                        help="Optimizer budget of the chain's first MAP (later points keep --optimizer-setting "
+                             'max_seconds): a cold start needs more iterations than warm-started points')
     parser.add_argument('--map-starts', type=int, default=0,
                         help='Extra MAP starts from carried members (besides the prior mean); the lowest '
                              'objective is resampled')
@@ -353,6 +379,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     chain = args.chain.resolve()
     study = json.loads((chain / 'study.json').read_text())
+    if study.get('ensemble_size') is not None and args.count != study['ensemble_size']:
+        parser.error('--count must equal the chain ensemble size')
     env = {**os.environ, 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1'}
     consecutive_fallbacks = 0
     while True:
@@ -364,8 +392,12 @@ def main(argv=None):
             return 0
         gate = pending_gate(chain)
         if gate is None:
-            run([PYTHON, '-B', '-u', ROOT / 'sequential_matern_1d.py', '--output-dir', chain,
-                 *driver_arguments(study, args.stop)], env=env)
+            if study.get('method') == 'ia_field_dip_enif':
+                from run_ia_chain import driver_args
+                script, arguments = 'run_ia_chain.py', driver_args(study, args.stop)
+            else:
+                script, arguments = 'sequential_matern_1d.py', driver_arguments(study, args.stop)
+            run([PYTHON, '-B', '-u', ROOT / script, '--output-dir', chain, *arguments], env=env)
             gate = pending_gate(chain)
             if gate is None:
                 continue
