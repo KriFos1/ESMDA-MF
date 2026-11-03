@@ -40,11 +40,11 @@
     ],
     "tolerance": 0.001,
     "timeout": 60.0,
-    "threads": 8,
-    "concurrency": 4
+    "threads": 4,
+    "concurrency": 8
   },
   "optimizer": {
-    "candidates": 4,
+    "candidates": 8,
     "initial_trust": 2.0,
     "max_trust": 2.0,
     "min_trust": 0.001
