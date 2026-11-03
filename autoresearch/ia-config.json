@@ -5,7 +5,7 @@
     "fraction": 0.025
   },
   "mask": {
-    "short_uhr": false,
+    "short_uhr": true,
     "components": [],
     "tools": []
   },
