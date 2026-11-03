@@ -45,8 +45,8 @@
   },
   "optimizer": {
     "candidates": 4,
-    "initial_trust": 2.0,
-    "max_trust": 2.0,
+    "initial_trust": 3.0,
+    "max_trust": 3.0,
     "min_trust": 0.001
   },
   "ensemble": 250,
