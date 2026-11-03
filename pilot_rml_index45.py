@@ -1,6 +1,7 @@
 """Prepare, run, check and collect a standalone original-prior RML experiment."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import fcntl
 import hashlib
@@ -22,10 +23,23 @@ DEFAULT_REFERENCE = ROOT / 'runs/benchmark3-full-two-step-esmda-b025-t75-2026101
 # Stop reasons that end a member without a restart (time_limit and execution
 # failures are resumable from the checkpoint).
 TERMINAL_REASONS = ('relative_gradient', 'objective_stagnation', 'nonlinearity_limited',
-                    'iteration_limit', 'gradient_tolerance', 'stalled', 'no_acceptable_trial')
+                    'iteration_limit', 'gradient_tolerance', 'stalled', 'no_acceptable_trial',
+                    'solver_failures')
 MODULES = ['pilot_rml_index45.py', 'matern_prior.py', 'rml_standalone.py', 'background_prior.py',
            'lm_laplace.py', 'rolling_prior.py', 'esmda_core.py', 'esmda_remote2d.py',
-           'run_DA_sequential.py', 'tv_regularization.py', 'sparse_precision.py']
+           'run_DA_sequential.py', 'tv_regularization.py', 'sparse_precision.py', 'apparent_dip.py', 'dip_prior.py']
+LM_FAMILY = 'whitened_parallel_trust_region_lm'
+
+
+def inherit_optimizer(study):
+    """A study derived from a source study runs this code's version of the source's optimizer.
+
+    Every prepared study is bound to its own bundled code (``source_sha256``), so an
+    older LM name can only reach here through a derived study, which gets the current one.
+    """
+    if str(study.get('optimizer_method', '')).startswith(LM_FAMILY):
+        study['optimizer_method'] = LM_OPTIMIZER
+    return study
 
 
 def digest(path):
@@ -56,6 +70,11 @@ class ScaledPrior:
 def load_prior(study, directory=None):
     """The study's prior, multiplied in standard deviation by ``prior['scale']`` when given."""
     base = load_base_prior(study, directory)
+    dip = study.get('dip_prior')
+    if dip is not None:
+        from dip_prior import DipPrior
+        with np.load(Path(directory) / dip['file']) as saved:
+            base = DipPrior(base, dip['mean'], dip['std'], saved['regression'])
     scale = study['prior'].get('scale')
     return base if scale in (None, 1, 1.) else ScaledPrior(base, scale)
 
@@ -244,6 +263,7 @@ def prepare_cascade(args):
              'data_inflation': inflation, 'remaining_likelihood_weight': remaining,
              'source_study': str(args.source.resolve()),
              'source_sha256': {name: digest(ROOT / name) for name in MODULES}}
+    inherit_optimizer(study)
     study.pop('reused_inputs_sha256', None)
     study['inputs_sha256'] = digest(output / 'inputs.npz')
     atomic_json(output / 'study.json', study)
@@ -282,6 +302,7 @@ def prepare_cascade_starts(args, output, source, source_inputs, selection, casca
              'source_study': str(args.source.resolve()),
              'source_inputs_sha256': source['inputs_sha256'],
              'source_sha256': {name: digest(ROOT / name) for name in MODULES}}
+    inherit_optimizer(study)
     study.pop('reused_inputs_sha256', None)
     study['inputs_sha256'] = digest(output / 'inputs.npz')
     atomic_json(output / 'study.json', study)
@@ -362,6 +383,7 @@ def prepare_cascade_prior_starts(args, output, source, source_inputs, selection,
                                     'd + N(0, Cd) targets (seed = noise seed)'),
              'source_study': str(args.source.resolve()),
              'source_sha256': {name: digest(ROOT / name) for name in MODULES}}
+    inherit_optimizer(study)
     study.pop('reused_inputs_sha256', None)
     study['inputs_sha256'] = digest(output / 'inputs.npz')
     atomic_json(output / 'study.json', study)
@@ -383,7 +405,9 @@ def prepare_laplace(args):
     multi-start test of the same MAP problem. ``--prior matern`` replaces the
     carried prior by the chain's own stationary Matern prior (its means, stds and
     ranges, no memory of earlier points). ``--likelihood-weight w`` replaces the
-    problem's weight (data covariance Cd / w). The member job also saves the Jacobian
+    problem's weight (data covariance Cd / w). ``--solver-grid`` makes the solver use
+    that grid (customgrids.inp) instead of its built-in one; ``--solver-tolerance`` and
+    ``--evaluation-timeout`` replace the source study's values. The member job also saves the Jacobian
     at the MAP for the Laplace resampling (``save_jacobian``).
     """
     from chain_laplace import PRECISION_RADIUS, STD_FLOORS, ensemble_moments, load_problem
@@ -395,6 +419,21 @@ def prepare_laplace(args):
     source = json.loads((args.source / 'study.json').read_text())
     simulator = {key: value for key, value in (('binary_dir', args.binary_dir),
                                                ('orientation', args.orientation)) if value is not None}
+    grid = getattr(args, 'solver_grid', None)
+    if grid is not None:
+        if len(grid) != 9 or any(int(value) != value or value < 1 for value in grid):
+            raise ValueError('The solver grid needs nine positive integers')
+        simulator.update(solver_grid=[int(value) for value in grid], apply_solver_grid=True)
+    tolerance = getattr(args, 'solver_tolerance', None)
+    if tolerance is not None:
+        if not 0 < tolerance < 1:
+            raise ValueError('The solver tolerance must lie between 0 and 1')
+        simulator['solver_tolerance'] = float(tolerance)
+    timeout = getattr(args, 'evaluation_timeout', None)
+    if timeout is not None:
+        if not (np.isfinite(timeout) and timeout > 0):
+            raise ValueError('The solver evaluation timeout must be positive and finite')
+        simulator['evaluation_timeout_seconds'] = float(timeout)
     source['simulator'] = {**source['simulator'], **simulator}
     for setting in getattr(args, 'optimizer_setting', None) or []:
         key, separator, value = setting.partition('=')
@@ -423,7 +462,22 @@ def prepare_laplace(args):
             raise ValueError('The likelihood weight must be positive')
         weight = float(args.likelihood_weight)
     observations, variance = problem['observations'], problem['variance']
+    dip_config = None
+    field_case = 'dip_latent' in problem or bool(problem.get('fixed_zero_dip', False))
+    fit_fields = problem['prior_ensemble']
+    if 'dip_latent' in problem:
+        from dip_prior import condition_fields
+        slots = max(3, int(source['optimizer']['candidates']))
+        if source['simulator'].get('concurrency', 1) < slots:
+            raise ValueError(f'Dip-aware MAP requires simulator concurrency of at least {slots}')
+        fit_fields, dip_mean, dip_std, regression = condition_fields(fit_fields, problem['dip_latent'])
+        dip_config = {'file': 'dip-prior.npz', 'mean': dip_mean, 'std': dip_std,
+                      'bounds': problem['dip_bounds'].tolist(), 'fd_step_degrees': .1}
+        if problem['prior_type'] != 'ensemble_precision':
+            raise ValueError('Dip handoff requires the ensemble-precision prior')
     output.mkdir(parents=True)
+    if dip_config:
+        atomic_npz(output / dip_config['file'], regression=regression)
     if getattr(args, 'prior', 'carried') == 'matern':
         matern = json.loads((problem_path.parent / 'study.json').read_text())['prior']
         if matern.get('family') != 'matern':
@@ -438,7 +492,7 @@ def prepare_laplace(args):
         covariance_note = (f"the chain's stationary Matern nu=1 prior (means {matern['means']}, stds "
                            f"{matern['stds']}, ranges {problem['ranges'].tolist()}); no carried information")
     elif problem['prior_type'] == 'ensemble_precision':
-        prior = EnsemblePrecisionPrior.fit(problem['prior_ensemble'], (nx, nz), PRECISION_RADIUS, STD_FLOORS)
+        prior = EnsemblePrecisionPrior.fit(fit_fields, (nx, nz), PRECISION_RADIUS, STD_FLOORS)
         prior.save(output / 'prior-precision.npz')
         center = prior.mean
         prior_spec = {'type': 'ensemble_precision', 'file': 'prior-precision.npz', 'shape': [nx, nz],
@@ -447,6 +501,9 @@ def prepare_laplace(args):
         covariance_note = ('the carried ensemble\'s mean and sparse precision: ridge regressions (GCV) of each '
                            f'variable on its predecessors within {PRECISION_RADIUS} cells, both blocks; '
                            f'marginal std floors {STD_FLOORS}')
+        if dip_config:
+            center = np.r_[center, dip_config['mean']]
+            covariance_note += '; linear field/dip regression and independent conditional field precision'
     else:
         means, stds = ensemble_moments(problem['prior_ensemble'], nx * nz, STD_FLOORS)
         atomic_npz(output / 'prior-moments.npz', means=np.vstack(means), stds=np.vstack(stds))
@@ -473,6 +530,8 @@ def prepare_laplace(args):
         start_note = f'{count} starts ({"; ".join(labels)}); prior and data shared'
     elif n_starts:
         ensemble = problem['prior_ensemble']
+        if dip_config:
+            ensemble = np.vstack([ensemble, problem['dip_latent']])
         if not 0 < n_starts <= ensemble.shape[1]:
             raise ValueError('--starts must lie between 1 and the carried ensemble size')
         members = np.sort(np.random.default_rng(start_seed).choice(ensemble.shape[1], n_starts, replace=False))
@@ -496,9 +555,14 @@ def prepare_laplace(args):
              'prior': prior_spec, 'likelihood_weight': weight,
              'anisotropy': problem['anisotropy'],
              'anisotropy_state_moments': problem['anisotropy_moments'].tolist(),
-             'ratio_min': 1., 'rh_limits': [-1., float(np.log(40.))], 'log_rv_cap': float(np.log(40.)),
-             'parameterization': 'raw Gaussian state; Rh clipped only in physical forward map; '
-                                 f"anisotropy {problem['anisotropy']}",
+             'ratio_min': 1., 'rh_limits': None if field_case else [-1., float(np.log(40.))],
+             'log_rv_cap': None if field_case else float(np.log(40.)),
+             **({'dip_prior': dip_config} if dip_config else {}),
+             **({'forward_only_candidates': True} if field_case else {}),
+             'parameterization': ('raw Gaussian ln Rh, ln(Rv/Rh), and bounded apparent-dip latent; no resistivity clipping'
+                                   if dip_config else 'raw Gaussian ln Rh and ln(Rv/Rh), fixed apparent dip 0; no resistivity clipping'
+                                   if field_case else 'raw Gaussian state; Rh clipped only in physical forward map; '
+                                  f"anisotropy {problem['anisotropy']}"),
              'covariance_note': covariance_note,
              'randomization_note': (f'MAP: unperturbed observations, Cd / {weight:g} (2D share of the data '
                                     f'energy), {start_note}'),
@@ -508,6 +572,7 @@ def prepare_laplace(args):
                        'window_movement': [int(m) for m in problem['movement']]},
              'source_study': str(args.source.resolve()),
              'source_sha256': {name: digest(ROOT / name) for name in MODULES}}
+    inherit_optimizer(study)
     prior_scale = getattr(args, 'prior_scale', None)
     if prior_scale not in (None, 1, 1.):
         if not prior_scale > 0:
@@ -625,12 +690,15 @@ def evaluation_setup(study, inputs, output):
         adapter.run_grad_multi = cleaned(adapter.run_grad_multi)
     well = {key[5:]: value for key, value in inputs.items() if key.startswith('well_')}
     cells = solver_dims[0] * solver_dims[2]
-    lower, upper = study['rh_limits']
+    limits = study['rh_limits']
+    has_dip = 'dip_prior' in study
 
     def physical_parameters(raw):
         """Physical fields of a raw model state, on the solver grid (model cells expanded)."""
-        physical = expand(np.asarray(raw, dtype=float))
-        physical[:cells] = np.clip(physical[:cells], lower, upper)
+        raw = np.asarray(raw, dtype=float)
+        physical = expand(raw[:-1] if has_dip else raw)
+        if limits is not None:
+            physical[:cells] = np.clip(physical[:cells], *limits)
         return sequential._build_param_dict(physical)
 
     physical_parameters.expand, physical_parameters.contract = expand, contract
@@ -687,11 +755,25 @@ def forward_evaluator(study, inputs, output):
 
     adapter, well, physical_parameters = evaluation_setup(study, inputs, output)
     phase = phase_flags(inputs)
+    if 'dip_prior' in study:
+        adapter.backend().trusts_ad('2D')
 
     def predict_batch(raws):
         parameters = [physical_parameters(np.asarray(raw, dtype=float))[0] for raw in raws]
-        predictions = np.asarray(adapter.run_pred_multi(parameters, study['index'], study['shift_ft'], well),
-                                 dtype=float)
+        if 'dip_prior' in study:
+            from apparent_dip import physical_dip
+            def forward(item):
+                parameter, raw = item
+                try:
+                    return adapter.run_pred(parameter, study['index'], study['shift_ft'], well,
+                                            float(physical_dip(raw[-1], study['dip_prior']['bounds'])))
+                except (RuntimeError, ValueError):
+                    return np.full(len(inputs['mask']), np.nan)
+            with ThreadPoolExecutor(max_workers=min(len(raws), adapter.config.concurrency)) as pool:
+                predictions = np.asarray(list(pool.map(forward, zip(parameters, raws))), dtype=float)
+        else:
+            predictions = np.asarray(adapter.run_pred_multi(parameters, study['index'], study['shift_ft'], well),
+                                     dtype=float)
         return align_phases(predictions[:, inputs['mask']], inputs['observations'], phase, axis=1)
 
     return predict_batch
@@ -706,15 +788,18 @@ def model_evaluator(study, inputs, output):
         raise RuntimeError('A trusted exact-adjoint build is required')
     expand, contract = physical_parameters.expand, physical_parameters.contract
     cells = sequential.dims[0] * sequential.dims[2]     # solver-grid cells
-    lower, upper = study['rh_limits']
+    limits = study['rh_limits']
+    has_dip = 'dip_prior' in study
     phase = phase_flags(inputs)
 
     def compose(raw, rh, latent, prediction, j_rh, j_rv):
-        solver_raw = expand(raw)
+        solver_raw = expand(raw[:-1] if has_dip else raw)
         jacobian = sequential.optimizer_jacobian(
             j_rh, j_rv, latent, sequential.min_ratio, sequential.max_ratio,
             log_rv_cap=sequential.log_rv_cap, log_rh=rh, anisotropy=sequential.anisotropy)
-        jacobian[:, :cells] *= ((solver_raw[:cells] > lower) & (solver_raw[:cells] < upper))[None, :]
+        if limits is not None:
+            lower, upper = limits
+            jacobian[:, :cells] *= ((solver_raw[:cells] > lower) & (solver_raw[:cells] < upper))[None, :]
         # Phases on the observed branch: residuals stay in [-180, 180) degrees.
         return (align_phases(prediction[inputs['mask']], inputs['observations'], phase),
                 contract(jacobian[inputs['mask']]))
@@ -722,6 +807,22 @@ def model_evaluator(study, inputs, output):
     def evaluate_batch(raws):
         """Forward + Jacobian for several raw states at once; None marks a failed solve."""
         converted = [physical_parameters(raw) for raw in raws]
+        if has_dip:
+            from apparent_dip import dip_derivative, physical_dip
+            results = []
+            for raw, (parameters, rh, latent) in zip(raws, converted):
+                try:
+                    bounds = study['dip_prior']['bounds']
+                    dip = float(physical_dip(raw[-1], bounds))
+                    prediction, j_rh, j_rv, j_dip = adapter.run_grad_with_dip(
+                        parameters, study['index'], study['shift_ft'], well, dip,
+                        study['dip_prior']['fd_step_degrees'])
+                    prediction, jacobian = compose(raw, rh, latent, prediction, j_rh, j_rv)
+                    results.append((prediction, np.column_stack([jacobian, j_dip[inputs['mask']]
+                                                               * dip_derivative(raw[-1], bounds)])))
+                except (RuntimeError, ValueError):
+                    results.append(None)
+            return results
         results = adapter.run_grad_multi([parameters for parameters, _, _ in converted],
                                          study['index'], study['shift_ft'], well)
         return [None if j_rh is None else compose(raw, rh, latent, prediction, j_rh, j_rv)
@@ -735,6 +836,17 @@ def model_evaluator(study, inputs, output):
 
     evaluate.batch = evaluate_batch
     return evaluate
+
+
+def full_prediction(study, inputs, output, model):
+    """Forward-only prediction of every channel (not just the retained ones) for one raw model."""
+    adapter, well, physical_parameters = evaluation_setup(study, inputs, output)
+    parameters = physical_parameters(np.asarray(model, dtype=float))[0]
+    if 'dip_prior' in study:
+        from apparent_dip import physical_dip
+        return np.asarray(adapter.run_pred(parameters, study['index'], study['shift_ft'], well,
+                                           float(physical_dip(model[-1], study['dip_prior']['bounds']))), dtype=float)
+    return np.asarray(adapter.run_pred_multi([parameters], study['index'], study['shift_ft'], well), dtype=float)[0]
 
 
 def member(args):
@@ -756,25 +868,40 @@ def member(args):
         prior = load_prior(study, directory)
         try:
             evaluate = model_evaluator(study, inputs, output)
-            if study['optimizer_method'] == LM_OPTIMIZER:
+            if str(study['optimizer_method']).startswith(LM_FAMILY):
+                forward = (forward_evaluator(study, inputs, output)
+                           if study.get('forward_only_candidates') else None)
                 fit = optimize_member_lm(
                     prior, inputs['prior_centers'][args.member], inputs['targets'][args.member],
                     inputs['variance'], evaluate.batch, checkpoint=output / 'checkpoint.npz',
                     identity=identity,
                     start=inputs['start_models'][args.member] if 'start_models' in inputs else None,
+                    evaluate_forward=forward,
                     **study['optimizer'])
             else:
                 fit = optimize_member(
                     prior, inputs['prior_centers'][args.member], inputs['targets'][args.member],
                     inputs['variance'], evaluate, checkpoint=output / 'checkpoint.npz',
                     identity=identity, **study['optimizer'])
+            final_jacobian = fit.pop('jacobian', None)
+            extra = {}
+            if study.get('save_full_prediction'):
+                # All channels of the final model (the fit's prediction holds the retained ones only).
+                try:
+                    extra['prediction_full'] = full_prediction(study, inputs, output, fit['model'])
+                except (RuntimeError, ValueError, OSError) as error:
+                    print(f'full prediction failed: {error}', flush=True)
+                    extra['prediction_full'] = np.full(len(inputs['mask']), np.nan)
             if study.get('save_jacobian'):
                 # Jacobian at the solution for the Laplace approximation of the posterior.
-                prediction, jacobian = evaluate(fit['model'])
+                if study.get('forward_only_candidates') and final_jacobian is not None:
+                    prediction, jacobian = fit['prediction'], final_jacobian
+                else:
+                    prediction, jacobian = evaluate(fit['model'])
                 atomic_npz(output / 'laplace.npz', model=fit['model'], prediction=prediction,
                            jacobian=jacobian)
             atomic_npz(output / 'fit.npz', model=fit.pop('model'), z=fit.pop('z'),
-                       prediction=fit.pop('prediction'))
+                       prediction=fit.pop('prediction'), **extra)
             fit.update(member=args.member, identity=identity)
             atomic_json(report, fit)
         except Exception as error:
@@ -974,7 +1101,7 @@ def bundle(args):
     with tarfile.open(destination, 'w:gz') as archive:
         add_code(archive)
         for name in ('study.json', 'inputs.npz', 'rml-array.sbatch', 'prior-ensemble.npz',
-                     'prior-moments.npz', 'prior-precision.npz'):
+                     'prior-moments.npz', 'prior-precision.npz', 'dip-prior.npz'):
             if not (directory / name).exists():
                 continue
             archive.add(directory / name, arcname=f'run/{name}')
@@ -1042,6 +1169,14 @@ def main(argv=None):
     laplace_parser.add_argument('--binary-dir', default=None, help='Override the source study\'s fwd2D build')
     laplace_parser.add_argument('--orientation', choices=['gradient', 'bedding'], default=None,
                                 help='Override the source study\'s material orientation')
+    laplace_parser.add_argument('--solver-grid', type=int, nargs=9, default=None,
+                                metavar=('UX', 'UY', 'UZ', 'OX', 'OY', 'OZ', 'AX', 'AY', 'AZ'),
+                                help='Make the solver use this grid (uniform and optimal node counts, material '
+                                     'averaging) instead of its built-in one')
+    laplace_parser.add_argument('--solver-tolerance', type=float, default=None,
+                                help="Override the source study's solver tolerance")
+    laplace_parser.add_argument('--evaluation-timeout', type=float, default=None,
+                                help='Seconds one solver evaluation may run (default: 180)')
     laplace_parser.add_argument('--starts', type=int, default=0,
                                 help='Multi-start test: this many members, each starting from a distinct '
                                      'carried-ensemble member (default 0: one member from the prior mean)')
