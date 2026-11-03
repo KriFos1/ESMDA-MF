@@ -27,7 +27,17 @@
     "fix_dip": true
   },
   "solver": {
-    "grid": null,
+    "grid": [
+      12,
+      4,
+      24,
+      8,
+      8,
+      10,
+      2,
+      1,
+      2
+    ],
     "tolerance": 0.001,
     "timeout": 60.0,
     "threads": 8,
