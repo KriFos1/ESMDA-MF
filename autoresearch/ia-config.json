@@ -15,11 +15,11 @@
     "rh_std": null,
     "rh_ranges_ft": [
       100.0,
-      100.0
+      50.0
     ],
     "latent_ranges_ft": [
       160.0,
-      70.0
+      35.0
     ],
     "ratio_mean": 1.2,
     "ratio_std": 0.6,
