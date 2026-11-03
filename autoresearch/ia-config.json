@@ -11,7 +11,7 @@
   },
   "prior": {
     "mode": "section-global",
-    "rh_mean_offset": 0.0,
+    "rh_mean_offset": -0.5,
     "rh_std": null,
     "rh_ranges_ft": [
       100.0,
