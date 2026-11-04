@@ -372,6 +372,7 @@ def test_warm_start_exports_the_previous_map_reindexed_and_prepare_starts_there(
     np.testing.assert_array_equal(warm[:cells].reshape(nx, nz)[0], np.arange(nz) + nz)   # shifted one column
     np.testing.assert_array_equal(warm[:cells].reshape(nx, nz)[-1], warm[:cells].reshape(nx, nz)[-2])  # edge extended
     assert ia.previous_map_model(chain, 2, nx, nz, (1, 0)) is None             # no 2D stage at point 2
+    assert ia.previous_map_model(chain, None, nx, nz, (0, 0)) is None          # the chain's first point
     common = dict(observations=np.ones(8), variance=np.ones(8), mask=np.ones(8, dtype=bool),
                   shift={'x': 0., 'y': 0., 'z': 0.}, movement=(1, 0), dims=(nx, 5, nz), spacing=(5., 5., 5.),
                   tools=[('24kHz', '15.61ft')], anisotropy='log', anisotropy_moments=(0., .3),

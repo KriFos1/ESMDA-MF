@@ -172,9 +172,9 @@ def driver_args(study, stop):
 
 def previous_map_model(output, previous_index, nx, nz, movement):
     """The previous point's 2D MAP model reindexed to the current window, or None without a 2D stage there."""
-    record = output / f'laplace-{previous_index:03d}.json'
-    if previous_index is None or not record.exists():
+    if previous_index is None or not (output / f'laplace-{previous_index:03d}.json').exists():
         return None
+    record = output / f'laplace-{previous_index:03d}.json'
     run = Path(json.loads(record.read_text())['map']['run'])
     selected = run / 'selected-member.json'
     member = json.loads(selected.read_text())['member'] if selected.exists() else 0
