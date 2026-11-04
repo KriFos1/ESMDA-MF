@@ -352,6 +352,45 @@ def test_prior_ranges_and_warm_start_settings_reach_the_chain_and_the_controller
     assert len(commands) == 3 and '--accept-time-limit' in commands[2]
 
 
+def test_warm_start_exports_the_previous_map_reindexed_and_prepare_starts_there(tmp_path):
+    nx, nz, members = 4, 5, 10
+    cells = nx * nz
+    chain = tmp_path / 'chain'
+    chain.mkdir()
+    (chain / 'study.json').write_text(json.dumps({'method': 'ia_field_dip_enif'}))
+    rng = np.random.default_rng(5)
+    fields = rng.normal(0., .2, (2 * cells, members))
+    dip = rng.normal(0., .2, members)
+    # Previous point: a MAP whose ln Rh field is the cell index, so reindexing is visible.
+    run = tmp_path / 'map-prev'
+    (run / 'member-000').mkdir(parents=True)
+    model = np.r_[np.arange(2 * cells, dtype=float), .3]
+    np.savez(run / 'member-000' / 'fit.npz', model=model, z=np.zeros(len(model)), prediction=np.ones(8))
+    (chain / 'laplace-003.json').write_text(json.dumps({'logging_index': 3, 'map': {'run': str(run)}}))
+    warm = ia.previous_map_model(chain, 3, nx, nz, (1, 0))
+    assert warm.shape == (2 * cells + 1,) and warm[-1] == .3
+    np.testing.assert_array_equal(warm[:cells].reshape(nx, nz)[0], np.arange(nz) + nz)   # shifted one column
+    np.testing.assert_array_equal(warm[:cells].reshape(nx, nz)[-1], warm[:cells].reshape(nx, nz)[-2])  # edge extended
+    assert ia.previous_map_model(chain, 2, nx, nz, (1, 0)) is None             # no 2D stage at point 2
+    common = dict(observations=np.ones(8), variance=np.ones(8), mask=np.ones(8, dtype=bool),
+                  shift={'x': 0., 'y': 0., 'z': 0.}, movement=(1, 0), dims=(nx, 5, nz), spacing=(5., 5., 5.),
+                  tools=[('24kHz', '15.61ft')], anisotropy='log', anisotropy_moments=(0., .3),
+                  ranges=[[50., 50.], [80., 35.]], probe={'open': True}, prior_type='ensemble_precision',
+                  well={key: np.zeros((1, 1)) for key in ('X', 'Y', 'Z', 'Distance', 'Inclination', 'Azimuth')})
+    with pytest.raises(ValueError, match='warm start'):
+        chain_laplace.export_problem(chain / 'bad.npz', index=4, state=fields, dip_latent=dip, warm_start=warm[:-1],
+                                     **common)
+    problem = chain / 'laplace-problem-004.npz'
+    chain_laplace.export_problem(problem, index=4, state=fields, dip_latent=dip, warm_start=warm, **common)
+    output = tmp_path / 'map'
+    rml.prepare_laplace(SimpleNamespace(run_dir=output, source=Path(rml.ROOT) / 'references/map-source',
+                                       binary_dir=None, orientation=None, problem=problem))
+    with np.load(output / 'inputs.npz') as inputs:
+        np.testing.assert_allclose(inputs['start_models'][0], warm)
+        assert inputs['prior_centers'].shape == (1, 2 * cells + 1)
+    assert 'previous point' in json.loads((output / 'study.json').read_text())['randomization_note']
+
+
 def test_budget_limited_map_is_final_only_when_accepted(tmp_path):
     import run_chain_laplace_loop as loop
     member = tmp_path / 'member-000'

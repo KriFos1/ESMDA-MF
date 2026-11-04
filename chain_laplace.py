@@ -42,7 +42,8 @@ def digest(path):
 
 def export_problem(path, *, index, state, observations, variance, mask, shift, movement, dims,
                    spacing, tools, anisotropy, anisotropy_moments, ranges, probe, well,
-                   likelihood_weight=1., prior_type='matern_cellwise'):
+                   likelihood_weight=1., prior_type='matern_cellwise', dip_latent=None,
+                   dip_bounds=(-45., 45.), fixed_zero_dip=False, warm_start=None):
     """Save everything the Laplace stage needs for one gate-open logging point.
 
     ``state`` is the ensemble the 2D prior is built from; the 2D stage
@@ -64,6 +65,27 @@ def export_problem(path, *, index, state, observations, variance, mask, shift, m
               'anisotropy_moments': np.asarray(anisotropy_moments, dtype=float),
               'ranges': np.asarray(ranges, dtype=float), 'probe': np.array(json.dumps(probe))}
     values.update({f'well_{key}': np.asarray(value) for key, value in well.items()})
+    if fixed_zero_dip and dip_latent is not None:
+        raise ValueError('Fixed dip cannot have a dip ensemble')
+    if fixed_zero_dip:
+        values['fixed_zero_dip'] = np.bool_(True)
+    if dip_latent is not None:
+        from apparent_dip import physical_dip
+
+        latent = np.asarray(dip_latent, dtype=float)
+        if latent.shape != (np.asarray(state).shape[1],):
+            raise ValueError('One apparent-dip latent is required per ensemble member')
+        physical_dip(latent, dip_bounds)
+        values['dip_latent'] = latent
+        values['dip_bounds'] = np.asarray(dip_bounds, dtype=float)
+    if warm_start is not None:
+        # Raw start model for the MAP (e.g. the previous point's MAP reindexed to this window);
+        # the prior and its centre are unchanged.
+        warm = np.asarray(warm_start, dtype=float)
+        expected = np.asarray(state).shape[0] + (1 if dip_latent is not None else 0)
+        if warm.shape != (expected,) or not np.isfinite(warm).all():
+            raise ValueError('The warm start must be one finite raw state of the exported problem')
+        values['warm_start'] = warm
     with Path(path).open('xb') as stream:
         np.savez_compressed(stream, **values)
 
@@ -126,6 +148,17 @@ def laplace_samples(prior, center, z_map, jacobian, variance, count, seed):
 
 def map_prior(problem, laplace_run, map_study):
     """The prior the MAP run used, rebuilt from the exported problem and checked against the run's file."""
+    if 'dip_latent' in problem:
+        from dip_prior import condition_fields
+        from pilot_rml_index45 import load_prior
+
+        _, mean, std, regression = condition_fields(problem['prior_ensemble'], problem['dip_latent'])
+        spec = map_study['dip_prior']
+        with np.load(Path(laplace_run) / spec['file']) as saved:
+            if not (np.isclose(mean, spec['mean']) and np.isclose(std, spec['std'])
+                    and np.allclose(regression, saved['regression'])):
+                raise ValueError('MAP dip prior does not match the exported ensemble')
+        return load_prior(map_study, laplace_run)
     if map_study['prior']['type'] == 'ensemble_precision':
         from sparse_precision import EnsemblePrecisionPrior
         saved = EnsemblePrecisionPrior.load(laplace_run / map_study['prior']['file'])
@@ -183,27 +216,34 @@ def laplace_posterior(chain, problem_path, laplace_run, count, seed):
     observations, variance = problem['observations'], problem['variance']
     started = time.monotonic()
     models, z, linear = laplace_samples(prior, prior.mean, z_map, jacobian, variance / weight, count, seed)
-    models = cap_rh(clamp_log_rh(models), RH_CAP_OHMM)
+    field_case = 'dip_latent' in problem or bool(problem.get('fixed_zero_dip', False))
+    if not field_case:
+        models = cap_rh(clamp_log_rh(models), RH_CAP_OHMM)
     linearized = prediction[:, None] + linear
     linear_misfit = np.mean((linearized - observations[:, None]) ** 2 / variance[:, None], axis=0)
     map_misfit = measurement_misfit(prediction, observations, variance)
-    manifest = json.loads((Path(study['reference']) / 'run.json').read_text())
-    climatological = matern_reference(manifest, problem['anisotropy'], *problem['anisotropy_moments'])
-    truth = reference_truth(Path(manifest['benchmark']))
-    meta = {'dims': (nx, ny, nz), 'spacing_ft': (dx, dy, dz), 'shift_ft': problem['shift_ft']}
     n = len(prior.mean)
-    posterior = {'rh_rmse_log10': rh_rmse(models, meta, truth),
-                 'map_rh_rmse_log10': rh_rmse(model[:, None], meta, truth),
-                 'map_2d_misfit': map_misfit,
-                 'linearized_member_misfit_median': float(np.median(linear_misfit)),
+    posterior = {'map_2d_misfit': map_misfit,
+                  'linearized_member_misfit_median': float(np.median(linear_misfit)),
                  'linearized_member_misfit_p90': float(np.percentile(linear_misfit, 90)),
                  'whitened_spread_per_dim': float(np.mean(np.sum(z ** 2, axis=0)) / n),
                  'whitened_spread_rh_per_cell': float(np.mean(np.sum(z[:cells] ** 2, axis=0)) / cells),
                  'map_whitened_offset_per_dim': float(z_map @ z_map / n),
-                 'prior_rh_rmse_log10': rh_rmse(problem['prior_ensemble'], meta, truth),
-                 'likelihood_weight': weight, 'prior_type': map_study['prior']['type'],
-                 **ensemble_diagnostics(models, nx, nz, climatological, problem['anisotropy']),
-                 **spread_summary(models, nx, nz)}
+                  'likelihood_weight': weight, 'prior_type': map_study['prior']['type'],
+                  **spread_summary(models[:2 * cells], nx, nz)}
+    if 'dip_latent' in problem:
+        from apparent_dip import physical_dip
+        posterior['dip_mean_degrees'] = float(np.mean(physical_dip(models[-1], problem['dip_bounds'])))
+        posterior['dip_std_degrees'] = float(np.std(physical_dip(models[-1], problem['dip_bounds']), ddof=1))
+    elif not field_case:
+        manifest = json.loads((Path(study['reference']) / 'run.json').read_text())
+        climatological = matern_reference(manifest, problem['anisotropy'], *problem['anisotropy_moments'])
+        truth = reference_truth(Path(manifest['benchmark']))
+        meta = {'dims': (nx, ny, nz), 'spacing_ft': (dx, dy, dz), 'shift_ft': problem['shift_ft']}
+        posterior.update(rh_rmse_log10=rh_rmse(models, meta, truth),
+                         map_rh_rmse_log10=rh_rmse(model[:, None], meta, truth),
+                         prior_rh_rmse_log10=rh_rmse(problem['prior_ensemble'], meta, truth),
+                         **ensemble_diagnostics(models, nx, nz, climatological, problem['anisotropy']))
     return {'problem': problem, 'map_study': map_study, 'result': result, 'model': model,
             'prediction': prediction, 'models': models, 'linear_misfit': linear_misfit,
             'map_misfit': map_misfit, 'posterior': posterior, 'seconds': time.monotonic() - started}
@@ -229,6 +269,10 @@ def sample(args):
     model, prediction, models, posterior = out['model'], out['prediction'], out['models'], out['posterior']
     map_misfit, weight = out['map_misfit'], problem['likelihood_weight']
     nx, ny, nz = problem['dims']
+    field_case = 'dip_latent' in problem or bool(problem.get('fixed_zero_dip', False))
+    if 'dip_latent' in problem:
+        dip_latent, models = models[-1].copy(), models[:-1]
+        model = model[:-1]
     dx, dy, dz = problem['spacing']
     checkpoint = chain / f'inversion_results_assim_{index}.pkl'
     probe = problem['probe']
@@ -256,8 +300,12 @@ def sample(args):
                'selected_fidelity': '2D', 'final_stage': 'laplace', 'two_d_mode': 'map-laplace',
                'localization': 'none', 'prior_style': 'matern', 'two_d_prior': map_study['prior']['type'],
                'anisotropy': problem['anisotropy'],
-               'rv_ratio_bounds': (1., float(map_study['ratio_max'])), 'rv_hard_cap_ohmm': RH_CAP_OHMM,
-               'rh_cap_ohmm': RH_CAP_OHMM, 'parameter_units': 'natural_log', 'unified_domain': True,
+               'rv_ratio_bounds': (1., float(map_study['ratio_max'])),
+               'rv_hard_cap_ohmm': None if field_case else RH_CAP_OHMM,
+               'rh_cap_ohmm': None if field_case else RH_CAP_OHMM,
+               **({'dip_latent': dip_latent, 'prior_dip_latent': problem['dip_latent']}
+                  if 'dip_latent' in problem else {}),
+               'parameter_units': 'natural_log', 'unified_domain': True,
                'posterior_prediction_kind': 'forward', 'posterior_misfit_kind': 'forward',
                'posterior_forward_verified': True,
                'laplace': {'map_run': str(laplace_run), 'map_reason': result.get('reason'),
@@ -281,14 +329,15 @@ def sample(args):
 
 def brief(index, out):
     posterior = out['posterior']
-    return {'index': index, 'map_misfit': round(out['map_misfit'], 3),
-            'map_reason': out['result'].get('reason'),
-            'linearized_member_misfit_median': round(posterior['linearized_member_misfit_median'], 3),
-            'rh_rmse': round(posterior['rh_rmse_log10'], 4),
-            'map_rh_rmse': round(posterior['map_rh_rmse_log10'], 4),
-            'prior_rh_rmse': round(posterior['prior_rh_rmse_log10'], 4),
-            'std_bit': round(posterior['mean_std_ln_rh_bit_column'], 3),
-            'score_rh': round(posterior['matern_2p_over_n_rh_median'], 3)}
+    summary = {'index': index, 'map_misfit': round(out['map_misfit'], 3),
+             'map_reason': out['result'].get('reason'),
+             'linearized_member_misfit_median': round(posterior['linearized_member_misfit_median'], 3),
+             'std_bit': round(posterior['mean_std_ln_rh_bit_column'], 3)}
+    for name in ('rh_rmse_log10', 'map_rh_rmse_log10', 'prior_rh_rmse_log10',
+                 'matern_2p_over_n_rh_median', 'dip_mean_degrees'):
+        if name in posterior:
+            summary[name] = round(posterior[name], 4)
+    return summary
 
 
 def compare(args):
@@ -338,7 +387,9 @@ def carry(args):
                'misfit_threshold': probe['threshold'], 'gate': probe, 'reverted': True,
                'optimized_2d': False, 'selected_fidelity': '1D', 'final_stage': 'carried_prior_fallback',
                'fallback_reason': args.reason, 'prior_style': 'matern',
-               'anisotropy': problem['anisotropy'], 'rv_hard_cap_ohmm': RH_CAP_OHMM,
+               'anisotropy': problem['anisotropy'],
+               'rv_hard_cap_ohmm': None if ('dip_latent' in problem or problem.get('fixed_zero_dip', False)) else RH_CAP_OHMM,
+               **({'dip_latent': problem['dip_latent'].copy()} if 'dip_latent' in problem else {}),
                'parameter_units': 'natural_log', 'unified_domain': True}
     with checkpoint.open('xb') as stream:
         pickle.dump(results, stream)

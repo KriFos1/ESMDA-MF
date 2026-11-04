@@ -140,6 +140,9 @@ def parse_args(argv=None):
                         help='Matern practical ranges of ln Rh along the well and vertically')
     parser.add_argument('--latent-ranges', type=float, nargs=2, default=[80., 35.], metavar=('X_FT', 'Z_FT'),
                         help='Matern practical ranges of the anisotropy latent')
+    parser.add_argument('--warm-start', action='store_true',
+                        help="Start each 2D MAP at the previous point's MAP model, reindexed to the new window "
+                             '(the prior is still the carried ensemble)')
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args(argv)
     if not (np.isfinite(args.rh_ranges + args.latent_ranges).all() and min(args.rh_ranges + args.latent_ranges) > 0):
@@ -163,7 +166,23 @@ def driver_args(study, stop):
             '--dip-std', str(study['dip_std']), '--lwd-prior', study.get('lwd_prior_mode', 'pointwise'),
             '--rh-ranges', *(str(v) for v in study.get('ranges', [[50., 50.], [80., 35.]])[0]),
             '--latent-ranges', *(str(v) for v in study.get('ranges', [[50., 50.], [80., 35.]])[1]), '--resume',
-            *(['--fixed-zero-dip'] if study.get('fixed_zero_dip', False) else [])]
+            *(['--fixed-zero-dip'] if study.get('fixed_zero_dip', False) else []),
+            *(['--warm-start'] if study.get('warm_start', False) else [])]
+
+
+def previous_map_model(output, previous_index, nx, nz, movement):
+    """The previous point's 2D MAP model reindexed to the current window, or None without a 2D stage there."""
+    record = output / f'laplace-{previous_index:03d}.json'
+    if previous_index is None or not record.exists():
+        return None
+    run = Path(json.loads(record.read_text())['map']['run'])
+    selected = run / 'selected-member.json'
+    member = json.loads(selected.read_text())['member'] if selected.exists() else 0
+    with np.load(run / f'member-{member:03d}' / 'fit.npz', allow_pickle=False) as saved:
+        model = saved['model'].astype(float)
+    cells = nx * nz
+    fields, rest = model[:2 * cells], model[2 * cells:]
+    return np.concatenate([reindex_window(fields[:, None], nx, nz, movement)[:, 0], rest])
 
 
 def main(argv=None):
@@ -216,7 +235,7 @@ def main(argv=None):
                            if mode == 'section-global' else
                            'geometric mean of the two LWD resistivities at the current point'),
              'plane': plane, 'tools': [list(tool) for tool in tools], 'sim_settings': settings,
-             'noise': noise, 'ranges': ranges, 'input_sha256': input_hashes}
+             'noise': noise, 'ranges': ranges, 'warm_start': bool(args.warm_start), 'input_sha256': input_hashes}
     if args.fixed_zero_dip:
         study['fixed_zero_dip'] = True
     if mode == 'section-global':
@@ -330,12 +349,13 @@ def main(argv=None):
             (output / 'history.json').write_text(json.dumps(history, indent=1) + '\n')
             if gate_open:
                 problem = f'laplace-problem-{index:03d}.npz'
+                warm = previous_map_model(output, previous_index, nx, nz, movement) if args.warm_start else None
                 export_problem(output / problem, index=index, state=prior_state, observations=observations,
                                variance=covariance, mask=mask, shift=shift, movement=movement,
                                dims=sequential.dims, spacing=(cell, cell, cell), tools=tools, anisotropy='log',
                                anisotropy_moments=(np.log(args.ratio_mean), args.ratio_std), ranges=ranges,
                                probe=probe, well=well, prior_type='ensemble_precision', dip_latent=prior_dip,
-                                dip_bounds=dip_bounds, fixed_zero_dip=args.fixed_zero_dip)
+                               dip_bounds=dip_bounds, fixed_zero_dip=args.fixed_zero_dip, warm_start=warm)
                 (output / f'gate-{index:03d}.json').write_text(json.dumps(
                     {'logging_index': index, 'previous_index': previous_index, 'probe': probe, 'problem': problem,
                      'shift_ft': shift, 'window_movement': list(movement), 'relaxation_rho': rho,

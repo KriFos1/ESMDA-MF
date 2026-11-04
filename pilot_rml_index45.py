@@ -520,6 +520,13 @@ def prepare_laplace(args):
     count = n_starts or 1
     starts, labels = {}, None
     start_note = 'start at the prior mean'
+    if start_file is None and not n_starts and 'warm_start' in problem:
+        # The chain's warm start: the previous point's MAP, reindexed to this window.
+        warm = np.asarray(problem['warm_start'], dtype=float)
+        if warm.shape != center.shape:
+            raise ValueError('The warm start does not match the prepared state')
+        starts, labels = {'start_models': warm[None, :]}, ['previous MAP']
+        start_note = "start at the previous point's MAP (reindexed); prior centre unchanged"
     if start_file is not None:
         with np.load(start_file, allow_pickle=False) as saved:
             models, labels = saved['models'].astype(float), [str(label) for label in saved['labels']]
