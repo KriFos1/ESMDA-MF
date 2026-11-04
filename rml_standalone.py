@@ -1,5 +1,6 @@
 """Whitened, independently restartable randomized-posterior optimization."""
 
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -235,8 +236,20 @@ def optimize_member(prior, center, target, variance, evaluate, checkpoint=None,
             'seconds_this_attempt': time.monotonic() - started}
 
 
-LM_OPTIMIZER = 'whitened_parallel_trust_region_lm_v1'
+LM_OPTIMIZER = 'whitened_parallel_trust_region_lm_v3'
 MINIMUM_DAMPING = 1e-6
+# A solver failure says nothing about the step size (block-Lanczos stalls and crashes hit
+# tiny and large steps alike), so it shrinks neither the trust radius nor the damping. A
+# round in which every candidate failed is repeated with its steps scaled by these factors:
+# twice with new models between the failed ones of the halving ladder, then once continuing
+# a four-step ladder below its smallest step. (v2 repeated it at fractions of the radius,
+# which re-solved the same models whenever the radius did not bind.) An accepted candidate
+# whose linearization failed is retried at these step scales; a failed start is retried
+# from a slightly perturbed point.
+FAILURE_SCALES = (2 ** (-1 / 3), 2 ** (-2 / 3), 1 / 16)
+LINEARIZATION_SCALES = (.97,)
+START_PERTURBATION = 1e-3
+START_RETRIES = 3
 
 
 def step_size(prior, step):
@@ -277,19 +290,27 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                        identity='', candidates=4, initial_trust=.3, max_trust=2., min_trust=1e-3,
                        max_iterations=50, max_rounds=4, max_seconds=3300.,
                        stagnation_tolerance=1e-3, stagnation_iterations=2,
-                       relative_gradient_tolerance=1e-3, acceptance=1e-4, start=None):
+                       relative_gradient_tolerance=1e-3, acceptance=1e-4, start=None,
+                       evaluate_forward=None):
     """Trust-region Levenberg-Marquardt for one randomized posterior, parallel candidates.
 
     Each round evaluates ``candidates`` damped Gauss-Newton steps at once (forward
     and Jacobian). Their dampings meet nested trust radii on the largest raw-state
     change. The accepted candidate (lowest objective among gain ratio >=
     ``acceptance``) supplies the next linearization; damping follows Nielsen's
-    rule and the trust radius adapts to the gain ratio. A round without an
-    acceptable candidate shrinks the radius; ``max_rounds`` such rounds in a
-    row stop the member as ``nonlinearity_limited``.
+    rule and the trust radius adapts to the gain ratio. A round whose evaluated
+    candidates were all rejected shrinks the radius; ``max_rounds`` such rounds
+    stop the member as ``nonlinearity_limited``. Solver failures shrink neither
+    the radius nor the damping: a round in which every candidate failed is
+    repeated with its steps scaled by ``FAILURE_SCALES`` (beyond that the member
+    stops as ``solver_failures``), a failed linearization is retried at
+    ``LINEARIZATION_SCALES`` of the step, and a failed start from a slightly
+    perturbed point.
 
     ``start`` (raw model) begins the search away from the prior centre; the
     objective is unchanged (the prior term is still measured from ``center``).
+    If ``evaluate_forward`` is provided, trial objectives use forward-only
+    batches and only an accepted candidate is re-evaluated with a Jacobian.
     """
     if (candidates < 1 or max_iterations < 1 or max_rounds < 1 or max_seconds <= 0
             or not 0 < min_trust <= initial_trust <= max_trust or stagnation_iterations < 1
@@ -343,6 +364,28 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                 states.append(None)
         return states
 
+    def forward_objectives(points):
+        nonlocal evaluations
+        if time.monotonic() - started >= max_seconds:
+            raise TimeoutError('Optimizer walltime budget exhausted')
+        predictions = evaluate_forward([center + factor_apply(prior, point) for point in points])
+        evaluations += len(points)
+        if len(predictions) != len(points):
+            raise ValueError('Forward evaluator returned the wrong number of results')
+        outcomes = []
+        for point, prediction in zip(points, predictions):
+            if prediction is None:
+                outcomes.append(None)
+                continue
+            prediction = np.asarray(prediction, dtype=float)
+            if prediction.shape != target.shape or not np.isfinite(prediction).all():
+                outcomes.append(None)
+                continue
+            residual = prediction - target
+            objective = .5 * float(point @ point) + .5 * float(np.sum(residual ** 2 / variance))
+            outcomes.append(((objective,), None) if np.isfinite(objective) else None)
+        return outcomes
+
     def save():
         if checkpoint is not None:
             atomic_npz(checkpoint, z=z, prediction=state[2], jacobian=jacobian, identity=identity,
@@ -361,11 +404,28 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
 
     if state is None:
         first = evaluate_points([z])[0]
+        retries = 0
+        if first is None:
+            # A solver failure at the start is no property of the model: move by a tiny,
+            # reproducible amount and try again.
+            rng = np.random.default_rng(int(hashlib.sha256(identity.encode()).hexdigest()[:8], 16))
+            while first is None and retries < START_RETRIES:
+                retries += 1
+                z = z + START_PERTURBATION * rng.standard_normal(z.shape)
+                first = evaluate_points([z])[0]
+        start_fallback = False
+        if first is None and start is not None:
+            # A supplied start (e.g. a warm start from another point) the solver cannot handle:
+            # fall back to the prior centre rather than lose the point.
+            z = np.zeros_like(center)
+            first = evaluate_points([z])[0]
+            start_fallback = first is not None
         if first is None:
             raise RuntimeError('The starting-model evaluation failed')
         state, jacobian = first
         initial_gradient = max(float(np.max(np.abs(state[1]))), 1e-300)
-        record(step_inf=0.)
+        record(step_inf=0., **({'start_retries': retries} if retries else {}),
+               **({'start_fallback': 'prior centre'} if start_fallback else {}))
     reason, message = 'iteration_limit', ''
     try:
         while True:
@@ -380,20 +440,31 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                 break
             residual = (prediction - target) / np.sqrt(variance)
             gram = sensitivity @ sensitivity.T
-            accepted = False
-            for round_index in range(max_rounds):
-                dampings = candidate_dampings(prior, z, residual, sensitivity, gram, trust,
-                                              damping, candidates)
-                steps = [gauss_newton_step(z, residual, sensitivity, value, gram) for value in dampings]
-                predicted = [float(-gradient @ step - .5 * (step @ step + np.sum((sensitivity @ step) ** 2)))
-                             for step in steps]
+
+            def model_reduction(step):
+                return float(-gradient @ step - .5 * (step @ step + np.sum((sensitivity @ step) ** 2)))
+
+            accepted, stop = False, False
+            round_index, rejected_rounds, failure_rounds, radius = 0, 0, 0, trust
+            while not accepted:
+                round_index += 1
+                if not failure_rounds:
+                    dampings = candidate_dampings(prior, z, residual, sensitivity, gram, radius,
+                                                  damping, candidates)
+                    ladder = [gauss_newton_step(z, residual, sensitivity, value, gram) for value in dampings]
+                scale = FAILURE_SCALES[failure_rounds - 1] if failure_rounds else 1.
+                steps = [step * scale for step in ladder]
+                predicted = [model_reduction(step) for step in steps]
                 sizes = [step_size(prior, step) for step in steps]
-                outcomes = evaluate_points([z + step for step in steps])
+                outcomes = (evaluate_points([z + step for step in steps]) if evaluate_forward is None
+                            else forward_objectives([z + step for step in steps]))
                 rows = []
                 for value, step_inf, gain_model, outcome in zip(dampings, sizes, predicted, outcomes):
-                    row = {'iteration': len(history), 'round': round_index + 1, 'damping': value,
-                           'step_inf': step_inf, 'trust': trust, 'predicted_reduction': gain_model,
+                    row = {'iteration': len(history), 'round': round_index, 'damping': value,
+                           'step_inf': step_inf, 'trust': radius, 'predicted_reduction': gain_model,
                            'failed': outcome is None}
+                    if failure_rounds:
+                        row['step_scale'] = scale
                     if outcome is not None:
                         actual = loss - outcome[0][0]
                         row.update(objective=outcome[0][0], actual_reduction=actual,
@@ -405,36 +476,83 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                     rows.append(row)
                 trials.extend(rows)
                 good = [index for index, row in enumerate(rows) if row['accepted_candidate']]
-                if not good:
-                    trust = max(min_trust, min(sizes) / 4.)
+                best = None
+                for candidate in sorted(good, key=lambda index: rows[index]['objective']):
+                    if evaluate_forward is None:
+                        best = candidate
+                        break
+                    row = rows[candidate]
+                    for scale in (1., *LINEARIZATION_SCALES):
+                        step = steps[candidate] * scale
+                        gain_model = predicted[candidate] if scale == 1. else model_reduction(step)
+                        linearized = evaluate_points([z + step])[0]
+                        if linearized is None:
+                            row.setdefault('linearization_failures', []).append(scale)
+                            continue
+                        actual = loss - linearized[0][0]
+                        ratio = actual / gain_model if gain_model > 0 else None
+                        if ratio is None or actual <= 0 or ratio < acceptance:
+                            row['linearization_rejected'] = True
+                            break
+                        steps[candidate], predicted[candidate] = step, gain_model
+                        sizes[candidate] = step_size(prior, step)
+                        outcomes[candidate] = linearized
+                        row.update(objective=linearized[0][0], actual_reduction=actual, gain_ratio=ratio,
+                                   linearization_scale=scale)
+                        best = candidate
+                        break
+                    if best is not None:
+                        break
+                    row['accepted_candidate'] = False
+                    if not row.get('linearization_rejected'):
+                        row['linearization_failed'] = True
+                if best is not None:
+                    accepted = True
+                    break
+                # Evidence against the step size: an evaluated candidate or linearization was rejected.
+                rejected = [index for index, row in enumerate(rows)
+                            if not row['failed'] and not row.get('linearization_failed')]
+                if rejected:
+                    rejected_rounds, failure_rounds = rejected_rounds + 1, 0
+                    trust = max(min_trust, min(sizes[index] for index in rejected) / 4.)
                     damping = max(dampings) * 2.
+                    radius = trust
                     save()
+                    if rejected_rounds >= max_rounds:
+                        reason = 'nonlinearity_limited'
+                        message = f'{max_rounds} rounds of {candidates} candidates without objective decrease'
+                        stop = True
+                        break
                     continue
-                best = min(good, key=lambda index: rows[index]['objective'])
-                ratio, size = rows[best]['gain_ratio'], sizes[best]
-                damping = max(MINIMUM_DAMPING, dampings[best] * max(1 / 3, 1 - (2 * ratio - 1) ** 3))
-                if ratio > .75:
-                    trust = min(max_trust, max(trust, 2. * size))
-                elif ratio < .25:
-                    trust = max(min_trust, size / 2.)
-                decrease = (loss - rows[best]['objective']) / max(abs(loss), 1e-300)
-                stagnant = stagnant + 1 if decrease < stagnation_tolerance else 0
-                z = z + steps[best]
-                state, jacobian = outcomes[best]
-                record(step_inf=size, damping=dampings[best], gain_ratio=ratio,
-                       relative_decrease=decrease, round=round_index + 1, candidate=best)
-                accepted = True
+                for row in rows:
+                    row['failure_round'] = True
+                failure_rounds += 1
+                save()
+                if failure_rounds > len(FAILURE_SCALES):
+                    reason = 'solver_failures'
+                    message = f'{failure_rounds} consecutive rounds in which every candidate failed to solve'
+                    stop = True
+                    break
+            if stop:
                 break
-            if not accepted:
-                reason = 'nonlinearity_limited'
-                message = f'{max_rounds} rounds of {candidates} candidates without objective decrease'
-                break
+            ratio, size = rows[best]['gain_ratio'], sizes[best]
+            damping = max(MINIMUM_DAMPING, dampings[best] * max(1 / 3, 1 - (2 * ratio - 1) ** 3))
+            if ratio > .75:
+                trust = min(max_trust, max(trust, 2. * size))
+            elif ratio < .25:
+                trust = max(min_trust, size / 2.)
+            decrease = (loss - rows[best]['objective']) / max(abs(loss), 1e-300)
+            stagnant = stagnant + 1 if decrease < stagnation_tolerance else 0
+            z = z + steps[best]
+            state, jacobian = outcomes[best]
+            record(step_inf=size, damping=dampings[best], gain_ratio=ratio,
+                   relative_decrease=decrease, round=round_index, candidate=best)
     except TimeoutError as error:
         reason, message = 'time_limit', str(error)
     return {'model': center + factor_apply(prior, z), 'z': z, 'prediction': state[2],
             'optimizer': LM_OPTIMIZER, 'next_damping': damping, 'trust': trust,
             'trial_history': trials, 'accepted_iterations': len(history) - 1,
             'converged': reason in ('relative_gradient', 'objective_stagnation'),
-            'reason': reason, 'message': message, 'history': history,
+            'reason': reason, 'message': message, 'history': history, 'jacobian': jacobian,
             'evaluations_this_attempt': evaluations,
             'seconds_this_attempt': time.monotonic() - started}

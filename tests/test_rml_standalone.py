@@ -399,3 +399,176 @@ def test_lm_from_a_distant_start_reaches_the_same_linear_gaussian_minimizer(tmp_
     np.testing.assert_allclose(seen[0], start, atol=1e-10)
     assert fit['history'][0]['prior_loss'] > 0
     np.testing.assert_allclose(fit['model'], center + gain @ (target - matrix @ center), atol=1e-6)
+
+
+def test_forward_only_trials_match_eager_lm_and_reuse_final_jacobian():
+    prior = prior_fixture()
+    rng = np.random.default_rng(31)
+    matrix = rng.normal(size=(3, 8))
+    center, target, variance = rng.normal(size=8), np.array([.4, -.2, .9]), np.array([.02, .03, .04])
+    def evaluate(model):
+        values = matrix @ model
+        return np.sin(values), np.cos(values)[:, None] * matrix
+    eager = optimize_member_lm(prior, center, target, variance, batch_of(evaluate), max_iterations=8)
+    jacobian_batches, forward_batches = [], []
+    def forward(models):
+        forward_batches.append(len(models))
+        return [evaluate(model)[0] for model in models]
+    lazy = optimize_member_lm(prior, center, target, variance, batch_of(evaluate, jacobian_batches),
+                              max_iterations=8, evaluate_forward=forward)
+    np.testing.assert_allclose(lazy['model'], eager['model'], atol=1e-12)
+    np.testing.assert_allclose([row['objective'] for row in lazy['history']],
+                               [row['objective'] for row in eager['history']], atol=1e-12)
+    assert set(jacobian_batches) == {1} and len(jacobian_batches) == len(lazy['history'])
+    assert set(forward_batches) == {4}
+    np.testing.assert_allclose(lazy['jacobian'], evaluate(lazy['model'])[1])
+
+
+def test_forward_only_lm_handles_failed_trials_and_failed_linearization():
+    prior = prior_fixture()
+    matrix = np.ones((1, 8))
+    center, target, variance = np.zeros(8), np.ones(1), np.array([.1])
+    calls = []
+    def jacobian_batch(models):
+        calls.append(len(models))
+        if len(calls) == 2:
+            return [None]
+        return [(matrix @ model, matrix) for model in models]
+    def forward(models):
+        values = [matrix @ model for model in models]
+        values[0] = np.full(1, np.nan)
+        return values
+    fit = optimize_member_lm(prior, center, target, variance, jacobian_batch,
+                             evaluate_forward=forward, max_iterations=2)
+    assert any(row['failed'] for row in fit['trial_history'])
+    # The failed linearization is retried at a slightly shorter step instead of shrinking the radius.
+    assert any(row.get('linearization_failures') == [1.] and row.get('linearization_scale') == .97
+               for row in fit['trial_history'])
+    assert fit['accepted_iterations'] >= 1
+    assert np.all(np.diff([row['objective'] for row in fit['history']]) < 0)
+
+
+def linear_gaussian_case(seed=28):
+    prior = prior_fixture()
+    matrix = np.random.default_rng(seed).normal(size=(3, 8))
+    target, variance = np.array([.1, -.3, .2]), np.array([.02, .03, .04])
+    covariance = prior.apply(np.eye(8))
+    gain = covariance @ matrix.T @ np.linalg.inv(matrix @ covariance @ matrix.T + np.diag(variance))
+    return prior, matrix, target, variance, gain @ target
+
+
+def test_lm_failure_rounds_keep_trust_and_damping_and_solve_new_models_between_the_failed_ones():
+    prior, matrix, target, variance, minimizer = linear_gaussian_case()
+    calls = []
+    def evaluate_batch(models):
+        calls.append(len(models))
+        if len(calls) == 2:                          # every candidate of the first round fails
+            return [None] * len(models)
+        return [(matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, max_iterations=200,
+                             relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12)
+    first, second = fit['trial_history'][:4], fit['trial_history'][4:8]
+    assert all(row['failed'] and row['failure_round'] for row in first)
+    assert all(row['trust'] == .3 for row in first + second)
+    assert [row['damping'] for row in second] == [row['damping'] for row in first]
+    assert all(row['step_scale'] == pytest.approx(2 ** (-1 / 3)) for row in second)
+    np.testing.assert_allclose([row['step_inf'] for row in second],
+                               [2 ** (-1 / 3) * row['step_inf'] for row in first])
+    # New models at the scale of the failed ones, not a shorter ladder.
+    assert not {row['step_inf'] for row in second} & {row['step_inf'] for row in first}
+    assert min(row['step_inf'] for row in first) < second[0]['step_inf'] < first[0]['step_inf']
+    accepted = fit['history'][1]
+    assert fit['converged'] and accepted['round'] == 2
+    ratio, damping = accepted['gain_ratio'], first[accepted['candidate']]['damping']
+    assert accepted['next_damping'] == pytest.approx(max(1e-6, damping * max(1 / 3, 1 - (2 * ratio - 1) ** 3)))
+    np.testing.assert_allclose(fit['model'], minimizer, atol=1e-6)
+
+
+def test_lm_stops_as_solver_failures_when_every_round_fails():
+    prior = prior_fixture()
+    calls = []
+    def evaluate_batch(models):
+        calls.append(len(models))
+        if len(calls) == 1:
+            return [(np.array([model.sum()]), np.ones((1, 8))) for model in models]
+        return [None] * len(models)
+    fit = optimize_member_lm(prior, np.zeros(8), np.ones(1), np.ones(1), evaluate_batch)
+    assert fit['reason'] == 'solver_failures' and not fit['converged'] and fit['accepted_iterations'] == 0
+    from pilot_rml_index45 import TERMINAL_REASONS
+    assert fit['reason'] in TERMINAL_REASONS          # a finished member, not one to resubmit
+    assert len(calls) == 5                           # the start, then 1 + len(FAILURE_SCALES) rounds
+    trials = fit['trial_history']
+    assert [row['trust'] for row in trials[::4]] == [.3] * 4
+    assert [row.get('step_scale', 1.) for row in trials[::4]] == pytest.approx(
+        [1., 2 ** (-1 / 3), 2 ** (-2 / 3), 1 / 16])
+    sizes = [{row['step_inf'] for row in trials[start:start + 4]} for start in range(0, 16, 4)]
+    assert all(sizes[k].isdisjoint(set().union(*sizes[:k])) for k in range(1, 4))  # new models only
+    # The last retry continues the ladder below its smallest failed step.
+    assert max(sizes[3]) < min(sizes[0])
+
+
+def test_lm_retries_a_failed_start_from_a_reproducible_nearby_point():
+    from rml_standalone import factor_solve
+    prior = prior_fixture()
+    matrix = np.ones((1, 8))
+    def run():
+        seen = []
+        def evaluate_batch(models):
+            seen.append(models[0].copy())
+            return [None] if len(seen) == 1 else [(matrix @ model, matrix) for model in models]
+        fit = optimize_member_lm(prior, np.zeros(8), np.ones(1), np.array([.1]), evaluate_batch,
+                                 identity='start', max_iterations=3)
+        return fit, seen
+    fit, seen = run()
+    assert fit['history'][0]['start_retries'] == 1 and fit['accepted_iterations'] >= 1
+    offset = np.max(np.abs(factor_solve(prior, seen[1])))
+    assert 0 < offset < 1e-2
+    np.testing.assert_array_equal(run()[1][1], seen[1])
+
+
+def test_lm_falls_back_to_the_prior_centre_when_a_supplied_start_cannot_be_solved():
+    prior, matrix, target, variance, minimizer = linear_gaussian_case()
+    start = np.full(8, 3.)
+    seen = []
+    def evaluate_batch(models):
+        seen.extend(np.asarray(m) for m in models)
+        # Every model near the supplied start fails; everything else solves.
+        return [None if np.linalg.norm(model - start) < 1. else (matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, start=start, identity='warm',
+                             max_iterations=200, relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12)
+    assert fit['history'][0]['start_retries'] == 3 and fit['history'][0]['start_fallback'] == 'prior centre'
+    np.testing.assert_allclose(seen[4], np.zeros(8), atol=1e-12)        # start, 3 retries, then the centre
+    assert fit['converged']
+    np.testing.assert_allclose(fit['model'], minimizer, atol=1e-6)
+
+
+def test_lm_retries_a_failed_linearization_with_a_slightly_shorter_step():
+    prior, matrix, target, variance, _ = linear_gaussian_case(31)
+    linearized = []
+    def jacobian_batch(models):
+        linearized.append(models[0].copy())
+        if len(linearized) == 2:                     # the accepted candidate's first linearization
+            return [None]
+        return [(matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, jacobian_batch,
+                             evaluate_forward=lambda models: [matrix @ model for model in models],
+                             max_iterations=1)
+    retried = [row for row in fit['trial_history'] if row.get('linearization_failures')]
+    assert len(retried) == 1 and retried[0]['linearization_scale'] == .97
+    np.testing.assert_allclose(linearized[2], .97 * linearized[1])
+    assert fit['history'][1]['step_inf'] == pytest.approx(.97 * retried[0]['step_inf'])
+    assert fit['accepted_iterations'] == 1
+
+
+def test_forward_only_lm_rejects_a_trial_if_relinearization_worsens_objective():
+    prior = prior_fixture()
+    matrix = np.ones((1, 8))
+    def evaluate(models):
+        return [(np.array([0. if not np.any(model) else -1.]), matrix) for model in models]
+    def forward(models):
+        return [np.array([.9]) for _ in models]
+    fit = optimize_member_lm(prior, np.zeros(8), np.ones(1), np.array([.1]), evaluate,
+                             evaluate_forward=forward, max_rounds=1)
+    assert fit['reason'] == 'nonlinearity_limited' and fit['accepted_iterations'] == 0
+    assert any(row.get('linearization_rejected') for row in fit['trial_history'])
+    np.testing.assert_array_equal(fit['model'], np.zeros(8))
