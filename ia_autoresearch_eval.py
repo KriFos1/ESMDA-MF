@@ -83,7 +83,13 @@ def build_problem(config, index, output, inputs=INPUTS):
     trajectory, settings, well, labels, values = read_inputs(inputs)
     cell, dip_bounds = settings['cell_ft'], settings['dip_bounds']
     noise, prior_cfg = config['noise'], config['prior']
-    sigma = prepare.noise_sigma(values, noise['rule'], noise['fraction'])[index]
+    sigma = prepare.noise_sigma(values, noise['rule'], noise['fraction'])[index].copy()
+    # Optional floors (model error): {'phase': deg, 'attenuation': dB} and/or per component, e.g. {'UADA': .1}.
+    floors = noise.get('floors', {})
+    for position, component in enumerate(COMPONENTS):
+        floor = max(floors.get(component, 0.), floors.get('phase' if position % 2 == 0 else 'attenuation', 0.))
+        if floor > 0:
+            sigma[:, position] = np.maximum(sigma[:, position], floor)
     keep = channel_mask(sigma, labels, config.get('mask', {}))
     observations, variance = values[index].ravel(), sigma.ravel() ** 2
     lwd = lwd_log_values(inputs / 'LWD_resistivity.txt', len(trajectory))
@@ -116,7 +122,7 @@ def build_problem(config, index, output, inputs=INPUTS):
                    prior_type='ensemble_precision', dip_latent=None if fixed else dip, dip_bounds=dip_bounds,
                    fixed_zero_dip=fixed)
     return {'rh_mean': rh_mean, 'rh_std': rh_std, 'retained': int(keep.sum()),
-            'observations_full': observations, 'keep': keep}
+            'observations_full': observations, 'keep': keep, 'sigma_full': sigma.ravel()}
 
 
 def prepare_study(config, problem, run_dir, budget):

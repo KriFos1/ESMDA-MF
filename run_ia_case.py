@@ -64,6 +64,8 @@ def main(argv=None):
                         help='A MAP stopped on its budget is final (resampled), not resubmitted')
     parser.add_argument('--warm-start', action='store_true',
                         help="New chains: start each 2D MAP at the previous point's MAP model (reindexed)")
+    parser.add_argument('--noise-floors', type=float, nargs=2, default=None, metavar=('PHASE_DEG', 'ATTEN_DB'),
+                        help='New chains: model-error floors on the phase / attenuation standard deviations')
     parser.add_argument('--optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
                         help='MAP optimizer override, e.g. max_seconds=120 or initial_trust=2.0 (repeatable)')
     parser.add_argument('--rh-ranges', type=float, nargs=2, default=None, metavar=('X_FT', 'Z_FT'),
@@ -92,6 +94,8 @@ def main(argv=None):
             command += ['--latent-ranges', *map(str, args.latent_ranges)]
         if args.warm_start:
             command += ['--warm-start']
+        if args.noise_floors is not None:
+            command += ['--noise-floors', *map(str, args.noise_floors)]
         subprocess.run(command, cwd=ROOT, env=env, check=True)
     study = json.loads((run_dir / 'study.json').read_text())
     if study.get('method') != 'ia_field_dip_enif':

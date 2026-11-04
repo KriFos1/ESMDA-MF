@@ -352,6 +352,27 @@ def test_prior_ranges_and_warm_start_settings_reach_the_chain_and_the_controller
     assert len(commands) == 3 and '--accept-time-limit' in commands[2]
 
 
+def test_noise_floors_are_applied_recorded_and_carried_on_resume(tmp_path, monkeypatch):
+    covariance = np.array([1e-4, 1e-4, 4., 4.] * 2)
+    floored = ia.floor_variance(covariance, (1., .25))
+    np.testing.assert_allclose(floored, [1., .0625, 4., 4.] * 2)
+    fake_ia_simulators(monkeypatch)
+    output = tmp_path / 'chain'
+    common = ['--output-dir', str(output), '--nx', '3', '--nz', '4', '--ensemble-size', '4', '--mda-steps', '1',
+              '--gate-threshold', '1e300']
+    assert ia.main([*common, '--stop', '1', '--noise-floors', '1', '0.25']) == 0
+    study = json.loads((output / 'study.json').read_text())
+    assert study['noise']['floors'] == [1., .25]
+    with (output / 'inversion_results_assim_0.pkl').open('rb') as stream:
+        result = pickle.load(stream)
+    phase = np.arange(72) % 2 == 0
+    assert np.all(result['data_covariance'][phase] >= 1.) and np.all(result['data_covariance'][~phase] >= .0625)
+    arguments = ia.driver_args(study, 2)
+    assert arguments[arguments.index('--noise-floors') + 1:arguments.index('--noise-floors') + 3] == ['1.0', '0.25']
+    with pytest.raises(ValueError, match='differs in noise'):
+        ia.main([*common, '--stop', '2', '--resume'])
+
+
 def test_warm_start_exports_the_previous_map_reindexed_and_prepare_starts_there(tmp_path):
     nx, nz, members = 4, 5, 10
     cells = nx * nz

@@ -143,10 +143,15 @@ def parse_args(argv=None):
     parser.add_argument('--warm-start', action='store_true',
                         help="Start each 2D MAP at the previous point's MAP model, reindexed to the new window "
                              '(the prior is still the carried ensemble)')
+    parser.add_argument('--noise-floors', type=float, nargs=2, default=None, metavar=('PHASE_DEG', 'ATTEN_DB'),
+                        help='Model-error floors on every phase / attenuation channel standard deviation: the '
+                             'near-tool UAD channels otherwise change by chi2 ~1000 between consecutive points')
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args(argv)
     if not (np.isfinite(args.rh_ranges + args.latent_ranges).all() and min(args.rh_ranges + args.latent_ranges) > 0):
         parser.error('Prior ranges must be positive and finite')
+    if args.noise_floors is not None and not (np.isfinite(args.noise_floors).all() and min(args.noise_floors) > 0):
+        parser.error('Noise floors must be positive and finite')
     if (args.stop < 1 or args.ensemble_size < 3 or not 1 <= args.mda_steps <= 10
             or args.nx < 2 or args.nz < 2 or not np.isfinite([args.gate_threshold, args.memory_ft,
                     args.ratio_mean, args.ratio_std, args.dip_std]).all()
@@ -167,7 +172,19 @@ def driver_args(study, stop):
             '--rh-ranges', *(str(v) for v in study.get('ranges', [[50., 50.], [80., 35.]])[0]),
             '--latent-ranges', *(str(v) for v in study.get('ranges', [[50., 50.], [80., 35.]])[1]), '--resume',
             *(['--fixed-zero-dip'] if study.get('fixed_zero_dip', False) else []),
-            *(['--warm-start'] if study.get('warm_start', False) else [])]
+            *(['--warm-start'] if study.get('warm_start', False) else []),
+            *(['--noise-floors', *(str(v) for v in study['noise']['floors'])] if study.get('noise', {}).get('floors') else [])]
+
+
+def floor_variance(covariance, floors, width=len(UDAR_COMPONENTS)):
+    """Variances with every phase (even) / attenuation (odd) channel's std floored at ``floors``."""
+    covariance = np.array(covariance, dtype=float, copy=True)
+    if covariance.size % width:
+        raise ValueError('Need whole tools')
+    phase = np.arange(covariance.size) % 2 == 0
+    covariance[phase] = np.maximum(covariance[phase], float(floors[0]) ** 2)
+    covariance[~phase] = np.maximum(covariance[~phase], float(floors[1]) ** 2)
+    return covariance
 
 
 def previous_map_model(output, previous_index, nx, nz, movement):
@@ -213,6 +230,8 @@ def main(argv=None):
         raise ValueError('Observation and variance tools differ')
     input_hashes = validate_observations(inputs, data, variance, trajectory)
     noise = noise_settings(variance)
+    if args.noise_floors is not None:
+        noise['floors'] = [float(v) for v in args.noise_floors]
     nx, nz, cells = args.nx, args.nz, args.nx * args.nz
     sequential.dims = (nx, 5, nz)
     sequential.dX = sequential.dY = sequential.dZ = cell
@@ -308,6 +327,8 @@ def main(argv=None):
                     dip = rho * dip + np.sqrt(1. - rho ** 2) * args.dip_std * np.random.default_rng(streams[3]).normal(size=args.ensemble_size)
             prior_state, prior_dip = state.copy(), None if dip is None else dip.copy()
             observations, covariance = observation_vectors(data, variance, index, tools)
+            if args.noise_floors is not None:
+                covariance = floor_variance(covariance, args.noise_floors)
             mask = ~noise_floor_mask(observations, covariance, NOISE_FLOOR)
             if not mask.any():
                 raise ValueError(f'Index {index}: every channel is masked')
