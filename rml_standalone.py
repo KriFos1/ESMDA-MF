@@ -346,10 +346,11 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
             jacobian = saved['jacobian'].copy()
     started = time.monotonic()
     evaluations = 0
+    budget_started = None       # the budget clock runs from the first iteration, not from the start retries
 
     def evaluate_points(points):
         nonlocal evaluations
-        if time.monotonic() - started >= max_seconds:
+        if budget_started is not None and time.monotonic() - budget_started >= max_seconds:
             raise TimeoutError('Optimizer walltime budget exhausted')
         results = evaluate_batch([center + factor_apply(prior, point) for point in points])
         evaluations += len(points)
@@ -366,7 +367,7 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
 
     def forward_objectives(points):
         nonlocal evaluations
-        if time.monotonic() - started >= max_seconds:
+        if budget_started is not None and time.monotonic() - budget_started >= max_seconds:
             raise TimeoutError('Optimizer walltime budget exhausted')
         predictions = evaluate_forward([center + factor_apply(prior, point) for point in points])
         evaluations += len(points)
@@ -426,6 +427,7 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
         initial_gradient = max(float(np.max(np.abs(state[1]))), 1e-300)
         record(step_inf=0., **({'start_retries': retries} if retries else {}),
                **({'start_fallback': 'prior centre'} if start_fallback else {}))
+    budget_started = time.monotonic()
     reason, message = 'iteration_limit', ''
     try:
         while True:
