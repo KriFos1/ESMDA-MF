@@ -434,6 +434,11 @@ def prepare_laplace(args):
         if not (np.isfinite(timeout) and timeout > 0):
             raise ValueError('The solver evaluation timeout must be positive and finite')
         simulator['evaluation_timeout_seconds'] = float(timeout)
+    adjoint_timeout = getattr(args, 'adjoint_timeout', None)
+    if adjoint_timeout is not None:
+        if not (np.isfinite(adjoint_timeout) and adjoint_timeout > 0):
+            raise ValueError('The adjoint timeout must be positive and finite')
+        simulator['adjoint_timeout_seconds'] = float(adjoint_timeout)
     source['simulator'] = {**source['simulator'], **simulator}
     for setting in getattr(args, 'optimizer_setting', None) or []:
         key, separator, value = setting.partition('=')
@@ -1206,6 +1211,8 @@ def main(argv=None):
                                 help="Override the source study's solver tolerance")
     laplace_parser.add_argument('--evaluation-timeout', type=float, default=None,
                                 help='Seconds one solver evaluation may run (default: 180)')
+    laplace_parser.add_argument('--adjoint-timeout', type=float, default=None,
+                                help='Seconds one Jacobian (adjoint) evaluation may run (default: the evaluation timeout)')
     laplace_parser.add_argument('--starts', type=int, default=0,
                                 help='Multi-start test: this many members, each starting from a distinct '
                                      'carried-ensemble member (default 0: one member from the prior mean)')

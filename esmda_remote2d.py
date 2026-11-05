@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -121,6 +122,14 @@ class SimBackendConfig:
     poll_max_delay_seconds: float = 5.
     reconnect_grace_seconds: float = 180.
     solver_grid: tuple = (20, 4, 40, 30, 20, 30, 2, 1, 2)
+    # The solver uses solver_grid only when the worker writes customgrids.inp; otherwise its
+    # built-in grid (20 4 40 / 12 10 16 / 2 1 2), on which the benchmark data were generated.
+    apply_solver_grid: bool = False
+    # Wall-time limit of one solver evaluation; refined grids need more than the default.
+    evaluation_timeout_seconds: float = 180.
+    # Separate limit for Jacobian (adjoint) evaluations, which take about twice a forward solve;
+    # None: the evaluation timeout applies to both.
+    adjoint_timeout_seconds: float | None = None
     # Local backend inside a Slurm allocation: run each solve as an `srun` job
     # step with `ranks` MPI ranks x `cpus` CPUs, MKL-threaded DGEMM and a
     # pinned MKL code path. These change the floating-point forward result,
@@ -164,6 +173,10 @@ class SimBackendConfig:
             reconnect_grace_seconds=float(_env("DA_SIM_RECONNECT_GRACE", 180.)),
             solver_grid=tuple(int(v) for v in
                               _env("DA_SIM_SOLVER_GRID", "20,4,40,30,20,30,2,1,2").split(",")),
+            apply_solver_grid=str(_env("DA_SIM_APPLY_SOLVER_GRID", "0")).lower() in ("1", "true", "yes"),
+            evaluation_timeout_seconds=float(_env("DA_SIM_EVALUATION_TIMEOUT", 180.)),
+            adjoint_timeout_seconds=(None if _env("DA_SIM_ADJOINT_TIMEOUT", "") in ("", "none", "None")
+                                     else float(_env("DA_SIM_ADJOINT_TIMEOUT", ""))),
             orientation=_env("DA_SIM_ORIENTATION", "gradient"),
         )
 
@@ -207,7 +220,13 @@ class SimBackendConfig:
         parser.add_argument("--solver-grid", default=",".join(str(v) for v in self.solver_grid),
                             metavar="UX,UY,UZ,OX,OY,OZ,AX,AY,AZ",
                             help="fwd2D custom grid: uniform and optimal node counts and "
-                                 "material averaging (default: %(default)s)")
+                                 "material averaging, used with --apply-solver-grid (default: %(default)s)")
+        parser.add_argument("--apply-solver-grid", action="store_true", default=self.apply_solver_grid,
+                            help="Make the solver use --solver-grid (default: its built-in grid)")
+        parser.add_argument("--evaluation-timeout", type=float, default=self.evaluation_timeout_seconds,
+                            help="Seconds one solver evaluation may run (default: %(default)s)")
+        parser.add_argument("--adjoint-timeout", type=float, default=self.adjoint_timeout_seconds,
+                            help="Seconds one Jacobian (adjoint) evaluation may run (default: the evaluation timeout)")
         parser.add_argument("--orientation", choices=["gradient", "bedding"], default=self.orientation,
                             help="Material TI axis: legacy per-cell gradient axis, or the bedding axis "
                                  "everywhere (needs an orientation-capable build)")
@@ -239,6 +258,9 @@ class SimBackendConfig:
             poll_max_delay_seconds=args.poll_max_delay,
             reconnect_grace_seconds=args.reconnect_grace,
             solver_grid=tuple(int(v) for v in args.solver_grid.split(",")),
+            apply_solver_grid=args.apply_solver_grid,
+            evaluation_timeout_seconds=args.evaluation_timeout,
+            adjoint_timeout_seconds=args.adjoint_timeout,
             orientation=args.orientation,
         )
         return SimBackendConfig(**{**asdict(self), **kwargs})
@@ -292,6 +314,9 @@ class SimBackendConfig:
             "DA_SIM_POLL_MAX_DELAY": str(values["poll_max_delay_seconds"]),
             "DA_SIM_RECONNECT_GRACE": str(values["reconnect_grace_seconds"]),
             "DA_SIM_SOLVER_GRID": values["solver_grid"],
+            "DA_SIM_APPLY_SOLVER_GRID": "1" if self.apply_solver_grid else "0",
+            "DA_SIM_EVALUATION_TIMEOUT": str(self.evaluation_timeout_seconds),
+            "DA_SIM_ADJOINT_TIMEOUT": "" if self.adjoint_timeout_seconds is None else str(self.adjoint_timeout_seconds),
             "DA_SIM_ORIENTATION": values["orientation"],
         }
 
@@ -309,6 +334,11 @@ class Remote2D:
             raise ValueError("Solver tolerance must lie between 0 and 1")
         if len(config.solver_grid) != 9:
             raise ValueError("solver_grid must be nine integers")
+        if not np.isfinite(config.evaluation_timeout_seconds) or config.evaluation_timeout_seconds <= 0:
+            raise ValueError("The evaluation timeout must be positive and finite")
+        if config.adjoint_timeout_seconds is not None and not (
+                np.isfinite(config.adjoint_timeout_seconds) and config.adjoint_timeout_seconds > 0):
+            raise ValueError("The adjoint timeout must be positive and finite")
         if not np.isfinite(config.poll_max_delay_seconds) or config.poll_max_delay_seconds < 1:
             raise ValueError('Maximum polling delay must be finite and at least one second')
         if not np.isclose(self.dY, self.dX):
@@ -400,7 +430,7 @@ class Remote2D:
         return pairs
 
     def build_metadata(self, logging_point_idx, shift, well, jacobian=False,
-                       tolerate_failures=False):
+                       tolerate_failures=False, apparent_dip=None):
         """Worker metadata for the tile centred on the current log point.
 
         ``shift`` is the ESMDA-MF ``UTA2D_sim.model['shift']`` (feet) and
@@ -417,7 +447,7 @@ class Remote2D:
         well_md = float(np.asarray(well["Distance"]).ravel()[logging_point_idx])
         inclination = float(np.asarray(well["Inclination"]).ravel()[logging_point_idx])
         azimuth = float(np.asarray(well["Azimuth"]).ravel()[logging_point_idx])
-        return {
+        metadata = {
             "fidelity": "2D",
             "tools": self._tool_pairs(),
             "spacing": [dx_m, dz_m],
@@ -430,13 +460,23 @@ class Remote2D:
             "jacobian": bool(jacobian),
             "full_jacobian": bool(jacobian),
             "tolerate_failures": bool(tolerate_failures),
-            "evaluation_timeout_seconds": 180.0,
+            "evaluation_timeout_seconds": float(self.config.adjoint_timeout_seconds
+                                                if jacobian and self.config.adjoint_timeout_seconds is not None
+                                                else self.config.evaluation_timeout_seconds),
             "solver_tolerance": self.config.solver_tolerance,
             "poll_max_delay_seconds": self.config.poll_max_delay_seconds,
             "reconnect_grace_seconds": self.config.reconnect_grace_seconds,
             "solver_grid": list(self.config.solver_grid),
             "orientation": self.config.orientation,
         }
+        if self.config.apply_solver_grid:
+            metadata["apply_solver_grid"] = True
+        if apparent_dip is not None:
+            angle = float(apparent_dip)
+            if self.config.orientation != 'bedding' or not np.isfinite(angle) or not -90 < angle < 90:
+                raise ValueError('Apparent dip requires bedding orientation and an angle in (-90, 90)')
+            metadata['apparent_dip_degrees'] = angle
+        return metadata
 
     # -- field / result mapping --------------------------------------------
 
@@ -458,8 +498,8 @@ class Remote2D:
             raise ValueError("Expected a finite canonical UDAR response for every tool")
         return response
 
-    def run_pred(self, param_dict, logging_point_idx, shift, well):
-        metadata = self.build_metadata(logging_point_idx, shift, well, jacobian=False)
+    def run_pred(self, param_dict, logging_point_idx, shift, well, apparent_dip=None):
+        metadata = self.build_metadata(logging_point_idx, shift, well, jacobian=False, apparent_dip=apparent_dip)
         fields = self.to_tile(param_dict)[None]
         collected = self.backend().evaluate_batch(metadata, fields)
         return self._prediction(collected[0][0])
@@ -475,10 +515,10 @@ class Remote2D:
         fields = np.stack([self.to_tile(param_dict) for param_dict in param_dicts])
         return self.backend().evaluate_batch(metadata, fields)[0]
 
-    def run_grad(self, param_dict, logging_point_idx, shift, well):
+    def run_grad(self, param_dict, logging_point_idx, shift, well, apparent_dip=None):
         if not self.backend().trusts_ad("2D"):
             raise RuntimeError("2D gradients require an exact discrete-adjoint build with adjoint-spec.json")
-        metadata = self.build_metadata(logging_point_idx, shift, well, jacobian=True)
+        metadata = self.build_metadata(logging_point_idx, shift, well, jacobian=True, apparent_dip=apparent_dip)
         fields = self.to_tile(param_dict)[None]
         collected = self.backend().evaluate_batch(metadata, fields)
         predictions = collected[0]
@@ -490,6 +530,45 @@ class Remote2D:
         pred_vec = self._prediction(predictions[0])
         j_rh, j_rv = self._adapt_full_jacobian(full_jacobians[0])
         return pred_vec, j_rh, j_rv
+
+    def run_grad_with_dip(self, param_dict, logging_point_idx, shift, well, apparent_dip, step_degrees=.1):
+        """Concurrent field adjoint and two forward-only dip differences, per degree.
+
+        If one dip perturbation fails to solve, the derivative falls back to the
+        one-sided difference with the baseline prediction (counted in
+        ``one_sided_dip_differences``); the adjoint or both perturbations failing
+        still fails the evaluation.
+        """
+        from esmda_core import align_phases
+
+        if not np.isfinite(step_degrees) or step_degrees <= 0:
+            raise ValueError('Dip finite-difference step must be positive and finite')
+        if self.config.concurrency < 3:
+            raise ValueError('Concurrent dip gradients require simulator concurrency of at least 3')
+        if not self.backend().trusts_ad('2D'):
+            raise RuntimeError('2D gradients require an exact discrete-adjoint build with adjoint-spec.json')
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            baseline = pool.submit(self.run_grad, param_dict, logging_point_idx, shift, well, apparent_dip)
+            perturbed = {sign: pool.submit(self.run_pred, param_dict, logging_point_idx, shift, well,
+                                           apparent_dip + sign * step_degrees) for sign in (1., -1.)}
+            prediction, j_rh, j_rv = baseline.result()
+            sides, errors = {}, {}
+            for sign, future in perturbed.items():
+                try:
+                    sides[sign] = future.result()
+                except (RuntimeError, ValueError, OSError) as error:   # a solver failure of one side
+                    errors[sign] = error
+        if not sides:
+            raise RuntimeError('Both dip perturbations failed') from errors[1.]
+        phase = np.tile([name.endswith('P') for name in UDAR_COMPONENTS], len(self.tools))
+        sides = {sign: align_phases(value, prediction, phase) for sign, value in sides.items()}
+        if len(sides) == 2:
+            return prediction, j_rh, j_rv, (sides[1.] - sides[-1.]) / (2 * step_degrees)
+        (sign, value), = sides.items()
+        self.one_sided_dip_differences = getattr(self, 'one_sided_dip_differences', 0) + 1
+        print(f'dip derivative: {"-" if sign > 0 else "+"}{step_degrees:g} deg perturbation failed '
+              f'({type(errors[-sign]).__name__}); using the one-sided difference', flush=True)
+        return prediction, j_rh, j_rv, sign * (value - prediction) / step_degrees
 
     def run_grad_multi(self, param_dicts, logging_point_idx, shift, well):
         """One batched forward+adjoint array job for several fields.

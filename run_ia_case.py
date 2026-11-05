@@ -55,6 +55,9 @@ def main(argv=None):
     parser.add_argument('--evaluation-timeout', type=float, default=None,
                         help='Seconds one MAP-stage solver evaluation may run (default: 180; refined '
                              'grids need more)')
+    parser.add_argument('--adjoint-timeout', type=float, default=None,
+                        help='Seconds one MAP-stage Jacobian (adjoint) evaluation may run; adjoints take about '
+                             'twice a forward solve (default: the evaluation timeout)')
     parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                         help='MAP stages with single-rank node solves inside the job (e.g. 8 4) instead of '
                              '2-rank srun steps, which deadlock on a convergence error')
@@ -110,8 +113,8 @@ def main(argv=None):
             raise ValueError(f'Existing chain uses a different {name}')
     binary_id = hashlib.sha256(args.binary_dir.encode()).hexdigest()[:8]
     solver = [args.solver_grid, args.solver_tolerance, args.evaluation_timeout, args.node_sbatch,
-              args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None]
-    solver_id = ('' if solver == [None] * 7 else
+              args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None, args.adjoint_timeout]
+    solver_id = ('' if solver == [None] * 8 else
                  '-s' + hashlib.sha256(json.dumps(solver).encode()).hexdigest()[:6])
     label = args.label or f'ia-{run_dir.name}-{implementation_id()}-b{binary_id}-m{args.map_starts}{solver_id}'
     if not label or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for character in label):
@@ -128,6 +131,8 @@ def main(argv=None):
         command += ['--solver-tolerance', str(args.solver_tolerance)]
     if args.evaluation_timeout is not None:
         command += ['--evaluation-timeout', str(args.evaluation_timeout)]
+    if args.adjoint_timeout is not None:
+        command += ['--adjoint-timeout', str(args.adjoint_timeout)]
     if args.node_sbatch is not None:
         command += ['--node-sbatch', *map(str, args.node_sbatch)]
     if args.first_map_seconds is not None:

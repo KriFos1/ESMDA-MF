@@ -431,6 +431,44 @@ def test_material_orientation_flows_from_cli_and_environment_into_metadata(monke
     assert adapter.build_metadata(0, {'x': 0., 'y': 0., 'z': 0.}, well)['orientation'] == 'bedding'
 
 
+def test_solver_grid_reaches_the_solver_only_on_request(monkeypatch):
+    import argparse
+
+    well = {key: np.array([[0.]]) for key in ('X', 'Y', 'Z', 'Distance', 'Inclination', 'Azimuth')}
+    shift = {'x': 0., 'y': 0., 'z': 0.}
+    default = Remote2D(SimBackendConfig(), (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')])
+    default_meta = default.build_metadata(0, shift, well)
+    assert 'apply_solver_grid' not in default_meta and default_meta['evaluation_timeout_seconds'] == 180.
+    parser = argparse.ArgumentParser()
+    SimBackendConfig().add_cli(parser)
+    config = SimBackendConfig().from_args(parser.parse_args(['--apply-solver-grid', '--evaluation-timeout', '1500',
+                                                             '--solver-grid', '40,4,80,30,20,30,2,1,2']))
+    assert config.apply_solver_grid and config.solver_grid == (40, 4, 80, 30, 20, 30, 2, 1, 2)
+    assert config.to_env()['DA_SIM_APPLY_SOLVER_GRID'] == '1'
+    assert config.to_env()['DA_SIM_EVALUATION_TIMEOUT'] == '1500.0'
+    assert SimBackendConfig().to_env()['DA_SIM_APPLY_SOLVER_GRID'] == '0'
+    monkeypatch.setenv('DA_SIM_APPLY_SOLVER_GRID', '1')
+    monkeypatch.setenv('DA_SIM_EVALUATION_TIMEOUT', '900')
+    assert SimBackendConfig.from_env().apply_solver_grid
+    assert SimBackendConfig.from_env().evaluation_timeout_seconds == 900.
+    meta = Remote2D(config, (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')]).build_metadata(0, shift, well)
+    assert meta['apply_solver_grid'] is True and meta['solver_grid'] == [40, 4, 80, 30, 20, 30, 2, 1, 2]
+    assert meta['evaluation_timeout_seconds'] == 1500.
+    with pytest.raises(ValueError, match='timeout'):
+        Remote2D(SimBackendConfig(evaluation_timeout_seconds=0.), (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')])
+    # A separate adjoint timeout applies to Jacobian evaluations only and round-trips through the env.
+    split = Remote2D(SimBackendConfig(evaluation_timeout_seconds=20., adjoint_timeout_seconds=60.),
+                     (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')])
+    assert split.build_metadata(0, shift, well)['evaluation_timeout_seconds'] == 20.
+    assert split.build_metadata(0, shift, well, jacobian=True)['evaluation_timeout_seconds'] == 60.
+    assert split.config.to_env()['DA_SIM_ADJOINT_TIMEOUT'] == '60.0'
+    assert SimBackendConfig().to_env()['DA_SIM_ADJOINT_TIMEOUT'] == '' and SimBackendConfig.from_env().adjoint_timeout_seconds is None
+    monkeypatch.setenv('DA_SIM_ADJOINT_TIMEOUT', '60')
+    assert SimBackendConfig.from_env().adjoint_timeout_seconds == 60.
+    with pytest.raises(ValueError, match='adjoint timeout'):
+        Remote2D(SimBackendConfig(adjoint_timeout_seconds=-1.), (3, 5, 4), 5., 5., 5., [('6kHz', '83ft')])
+
+
 def test_local_backend_honors_cpu_and_worker_requests(tmp_path):
     adapter = Remote2D(SimBackendConfig(cpus=3, concurrency=2), (3, 5, 4),
                        5., 5., 5., [('6kHz', '83ft')], jobs_dir=str(tmp_path / 'jobs'))

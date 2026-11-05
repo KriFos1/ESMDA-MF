@@ -275,6 +275,8 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                        if getattr(args, 'solver_tolerance', None) is not None else []),
                      *(['--evaluation-timeout', str(args.evaluation_timeout)]
                        if getattr(args, 'evaluation_timeout', None) is not None else []),
+                     *(['--adjoint-timeout', str(args.adjoint_timeout)]
+                       if getattr(args, 'adjoint_timeout', None) is not None else []),
                      *(['--hdfql', args.node_hdfql] if node and args.node_hdfql else [])]
         run([PYTHON, '-B', ROOT / 'pilot_rml_index45.py', 'prepare-laplace', '--problem',
              chain / problem, '--source', args.source, '--run-dir', run_dir, *overrides])
@@ -357,6 +359,8 @@ def main(argv=None):
                         help='Solver tolerance for the MAP stages (default: source study)')
     parser.add_argument('--evaluation-timeout', type=float, default=None,
                         help='Seconds one MAP-stage solver evaluation may run (default: 180)')
+    parser.add_argument('--adjoint-timeout', type=float, default=None,
+                        help='Seconds one MAP-stage Jacobian evaluation may run (default: the evaluation timeout)')
     parser.add_argument('--host', default='HPC')
     parser.add_argument('--hpc-root', default='/cluster/home/krfo/rml-index45-20261019')
     parser.add_argument('--hpc-python', default='/cluster/home/krfo/rml-index45-20261019/.venv/bin/python')
