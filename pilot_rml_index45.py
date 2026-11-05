@@ -972,6 +972,46 @@ def forward_batch(args):
     print(f'Forward batch of {len(parameters)} models in {time.monotonic() - started:.1f} s')
 
 
+def dip_probe(args):
+    """Solvability of each ``start_models`` row at its own apparent dip: forward, then forward + adjoint.
+
+    A diagnostic for points where every evaluation fails: the rows are typically one model with
+    a ladder of dip latents. Writes dip-probe.json (per row: dip, forward ok, adjoint ok, seconds).
+    """
+    from apparent_dip import physical_dip
+    directory = args.run_dir.resolve()
+    study, inputs = read_study(directory)
+    if 'start_models' not in inputs or 'dip_prior' not in study:
+        raise ValueError('The dip probe needs start models and a dip prior')
+    output = directory / f'dip-probe-{args.member:03d}'
+    output.mkdir(exist_ok=True)
+    adapter, well, physical_parameters = evaluation_setup(study, inputs, output)
+    adapter.backend().trusts_ad('2D')
+    bounds = study['dip_prior']['bounds']
+    rows = []
+    for model in inputs['start_models']:
+        parameters = physical_parameters(np.asarray(model, dtype=float))[0]
+        dip = float(physical_dip(model[-1], bounds))
+        row = {'dip_degrees': dip, 'forward': False, 'adjoint': False}
+        started = time.monotonic()
+        try:
+            prediction = adapter.run_pred(parameters, study['index'], study['shift_ft'], well, dip)
+            row['forward'] = bool(np.isfinite(prediction).all())
+        except (RuntimeError, ValueError) as error:
+            row['forward_error'] = str(error)[:120]
+        row['forward_seconds'] = time.monotonic() - started
+        started = time.monotonic()
+        try:
+            adapter.run_grad(parameters, study['index'], study['shift_ft'], well, dip)
+            row['adjoint'] = True
+        except (RuntimeError, ValueError) as error:
+            row['adjoint_error'] = str(error)[:120]
+        row['adjoint_seconds'] = time.monotonic() - started
+        rows.append(row)
+        print(json.dumps(row), flush=True)
+    atomic_json(output / 'dip-probe.json', rows)
+
+
 def gradient_check(args):
     directory = args.run_dir.resolve()
     study, inputs = read_study(directory)
@@ -1239,11 +1279,12 @@ def main(argv=None):
                 ('member', sub.add_parser('member')),
                 ('forward-start', sub.add_parser('forward-start')),
                 ('forward-batch', sub.add_parser('forward-batch')),
+                ('dip-probe', sub.add_parser('dip-probe')),
                 ('gradient-check', sub.add_parser('gradient-check')),
                 ('collect', sub.add_parser('collect')), ('bundle', sub.add_parser('bundle'))]
     for name, command in commands:
         command.add_argument('--run-dir', type=Path, required=True)
-        if name in ('member', 'gradient-check', 'forward-start', 'forward-batch'):
+        if name in ('member', 'gradient-check', 'forward-start', 'forward-batch', 'dip-probe'):
             command.add_argument('--member', type=int, required=True)
         if name == 'collect':
             command.add_argument('--verify-mean', action='store_true',
@@ -1259,7 +1300,7 @@ def main(argv=None):
             or not np.isfinite(args.max_seconds + args.max_trust + args.solver_tolerance)):
         parser.error('Require 25 members and positive finite resource/optimizer settings')
     {'prepare': prepare, 'prepare-cascade': prepare_cascade, 'prepare-laplace': prepare_laplace,
-     'member': member, 'forward-start': forward_start, 'forward-batch': forward_batch,
+     'member': member, 'forward-start': forward_start, 'forward-batch': forward_batch, 'dip-probe': dip_probe,
      'gradient-check': gradient_check, 'collect': collect, 'bundle': bundle}[args.command](args)
 
 
