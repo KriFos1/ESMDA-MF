@@ -1007,6 +1007,16 @@ def dip_probe(args):
         except (RuntimeError, ValueError) as error:
             row['adjoint_error'] = str(error)[:120]
         row['adjoint_seconds'] = time.monotonic() - started
+        # The member's own linearization: adjoint and the two dip-perturbed forwards at once.
+        started = time.monotonic()
+        try:
+            adapter.run_grad_with_dip(parameters, study['index'], study['shift_ft'], well, dip,
+                                      study['dip_prior']['fd_step_degrees'])
+            row['concurrent'] = True
+        except (RuntimeError, ValueError) as error:
+            row['concurrent'] = False
+            row['concurrent_error'] = str(error)[:120]
+        row['concurrent_seconds'] = time.monotonic() - started
         rows.append(row)
         print(json.dumps(row), flush=True)
     atomic_json(output / 'dip-probe.json', rows)
