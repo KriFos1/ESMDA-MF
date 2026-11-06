@@ -91,6 +91,8 @@ def main(argv=None):
     parser.add_argument('--case', action='append', default=[], metavar='NAME=JOB_DIR')
     parser.add_argument('--build', action='append', default=[], metavar='NAME=DIR')
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--solver-tolerance', type=float, action='append', default=None,
+                        help='Evaluate at these tolerances instead of the saved one (repeatable)')
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args(argv)
     output = args.output_dir.resolve()
@@ -106,18 +108,22 @@ def main(argv=None):
         case = {'name': name, 'source': str(source), 'jacobian': bool(request['metadata'].get('jacobian')),
                 'dip_degrees': request['metadata'].get('apparent_dip_degrees'),
                 'solver_tolerance': request['metadata'].get('solver_tolerance'), 'runs': {}}
+        tolerances = args.solver_tolerance or [request['metadata'].get('solver_tolerance')]
         for build, directory in builds:
+          for tolerance in tolerances:
             runtime = build_runtime(request['runtime'], directory)
             if case['jacobian'] and 'adjoint_spec' not in runtime:
                 continue
+            variant = build if tolerance == request['metadata'].get('solver_tolerance') else f'{build}@{tolerance:g}'
+            request_t = {**request, 'metadata': {**request['metadata'], 'solver_tolerance': tolerance}}
             runs = []
             for repeat in range(args.repeats):
-                result = evaluate(output / name / build / f'run-{repeat}', request, fields, runtime)
+                result = evaluate(output / name / variant / f'run-{repeat}', request_t, fields, runtime)
                 runs.append(result)
                 brief = {k: v for k, v in result.items() if k != 'prediction'}
-                print(json.dumps({'case': name, 'build': build, 'repeat': repeat, **brief}), flush=True)
+                print(json.dumps({'case': name, 'build': variant, 'repeat': repeat, **brief}), flush=True)
             ready = [r['prediction'] for r in runs if r['state'] == 'READY']
-            case['runs'][build] = {'states': [r['state'] for r in runs], 'seconds': [round(r['seconds'], 1) for r in runs],
+            case['runs'][variant] = {'states': [r['state'] for r in runs], 'seconds': [round(r['seconds'], 1) for r in runs],
                                    'min_error_bound': [r['min_error_bound'] for r in runs],
                                    'rom_exits': [r['rom_exits'] for r in runs],
                                    'repeat_spread': (float(np.abs(wrapped_difference(ready[0], ready[-1])).max())
