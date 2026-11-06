@@ -339,11 +339,12 @@ def test_prior_ranges_and_warm_start_settings_reach_the_chain_and_the_controller
     monkeypatch.setattr(run_ia_case.subprocess, 'run', run)
     monkeypatch.setattr(run_ia_case, 'implementation_id', lambda: '1234567890')
     assert run_ia_case.main(['--run-dir', str(case), '--stop', '5', '--ensemble-size', '8', '--rh-ranges', '100', '50',
-                             '--node-sbatch', '8', '4', '--first-map-seconds', '1200',
+                             '--node-sbatch', '8', '4', '--node-memory', '4', '--first-map-seconds', '1200',
                              '--optimizer-setting', 'max_seconds=120', '--optimizer-setting', 'initial_trust=2.0']) == 0
     chain_command, loop_command = commands
     assert chain_command[chain_command.index('--rh-ranges') + 1:chain_command.index('--rh-ranges') + 3] == ['100.0', '50.0']
     assert loop_command[loop_command.index('--node-sbatch') + 1:loop_command.index('--node-sbatch') + 3] == ['8', '4']
+    assert loop_command[loop_command.index('--node-memory') + 1] == '4'
     assert loop_command[loop_command.index('--first-map-seconds') + 1] == '1200.0'
     assert loop_command.count('--optimizer-setting') == 2
     assert '-s' in loop_command[loop_command.index('--label') + 1]      # the MAP label records the settings

@@ -306,8 +306,9 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                 log(f'index {index}: MAP members {pending} started on {args.host} (submission {submission + 1})')
             else:
                 # Node solves inside the allocation: one task with threads x concurrency CPUs, RML_NODE set.
+                memory = int(getattr(args, 'node_memory', 64))
                 layout = (f' RML_NODE=1 && sbatch --parsable --ntasks=1 --cpus-per-task={node_sbatch[0] * node_sbatch[1]} '
-                          f'--mem=64G' if node_sbatch else ' && sbatch --parsable')
+                          f'--mem={memory}G' if node_sbatch else ' && sbatch --parsable')
                 job = ssh(args.host, f'cd {remote} && export RML_PROJECT={remote}/code RML_RUN={remote}/run '
                                      f'RML_PYTHON={args.hpc_python}{layout} --export=ALL '
                                      f'--array={",".join(map(str, pending))} --chdir=$RML_RUN '
@@ -379,6 +380,9 @@ def main(argv=None):
     parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                         help='slurm: single-rank node solves inside each MAP job (threads per solve, solves at '
                              'once; the job gets threads x concurrency CPUs) instead of 2-rank srun steps')
+    parser.add_argument('--node-memory', type=int, default=64, metavar='GB',
+                        help='slurm: memory of each --node-sbatch MAP job (IA MAPs use about 1.2 GB; a busy '
+                             'cluster may only have a few GB unallocated)')
     parser.add_argument('--accept-time-limit', action='store_true',
                         help='Treat a MAP that stopped on its optimizer budget as finished (its best model is '
                              'resampled) instead of resubmitting it: the budget is the design, not an accident')

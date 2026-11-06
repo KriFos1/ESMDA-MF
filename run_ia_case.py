@@ -61,6 +61,8 @@ def main(argv=None):
     parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                         help='MAP stages with single-rank node solves inside the job (e.g. 8 4) instead of '
                              '2-rank srun steps, which deadlock on a convergence error')
+    parser.add_argument('--node-memory', type=int, default=None, metavar='GB',
+                        help='Memory requested by each --node-sbatch MAP job (default 64; the IA MAPs use about 1.2 GB)')
     parser.add_argument('--first-map-seconds', type=float, default=None,
                         help="Optimizer budget of the chain's first (cold-start) MAP")
     parser.add_argument('--accept-time-limit', action='store_true',
@@ -135,6 +137,8 @@ def main(argv=None):
         command += ['--adjoint-timeout', str(args.adjoint_timeout)]
     if args.node_sbatch is not None:
         command += ['--node-sbatch', *map(str, args.node_sbatch)]
+    if args.node_memory is not None:
+        command += ['--node-memory', str(args.node_memory)]
     if args.first_map_seconds is not None:
         command += ['--first-map-seconds', str(args.first_map_seconds)]
     for setting in args.optimizer_setting or []:
