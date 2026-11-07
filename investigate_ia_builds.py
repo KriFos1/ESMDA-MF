@@ -93,6 +93,11 @@ def main(argv=None):
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--solver-tolerance', type=float, action='append', default=None,
                         help='Evaluate at these tolerances instead of the saved one (repeatable)')
+    parser.add_argument('--threads', type=int, action='append', default=None,
+                        help='Solver threads (OMP and MKL) instead of the saved count (repeatable; variants '
+                             'are named build@tol/threads)')
+    parser.add_argument('--oneapi', default=None,
+                        help='oneapi-vars.sh to source instead of the one saved in the requests (another machine)')
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args(argv)
     output = args.output_dir.resolve()
@@ -109,13 +114,20 @@ def main(argv=None):
                 'dip_degrees': request['metadata'].get('apparent_dip_degrees'),
                 'solver_tolerance': request['metadata'].get('solver_tolerance'), 'runs': {}}
         tolerances = args.solver_tolerance or [request['metadata'].get('solver_tolerance')]
+        saved_threads = request['resources'].get('cpus_per_rank')
         for build, directory in builds:
           for tolerance in tolerances:
+           for threads in (args.threads or [saved_threads]):
             runtime = build_runtime(request['runtime'], directory)
+            if args.oneapi:
+                runtime['oneapi'] = str(Path(args.oneapi).expanduser().resolve())
             if case['jacobian'] and 'adjoint_spec' not in runtime:
                 continue
             variant = build if tolerance == request['metadata'].get('solver_tolerance') else f'{build}@{tolerance:g}'
-            request_t = {**request, 'metadata': {**request['metadata'], 'solver_tolerance': tolerance}}
+            if threads != saved_threads:
+                variant += f'/{threads}'
+            request_t = {**request, 'metadata': {**request['metadata'], 'solver_tolerance': tolerance},
+                         'resources': {**request['resources'], 'cpus_per_rank': threads, 'mkl_threads': threads}}
             runs = []
             for repeat in range(args.repeats):
                 result = evaluate(output / name / variant / f'run-{repeat}', request_t, fields, runtime)
