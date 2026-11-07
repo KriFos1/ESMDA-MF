@@ -621,10 +621,30 @@ def test_lm_keeps_the_looser_tolerance_when_the_refinement_fails():
                              tolerance_schedule=[[20., 1e-2], [1., 3e-3], [0., 1e-3]],
                              set_tolerance=lambda value: holder.__setitem__('tolerance', value))
     retained = [row for row in fit['history'] if 'tolerance_retained' in row]
-    assert retained and all(row['tolerance_retained'] == 3e-3 for row in retained)
+    assert len(retained) == 1 and retained[0]['tolerance_retained'] == 3e-3      # blocked after one failure
     assert not any(row.get('refined_tolerance') == 3e-3 for row in fit['history'])
-    assert fit['converged'] and fit['solver_tolerance'] == 1e-3
+    assert fit['converged'] and fit['solver_tolerance'] == 1e-3 and fit['blocked_tolerances'] == [3e-3]
     assert 3e-3 not in [row['solver_tolerance'] for row in fit['history']]
+    assert used.count(3e-3) == 1
+
+
+def test_lm_backs_off_the_tolerance_when_a_whole_round_stalls():
+    prior, matrix, target, variance, holder, used = scheduled_case()
+    def evaluate_batch(models):
+        used.append(holder['tolerance'])
+        # The refinement at 1e-3 (a single-point batch) solves; every later 1e-3 batch stalls.
+        stall = holder['tolerance'] == 1e-3 and used.count(1e-3) > 1
+        return [None if stall else (matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, max_iterations=100,
+                             relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12,
+                             tolerance_schedule=[[20., 1e-2], [1., 3e-3], [0., 1e-3]],
+                             set_tolerance=lambda value: holder.__setitem__('tolerance', value))
+    backoff = [row for row in fit['trial_history'] if 'tolerance_backoff' in row]
+    assert backoff and all(row['tolerance_backoff'] == 3e-3 and row['failed'] for row in backoff)
+    assert not any(row.get('failure_round') for row in fit['trial_history'])
+    assert fit['converged'] and fit['solver_tolerance'] == 3e-3 and fit['blocked_tolerances'] == [1e-3]
+    assert used.count(1e-3) == 2                       # the refinement and the one stalled round
+    assert fit['history'][-1]['solver_tolerance'] == 3e-3
 
 
 def test_lm_rejects_malformed_tolerance_schedules():

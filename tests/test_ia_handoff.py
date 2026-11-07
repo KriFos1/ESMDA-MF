@@ -351,6 +351,13 @@ def test_prior_ranges_and_warm_start_settings_reach_the_chain_and_the_controller
     assert '--accept-time-limit' not in loop_command
     assert run_ia_case.main(['--run-dir', str(case), '--stop', '5', '--ensemble-size', '8', '--accept-time-limit']) == 0
     assert len(commands) == 3 and '--accept-time-limit' in commands[2]
+    assert run_ia_case.main(['--run-dir', str(case), '--stop', '5', '--ensemble-size', '8', '--host', 'local',
+                             '--node-solver', '7', '4', '--hpc-root', '/tmp/root', '--hpc-python', '/usr/bin/python3',
+                             '--binary-dir', '/home/me/solver']) == 0
+    local = commands[3]
+    assert local[local.index('--host') + 1] == 'local' and local[local.index('--executor') + 1] == 'node'
+    assert local[local.index('--node-threads') + 1] == '7' and local[local.index('--node-concurrency') + 1] == '4'
+    assert '--node-sbatch' not in local and '-s' in local[local.index('--label') + 1]
 
 
 def test_noise_floors_are_applied_recorded_and_carried_on_resume(tmp_path, monkeypatch):

@@ -51,9 +51,24 @@ def retry(action, attempts=6, delay=60.):
             time.sleep(delay)
 
 
+LOCAL_HOST = 'local'    # --host local: the MAP stages run on this machine (node executor, no ssh)
+
+
 def ssh(host, command, capture=False):
+    if host == LOCAL_HOST:
+        return run(['bash', '-c', command], capture=capture)
     return retry(lambda: run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', host, command],
                              capture=capture))
+
+
+def located(host, path):
+    """``host:path`` for rsync/scp, or the bare path on the local host."""
+    return str(path) if host == LOCAL_HOST else f'{host}:{path}'
+
+
+def copy_command(host, source, target):
+    return (['cp', str(source), str(target)] if host == LOCAL_HOST
+            else ['scp', '-q', str(source), located(host, target)])
 
 
 def checkpoint_indices(chain):
@@ -170,7 +185,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 ulimit -s unlimited 2>/dev/null || true
 for member in "$@"; do
   (
-    for attempt in 1 2 3; do
+    for attempt in $(seq 1 "${RML_ATTEMPTS:-3}"); do
       "$RML_PYTHON" -B -u pilot_rml_index45.py member --run-dir "$RML_RUN" --member "$member" \
         >> "$RML_RUN/member-$(printf %03d "$member").log" 2>&1
       [ $? -eq 3 ] || break
@@ -194,8 +209,11 @@ def node_launch(args, remote, members):
     ssh(args.host, f"cat > {script} <<'EOF'\n{NODE_LAUNCHER}EOF\nchmod +x {script}")
     # Only the launcher goes to the background (with every stream redirected), so ssh returns at once;
     # backgrounding the whole 'cd && export && nohup' list kept ssh attached until the members finished.
+    # With an accepted time budget a member runs once (as the Slurm array does); otherwise it resumes
+    # from its checkpoint up to three times.
+    attempts = 1 if getattr(args, 'accept_time_limit', False) else 3
     ssh(args.host, f'cd {remote}; export RML_PROJECT={remote}/code RML_RUN={remote}/run '
-                   f'RML_PYTHON={args.hpc_python}; nohup {script} {" ".join(map(str, members))} '
+                   f'RML_PYTHON={args.hpc_python} RML_ATTEMPTS={attempts}; nohup {script} {" ".join(map(str, members))} '
                    f'> {remote}/run/node-launch.log 2>&1 < /dev/null & echo $! > {remote}/run/node-running')
 
 
@@ -247,7 +265,7 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
     def pull():
         retry(lambda: run(['rsync', '-a', '--exclude', 'jobs/', '--exclude', 'deployment.tar.gz',
                            '--exclude', 'inputs.npz', '--exclude', 'study.json',
-                           '--exclude', 'prior-moments.npz', f'{args.host}:{remote}/run/', f'{run_dir}/']))
+                           '--exclude', 'prior-moments.npz', located(args.host, f'{remote}/run/'), f'{run_dir}/']))
 
     def result_of(member):
         report = run_dir / f'member-{member:03d}' / 'result.json'
@@ -282,7 +300,7 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
              chain / problem, '--source', args.source, '--run-dir', run_dir, *overrides])
         run([PYTHON, '-B', ROOT / 'pilot_rml_index45.py', 'bundle', '--run-dir', run_dir])
         ssh(args.host, f'mkdir -p {remote}')
-        retry(lambda: run(['scp', '-q', run_dir / 'deployment.tar.gz', f'{args.host}:{remote}/']))
+        retry(lambda: run(copy_command(args.host, run_dir / 'deployment.tar.gz', f'{remote}/')))
         ssh(args.host, f'cd {remote} && tar xzf deployment.tar.gz && rm deployment.tar.gz')
     count = json.loads((run_dir / 'study.json').read_text())['count']
     if not all(finished(member) for member in range(count)):

@@ -331,10 +331,12 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     count): loose while the misfit is large (the extreme models that stall the
     solver), tight near convergence, where the optimizer resolves objective
     changes of the size of a loose solve's error. ``set_tolerance(value)`` is
-    called before the affected evaluations. The tolerance only tightens; when
-    it does, the incumbent is re-evaluated at the new tolerance so objective,
-    gradient and trial comparisons stay consistent (a failed re-evaluation
-    keeps the looser tolerance until the next accepted step).
+    called before the affected evaluations. When the tolerance tightens, the
+    incumbent is re-evaluated at the new tolerance so objective, gradient and
+    trial comparisons stay consistent. A tolerance at which the incumbent or a
+    whole round of candidates stalls is blocked for the rest of the member
+    (``blocked_tolerances``): the member keeps the tightest looser tolerance
+    instead of spending its budget on stalled solves.
     """
     if (candidates < 1 or max_iterations < 1 or max_rounds < 1 or max_seconds <= 0
             or not 0 < min_trust <= initial_trust <= max_trust or stagnation_iterations < 1
@@ -375,13 +377,18 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     evaluations = 0
     budget_started = None       # the budget clock runs from the first iteration, not from the start retries
     current_tolerance = None
+    blocked = set()         # schedule tolerances at which this member's solves stalled: not tried again
 
     def tolerance_for(likelihood_loss):
+        """The schedule's tolerance for a misfit, or the tightest looser one that is not blocked."""
         misfit = 2. * likelihood_loss / target.size
+        desired = schedule[-1][1]
         for threshold, tolerance in schedule:
             if misfit > threshold:
-                return tolerance
-        return schedule[-1][1]
+                desired = tolerance
+                break
+        allowed = [tolerance for _, tolerance in schedule if tolerance >= desired and tolerance not in blocked]
+        return min(allowed) if allowed else current_tolerance
 
     def apply_tolerance(value):
         nonlocal current_tolerance
@@ -390,10 +397,18 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
             current_tolerance = value
 
     def tolerance_fields():
-        return {'solver_tolerance': current_tolerance} if schedule is not None else {}
+        if schedule is None:
+            return {}
+        return {'solver_tolerance': current_tolerance, **({'blocked_tolerances': sorted(blocked)} if blocked else {})}
 
     if schedule is not None:
-        apply_tolerance(schedule[0][1] if state is None else tolerance_for(state[4]))
+        if state is None:
+            apply_tolerance(schedule[0][1])
+        else:
+            # Resume at the tolerance the checkpointed state was evaluated with (tightened below).
+            blocked.update(float(value) for value in history[-1].get('blocked_tolerances', []))
+            apply_tolerance(float(history[-1].get('refined_tolerance',
+                                                  history[-1].get('solver_tolerance', schedule[0][1]))))
 
     def evaluate_points(points):
         nonlocal evaluations
@@ -461,8 +476,10 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
         apply_tolerance(desired)
         refined = evaluate_points([z])[0]
         if refined is None:
+            # The incumbent itself stalls at the tighter tolerance: keep the looser one for this member.
+            blocked.add(desired)
             apply_tolerance(previous)
-            history[-1]['tolerance_retained'] = desired
+            history[-1].update(tolerance_retained=desired, blocked_tolerances=sorted(blocked))
         else:
             state, jacobian = refined
             history[-1].update(refined_tolerance=desired, refined_objective=state[0],
@@ -592,6 +609,18 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                         message = f'{max_rounds} rounds of {candidates} candidates without objective decrease'
                         stop = True
                         break
+                    continue
+                looser = ([tolerance for _, tolerance in schedule if tolerance > current_tolerance
+                           and tolerance not in blocked] if schedule is not None else [])
+                if looser:
+                    # Every candidate stalled at the tightened tolerance: the stall is the tolerance's,
+                    # not the steps'. Loosen for the rest of this member and repeat the same steps.
+                    blocked.add(current_tolerance)
+                    for row in rows:
+                        row['tolerance_backoff'] = min(looser)
+                    apply_tolerance(min(looser))
+                    history[-1]['blocked_tolerances'] = sorted(blocked)
+                    save()
                     continue
                 for row in rows:
                     row['failure_round'] = True

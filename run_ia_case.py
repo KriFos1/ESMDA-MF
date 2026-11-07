@@ -61,6 +61,10 @@ def main(argv=None):
     parser.add_argument('--node-sbatch', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                         help='MAP stages with single-rank node solves inside the job (e.g. 8 4) instead of '
                              '2-rank srun steps, which deadlock on a convergence error')
+    parser.add_argument('--node-solver', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
+                        help='MAP stages as background processes on --host without Slurm (e.g. --host local '
+                             'with a local fwd2D build in --binary-dir, --hpc-root a local directory and '
+                             '--hpc-python the local Python)')
     parser.add_argument('--node-memory', type=int, default=None, metavar='GB',
                         help='Memory requested by each --node-sbatch MAP job (default 64; the IA MAPs use about 1.2 GB)')
     parser.add_argument('--first-map-seconds', type=float, default=None,
@@ -115,8 +119,9 @@ def main(argv=None):
             raise ValueError(f'Existing chain uses a different {name}')
     binary_id = hashlib.sha256(args.binary_dir.encode()).hexdigest()[:8]
     solver = [args.solver_grid, args.solver_tolerance, args.evaluation_timeout, args.node_sbatch,
-              args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None, args.adjoint_timeout]
-    solver_id = ('' if solver == [None] * 8 else
+              args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None, args.adjoint_timeout,
+              args.node_solver]
+    solver_id = ('' if all(value is None for value in solver) else
                  '-s' + hashlib.sha256(json.dumps(solver).encode()).hexdigest()[:6])
     label = args.label or f'ia-{run_dir.name}-{implementation_id()}-b{binary_id}-m{args.map_starts}{solver_id}'
     if not label or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for character in label):
@@ -137,6 +142,9 @@ def main(argv=None):
         command += ['--adjoint-timeout', str(args.adjoint_timeout)]
     if args.node_sbatch is not None:
         command += ['--node-sbatch', *map(str, args.node_sbatch)]
+    if args.node_solver is not None:
+        command += ['--executor', 'node', '--node-threads', str(args.node_solver[0]),
+                    '--node-concurrency', str(args.node_solver[1])]
     if args.node_memory is not None:
         command += ['--node-memory', str(args.node_memory)]
     if args.first_map_seconds is not None:

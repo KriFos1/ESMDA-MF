@@ -166,6 +166,11 @@ def test_prepare_laplace_and_sample_build_the_gate_checkpoint(tmp_path, gate_env
         rml.prepare_laplace(SimpleNamespace(run_dir=tmp_path / 'bad', source=source, binary_dir=None,
                                             orientation=None, problem=chain / 'laplace-problem-002.npz',
                                             optimizer_setting=['tolerance=1']))
+    import run_chain_laplace_loop as loop
+    assert loop.ssh('local', 'echo local-$((1 + 2))', capture=True).strip() == 'local-3'
+    assert loop.located('local', '/data/run/') == '/data/run/' and loop.located('HPC', '/data/run/') == 'HPC:/data/run/'
+    assert loop.copy_command('local', '/a/d.tar.gz', '/b/') == ['cp', '/a/d.tar.gz', '/b/']
+    assert loop.copy_command('HPC', '/a/d.tar.gz', '/b/') == ['scp', '-q', '/a/d.tar.gz', 'HPC:/b/']
     scheduled = tmp_path / 'laplace-run-scheduled'
     rml.prepare_laplace(SimpleNamespace(run_dir=scheduled, source=source, binary_dir=None, orientation=None,
                                         problem=chain / 'laplace-problem-002.npz',
