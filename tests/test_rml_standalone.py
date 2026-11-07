@@ -572,3 +572,68 @@ def test_forward_only_lm_rejects_a_trial_if_relinearization_worsens_objective():
     assert fit['reason'] == 'nonlinearity_limited' and fit['accepted_iterations'] == 0
     assert any(row.get('linearization_rejected') for row in fit['trial_history'])
     np.testing.assert_array_equal(fit['model'], np.zeros(8))
+
+
+def scheduled_case():
+    prior = prior_fixture()
+    rng = np.random.default_rng(7)
+    matrix = rng.normal(size=(3, 8))
+    target, variance = matrix @ np.full(8, 2.), np.full(3, 1e-2)
+    holder, used = {'tolerance': None}, []
+    return prior, matrix, target, variance, holder, used
+
+
+def test_lm_tolerance_schedule_tightens_with_the_misfit_and_reevaluates_the_incumbent():
+    prior, matrix, target, variance, holder, used = scheduled_case()
+    def evaluate_batch(models):
+        used.append(holder['tolerance'])
+        return [(matrix @ model, matrix) for model in models]
+    schedule = [[20., 1e-2], [1., 3e-3], [0., 1e-3]]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, max_iterations=100,
+                             relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12,
+                             tolerance_schedule=schedule,
+                             set_tolerance=lambda value: holder.__setitem__('tolerance', value))
+    assert used[0] == 1e-2 and fit['converged'] and fit['solver_tolerance'] == 1e-3
+    tolerances = [row['solver_tolerance'] for row in fit['history']]
+    assert tolerances[0] == 1e-2 and tolerances[-1] == 1e-3 and np.all(np.diff(tolerances) <= 0)
+    misfits = [2 * row['likelihood_loss'] / 3 for row in fit['history']]
+    assert misfits[0] > 20
+    # The tolerance recorded with each accepted iteration is the one its evaluations used,
+    # and the incumbent was re-evaluated at the tighter tolerance once its misfit crossed a threshold.
+    refined = [row for row in fit['history'] if 'refined_tolerance' in row]
+    assert [row['refined_tolerance'] for row in refined] == [3e-3, 1e-3]
+    for row in refined:
+        assert row['refined_objective'] == pytest.approx(row['objective'])      # the fake solver is exact
+        assert 2 * row['likelihood_loss'] / 3 <= (20. if row['refined_tolerance'] == 3e-3 else 1.)
+    following = fit['history'][fit['history'].index(refined[0]) + 1]
+    assert following['solver_tolerance'] == 3e-3
+    assert all(row['solver_tolerance'] in (1e-2, 3e-3, 1e-3) for row in fit['trial_history'])
+    assert used[-1] == 1e-3
+
+
+def test_lm_keeps_the_looser_tolerance_when_the_refinement_fails():
+    prior, matrix, target, variance, holder, used = scheduled_case()
+    def evaluate_batch(models):
+        used.append(holder['tolerance'])
+        return [None if holder['tolerance'] == 3e-3 else (matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, max_iterations=100,
+                             relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12,
+                             tolerance_schedule=[[20., 1e-2], [1., 3e-3], [0., 1e-3]],
+                             set_tolerance=lambda value: holder.__setitem__('tolerance', value))
+    retained = [row for row in fit['history'] if 'tolerance_retained' in row]
+    assert retained and all(row['tolerance_retained'] == 3e-3 for row in retained)
+    assert not any(row.get('refined_tolerance') == 3e-3 for row in fit['history'])
+    assert fit['converged'] and fit['solver_tolerance'] == 1e-3
+    assert 3e-3 not in [row['solver_tolerance'] for row in fit['history']]
+
+
+def test_lm_rejects_malformed_tolerance_schedules():
+    prior, matrix, target, variance, holder, used = scheduled_case()
+    evaluate_batch = batch_of(lambda model: (matrix @ model, matrix))
+    setter = lambda value: None
+    for schedule in ([[1., 1e-2], [20., 1e-3]], [[20., 1e-3], [0., 1e-2]], [[20., 1.]], [], [[20.]]):
+        with pytest.raises(ValueError):
+            optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch,
+                               tolerance_schedule=schedule, set_tolerance=setter)
+    with pytest.raises(ValueError, match='set_tolerance'):
+        optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, tolerance_schedule=[[0., 1e-3]])

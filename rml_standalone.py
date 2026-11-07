@@ -286,12 +286,26 @@ def candidate_dampings(prior, z, residual, sensitivity, gram, radius, floor, cou
     return dampings
 
 
+def validate_tolerance_schedule(schedule):
+    """``[[chi2_per_channel_above, solver_tolerance], ...]`` with descending thresholds and
+    non-increasing tolerances; the last tolerance applies below the last threshold."""
+    try:
+        pairs = [(float(threshold), float(tolerance)) for threshold, tolerance in schedule]
+    except (TypeError, ValueError):
+        raise ValueError('A tolerance schedule is a list of [misfit threshold, solver tolerance] pairs')
+    if not pairs or any(not np.isfinite(t) or t < 0 or not 0 < tol < 1 for t, tol in pairs):
+        raise ValueError('Tolerance schedule thresholds must be finite and nonnegative, tolerances in (0, 1)')
+    if any(a[0] <= b[0] or a[1] < b[1] for a, b in zip(pairs, pairs[1:])):
+        raise ValueError('Tolerance schedule thresholds must descend and tolerances must not increase')
+    return pairs
+
+
 def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoint=None,
                        identity='', candidates=4, initial_trust=.3, max_trust=2., min_trust=1e-3,
                        max_iterations=50, max_rounds=4, max_seconds=3300.,
                        stagnation_tolerance=1e-3, stagnation_iterations=2,
                        relative_gradient_tolerance=1e-3, acceptance=1e-4, start=None,
-                       evaluate_forward=None):
+                       evaluate_forward=None, tolerance_schedule=None, set_tolerance=None):
     """Trust-region Levenberg-Marquardt for one randomized posterior, parallel candidates.
 
     Each round evaluates ``candidates`` damped Gauss-Newton steps at once (forward
@@ -311,11 +325,24 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     objective is unchanged (the prior term is still measured from ``center``).
     If ``evaluate_forward`` is provided, trial objectives use forward-only
     batches and only an accepted candidate is re-evaluated with a Jacobian.
+
+    ``tolerance_schedule`` (tolerance continuation) chooses the solver tolerance
+    from the incumbent's data misfit per channel (2 x likelihood loss / data
+    count): loose while the misfit is large (the extreme models that stall the
+    solver), tight near convergence, where the optimizer resolves objective
+    changes of the size of a loose solve's error. ``set_tolerance(value)`` is
+    called before the affected evaluations. The tolerance only tightens; when
+    it does, the incumbent is re-evaluated at the new tolerance so objective,
+    gradient and trial comparisons stay consistent (a failed re-evaluation
+    keeps the looser tolerance until the next accepted step).
     """
     if (candidates < 1 or max_iterations < 1 or max_rounds < 1 or max_seconds <= 0
             or not 0 < min_trust <= initial_trust <= max_trust or stagnation_iterations < 1
             or stagnation_tolerance <= 0 or relative_gradient_tolerance <= 0 or not 0 < acceptance < .25):
         raise ValueError('Invalid Levenberg-Marquardt settings')
+    schedule = validate_tolerance_schedule(tolerance_schedule) if tolerance_schedule is not None else None
+    if schedule is not None and set_tolerance is None:
+        raise ValueError('A tolerance schedule needs a set_tolerance callable')
     center, target, variance = map(np.asarray, (center, target, variance))
     if (center.shape != prior.mean.shape or target.ndim != 1 or variance.shape != target.shape
             or not np.isfinite(center).all() or not np.isfinite(target).all()
@@ -347,6 +374,26 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     started = time.monotonic()
     evaluations = 0
     budget_started = None       # the budget clock runs from the first iteration, not from the start retries
+    current_tolerance = None
+
+    def tolerance_for(likelihood_loss):
+        misfit = 2. * likelihood_loss / target.size
+        for threshold, tolerance in schedule:
+            if misfit > threshold:
+                return tolerance
+        return schedule[-1][1]
+
+    def apply_tolerance(value):
+        nonlocal current_tolerance
+        if value != current_tolerance:
+            set_tolerance(value)
+            current_tolerance = value
+
+    def tolerance_fields():
+        return {'solver_tolerance': current_tolerance} if schedule is not None else {}
+
+    if schedule is not None:
+        apply_tolerance(schedule[0][1] if state is None else tolerance_for(state[4]))
 
     def evaluate_points(points):
         nonlocal evaluations
@@ -400,7 +447,26 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
         history.append({'objective': loss, 'prior_loss': prior_loss, 'likelihood_loss': likelihood_loss,
                         'gradient_inf': gradient_inf,
                         'relative_gradient': gradient_inf / initial_gradient, 'trust': trust,
-                        'next_damping': damping, **extra})
+                        'next_damping': damping, **tolerance_fields(), **extra})
+        save()
+
+    def tighten_tolerance():
+        """Re-evaluate the incumbent at the schedule's tolerance for its misfit, if tighter."""
+        nonlocal state, jacobian
+        if schedule is None:
+            return
+        desired, previous = tolerance_for(state[4]), current_tolerance
+        if desired >= previous:
+            return
+        apply_tolerance(desired)
+        refined = evaluate_points([z])[0]
+        if refined is None:
+            apply_tolerance(previous)
+            history[-1]['tolerance_retained'] = desired
+        else:
+            state, jacobian = refined
+            history[-1].update(refined_tolerance=desired, refined_objective=state[0],
+                               refined_likelihood_loss=state[4])
         save()
 
     if state is None:
@@ -427,6 +493,7 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
         initial_gradient = max(float(np.max(np.abs(state[1]))), 1e-300)
         record(step_inf=0., **({'start_retries': retries} if retries else {}),
                **({'start_fallback': 'prior centre'} if start_fallback else {}))
+        tighten_tolerance()
     budget_started = time.monotonic()
     reason, message = 'iteration_limit', ''
     try:
@@ -464,7 +531,7 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                 for value, step_inf, gain_model, outcome in zip(dampings, sizes, predicted, outcomes):
                     row = {'iteration': len(history), 'round': round_index, 'damping': value,
                            'step_inf': step_inf, 'trust': radius, 'predicted_reduction': gain_model,
-                           'failed': outcome is None}
+                           'failed': outcome is None, **tolerance_fields()}
                     if failure_rounds:
                         row['step_scale'] = scale
                     if outcome is not None:
@@ -549,10 +616,11 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
             state, jacobian = outcomes[best]
             record(step_inf=size, damping=dampings[best], gain_ratio=ratio,
                    relative_decrease=decrease, round=round_index, candidate=best)
+            tighten_tolerance()
     except TimeoutError as error:
         reason, message = 'time_limit', str(error)
     return {'model': center + factor_apply(prior, z), 'z': z, 'prediction': state[2],
-            'optimizer': LM_OPTIMIZER, 'next_damping': damping, 'trust': trust,
+            'optimizer': LM_OPTIMIZER, 'next_damping': damping, 'trust': trust, **tolerance_fields(),
             'trial_history': trials, 'accepted_iterations': len(history) - 1,
             'converged': reason in ('relative_gradient', 'objective_stagnation'),
             'reason': reason, 'message': message, 'history': history, 'jacobian': jacobian,

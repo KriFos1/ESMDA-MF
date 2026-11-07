@@ -106,6 +106,23 @@ def test_prepare_laplace_and_sample_build_the_gate_checkpoint(tmp_path, gate_env
     simulator = json.loads((override / 'study.json').read_text())['simulator']
     assert simulator['binary_dir'] == '/builds/orient' and simulator['orientation'] == 'bedding'
     assert simulator['cpus'] == 8
+    gridded = tmp_path / 'laplace-run-grid'
+    rml.prepare_laplace(SimpleNamespace(run_dir=gridded, source=source, binary_dir=None, orientation=None,
+                                        problem=chain / 'laplace-problem-002.npz',
+                                        solver_grid=[40, 4, 80, 30, 20, 30, 2, 1, 2], solver_tolerance=1e-5,
+                                        evaluation_timeout=1500.))
+    gridded_simulator = json.loads((gridded / 'study.json').read_text())['simulator']
+    assert gridded_simulator['solver_grid'] == [40, 4, 80, 30, 20, 30, 2, 1, 2]
+    assert gridded_simulator['apply_solver_grid'] is True and gridded_simulator['solver_tolerance'] == 1e-5
+    assert gridded_simulator['evaluation_timeout_seconds'] == 1500.
+    assert 'apply_solver_grid' not in study['simulator'] and 'apply_solver_grid' not in simulator
+    assert 'evaluation_timeout_seconds' not in study['simulator']
+    for grid, tolerance, timeout in (([40, 4, 80], None, None), (None, 2., None), (None, None, -1.)):
+        with pytest.raises(ValueError, match='solver'):
+            rml.prepare_laplace(SimpleNamespace(run_dir=tmp_path / 'bad-grid', source=source, binary_dir=None,
+                                                orientation=None, problem=chain / 'laplace-problem-002.npz',
+                                                solver_grid=grid, solver_tolerance=tolerance,
+                                                evaluation_timeout=timeout))
     assert study['method'] == 'chain_laplace_map' and study['count'] == 1 and study['index'] == 2
     assert study['prior']['type'] == 'matern_cellwise' and study['save_jacobian'] and 'cascade' not in study
     assert study['anisotropy'] == 'log_clipped' and '--array=0-0' in (run_dir / 'rml-array.sbatch').read_text()
@@ -149,6 +166,17 @@ def test_prepare_laplace_and_sample_build_the_gate_checkpoint(tmp_path, gate_env
         rml.prepare_laplace(SimpleNamespace(run_dir=tmp_path / 'bad', source=source, binary_dir=None,
                                             orientation=None, problem=chain / 'laplace-problem-002.npz',
                                             optimizer_setting=['tolerance=1']))
+    scheduled = tmp_path / 'laplace-run-scheduled'
+    rml.prepare_laplace(SimpleNamespace(run_dir=scheduled, source=source, binary_dir=None, orientation=None,
+                                        problem=chain / 'laplace-problem-002.npz',
+                                        optimizer_setting=['tolerance_schedule=[[20,0.01],[6,3e-3],[0,0.001]]']))
+    optimizer = json.loads((scheduled / 'study.json').read_text())['optimizer']
+    assert optimizer['tolerance_schedule'] == [[20., .01], [6., 3e-3], [0., .001]] and optimizer['candidates'] == 4
+    for bad in ('tolerance_schedule=[[0,0.01],[20,0.001]]', 'tolerance_schedule=nonsense'):
+        with pytest.raises(ValueError):
+            rml.prepare_laplace(SimpleNamespace(run_dir=tmp_path / 'bad2', source=source, binary_dir=None,
+                                                orientation=None, problem=chain / 'laplace-problem-002.npz',
+                                                optimizer_setting=[bad]))
     node_run = tmp_path / 'laplace-run-node'
     rml.prepare_laplace(SimpleNamespace(run_dir=node_run, source=source, binary_dir='/data1/orient', orientation=None,
                                         problem=chain / 'laplace-problem-002.npz', node_solver=(3, 4),
@@ -327,6 +355,14 @@ def test_map_stage_adopts_a_job_or_result_left_by_a_previous_controller(tmp_path
     assert loop.job_in_directory('', '/b/run') is None
 
 
+def test_derived_studies_record_the_current_lm_version():
+    # The map source predates the failure-aware LM; a study prepared from it must still run the LM.
+    old = rml.inherit_optimizer({'optimizer_method': 'whitened_parallel_trust_region_lm_v1'})
+    assert old['optimizer_method'] == rml.LM_OPTIMIZER and rml.LM_OPTIMIZER.startswith(rml.LM_FAMILY)
+    assert rml.inherit_optimizer({'optimizer_method': rml.OPTIMIZER})['optimizer_method'] == rml.OPTIMIZER
+    assert rml.inherit_optimizer({}) == {}
+
+
 def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, monkeypatch):
     import run_chain_laplace_loop as loop
     monkeypatch.setattr(loop, 'ROOT', tmp_path)
@@ -348,18 +384,26 @@ def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, m
     monkeypatch.setattr(loop, 'wait_for_array', lambda host, job, members, poll: None)
     args = SimpleNamespace(label='test', hpc_root='/remote', host='HPC', source=tmp_path, poll=0.,
                            max_submissions=3, count=5, seed_base=0, hpc_python='python',
-                           binary_dir='/builds/orient', orientation='bedding')
+                           binary_dir='/builds/orient', orientation='bedding',
+                           solver_grid=[40, 4, 80, 30, 20, 30, 2, 1, 2], solver_tolerance=1e-5,
+                           evaluation_timeout=1500.)
     loop.map_stage(args, tmp_path / 'chain', 7)
     prepare = next(command for command in commands if 'prepare-laplace' in command)
     assert prepare[prepare.index('--binary-dir') + 1] == '/builds/orient'
     assert prepare[prepare.index('--orientation') + 1] == 'bedding'
+    grid = prepare.index('--solver-grid')
+    assert prepare[grid + 1:grid + 10] == ['40', '4', '80', '30', '20', '30', '2', '1', '2']
+    assert prepare[prepare.index('--solver-tolerance') + 1] == '1e-05'
+    assert prepare[prepare.index('--evaluation-timeout') + 1] == '1500.0'
     assert any('chain_laplace.py' in ' '.join(command) and 'sample' in command for command in commands)
     commands.clear()
     member.parent.rename(tmp_path / 'previous')
-    loop.map_stage(SimpleNamespace(**{**vars(args), 'binary_dir': None, 'orientation': None}),
+    loop.map_stage(SimpleNamespace(**{**vars(args), 'binary_dir': None, 'orientation': None,
+                                      'solver_grid': None, 'solver_tolerance': None, 'evaluation_timeout': None}),
                    tmp_path / 'chain', 7)
     prepare = next(command for command in commands if 'prepare-laplace' in command)
     assert '--binary-dir' not in prepare and '--orientation' not in prepare and '--starts' not in prepare
+    assert not {'--solver-grid', '--solver-tolerance', '--evaluation-timeout'} & set(prepare)
 
 
 def test_multi_start_map_stage_resamples_the_lowest_objective(tmp_path, monkeypatch):

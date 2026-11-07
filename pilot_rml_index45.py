@@ -442,8 +442,19 @@ def prepare_laplace(args):
     source['simulator'] = {**source['simulator'], **simulator}
     for setting in getattr(args, 'optimizer_setting', None) or []:
         key, separator, value = setting.partition('=')
+        if key == 'tolerance_schedule' and separator:
+            # Tolerance continuation: JSON [[misfit per channel above, solver tolerance], ...].
+            from rml_standalone import validate_tolerance_schedule
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(f'tolerance_schedule must be JSON pairs: {error}')
+            source['optimizer'] = {**source['optimizer'],
+                                   key: [list(pair) for pair in validate_tolerance_schedule(parsed)]}
+            continue
         if not separator or key not in source.get('optimizer', {}):
-            raise ValueError(f'Unknown optimizer setting {setting!r}; known: {sorted(source.get("optimizer", {}))}')
+            raise ValueError(f'Unknown optimizer setting {setting!r}; known: '
+                             f'{sorted(source.get("optimizer", {}))} and tolerance_schedule')
         current = source['optimizer'][key]
         source['optimizer'] = {**source['optimizer'], key: type(current)(float(value) if isinstance(current, float)
                                                                          else int(value))}
@@ -788,6 +799,7 @@ def forward_evaluator(study, inputs, output):
                                      dtype=float)
         return align_phases(predictions[:, inputs['mask']], inputs['observations'], phase, axis=1)
 
+    predict_batch.set_tolerance = getattr(adapter, 'set_solver_tolerance', None)
     return predict_batch
 
 
@@ -847,6 +859,7 @@ def model_evaluator(study, inputs, output):
         return result
 
     evaluate.batch = evaluate_batch
+    evaluate.set_tolerance = getattr(adapter, 'set_solver_tolerance', None)
     return evaluate
 
 
@@ -880,21 +893,35 @@ def member(args):
         prior = load_prior(study, directory)
         try:
             evaluate = model_evaluator(study, inputs, output)
+            settings = dict(study['optimizer'])
+            schedule = settings.pop('tolerance_schedule', None)
             if str(study['optimizer_method']).startswith(LM_FAMILY):
                 forward = (forward_evaluator(study, inputs, output)
                            if study.get('forward_only_candidates') else None)
+                setters = [setter for setter in (getattr(evaluate, 'set_tolerance', None),
+                                                 getattr(forward, 'set_tolerance', None)) if setter is not None]
+                if schedule is not None and not setters:
+                    raise ValueError('The evaluators cannot change the solver tolerance')
+
+                def set_tolerance(value):
+                    for setter in setters:
+                        setter(value)
+
                 fit = optimize_member_lm(
                     prior, inputs['prior_centers'][args.member], inputs['targets'][args.member],
                     inputs['variance'], evaluate.batch, checkpoint=output / 'checkpoint.npz',
                     identity=identity,
                     start=inputs['start_models'][args.member] if 'start_models' in inputs else None,
-                    evaluate_forward=forward,
-                    **study['optimizer'])
+                    evaluate_forward=forward, tolerance_schedule=schedule,
+                    set_tolerance=set_tolerance if schedule is not None else None,
+                    **settings)
             else:
+                if schedule is not None:
+                    raise ValueError('A tolerance schedule needs the Levenberg-Marquardt optimizer')
                 fit = optimize_member(
                     prior, inputs['prior_centers'][args.member], inputs['targets'][args.member],
                     inputs['variance'], evaluate, checkpoint=output / 'checkpoint.npz',
-                    identity=identity, **study['optimizer'])
+                    identity=identity, **settings)
             final_jacobian = fit.pop('jacobian', None)
             extra = {}
             if study.get('save_full_prediction'):

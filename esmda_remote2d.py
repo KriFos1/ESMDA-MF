@@ -35,7 +35,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -345,6 +345,13 @@ class Remote2D:
             raise ValueError("The worker requires dY == dX")
         if not self.tools:
             raise ValueError("At least one tool is required")
+
+    def set_solver_tolerance(self, tolerance):
+        """Change the solver tolerance of every later evaluation (the optimizer's tolerance continuation)."""
+        tolerance = float(tolerance)
+        if not 0 < tolerance < 1:
+            raise ValueError("Solver tolerance must lie between 0 and 1")
+        self.config = replace(self.config, solver_tolerance=tolerance)
 
     def _import_pxwf(self):
         here = os.path.dirname(os.path.abspath(__file__))

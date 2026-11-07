@@ -413,6 +413,11 @@ def test_metadata_uses_current_orientation_and_origin():
     np.testing.assert_allclose(meta['origin'], np.array([10, 20, 30]) / 3.28084)
     assert meta['solver_tolerance'] == 1e-6
     assert meta['orientation'] == 'gradient'
+    adapter.set_solver_tolerance(3e-3)
+    assert adapter.build_metadata(1, {'x': 10, 'y': 20, 'z': 30}, well)['solver_tolerance'] == 3e-3
+    assert adapter.build_metadata(1, {'x': 10, 'y': 20, 'z': 30}, well, jacobian=True)['solver_tolerance'] == 3e-3
+    with pytest.raises(ValueError):
+        adapter.set_solver_tolerance(1.)
 
 
 def test_material_orientation_flows_from_cli_and_environment_into_metadata(monkeypatch):
