@@ -418,7 +418,7 @@ def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, m
     assert not {'--solver-grid', '--solver-tolerance', '--evaluation-timeout'} & set(prepare)
     # Cold-start-only overrides: applied (after the general settings) while the chain has no MAP yet.
     commands.clear()
-    (tmp_path / 'previous').rename(tmp_path / 'previous2')
+    member.parent.rename(tmp_path / 'previous2')
     cold = SimpleNamespace(**{**vars(args), 'optimizer_setting': ['max_seconds=120'],
                               'first_optimizer_setting': ['tolerance_schedule=[[20,0.01],[0,0.001]]'],
                               'first_map_seconds': 1200.})
