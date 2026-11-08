@@ -32,19 +32,26 @@ def log(message):
     print(time.strftime('%Y-%m-%d %H:%M:%S'), message, flush=True)
 
 
+REMOTE_COMMANDS = ('ssh', 'scp', 'rsync')
+REMOTE_TIMEOUT = 900.       # a session that hangs after connecting (network drop) is retried, not waited on
+SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-o', 'ServerAliveInterval=15',
+               '-o', 'ServerAliveCountMax=4']
+
+
 def run(command, capture=False, env=None):
     log('$ ' + ' '.join(str(part) for part in command))
-    completed = subprocess.run([str(part) for part in command], check=True, text=True,
-                               capture_output=capture, env=env)
+    command = [str(part) for part in command]
+    completed = subprocess.run(command, check=True, text=True, capture_output=capture, env=env,
+                               timeout=REMOTE_TIMEOUT if command[0] in REMOTE_COMMANDS else None)
     return completed.stdout if capture else None
 
 
 def retry(action, attempts=6, delay=60.):
-    """Repeat a remote action across transient SSH/network failures."""
+    """Repeat a remote action across transient SSH/network failures (errors and hung sessions)."""
     for attempt in range(attempts):
         try:
             return action()
-        except subprocess.CalledProcessError as error:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             if attempt + 1 == attempts:
                 raise
             log(f'remote command failed ({error}); retrying in {delay:g} s')
@@ -57,8 +64,7 @@ LOCAL_HOST = 'local'    # --host local: the MAP stages run on this machine (node
 def ssh(host, command, capture=False):
     if host == LOCAL_HOST:
         return run(['bash', '-c', command], capture=capture)
-    return retry(lambda: run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', host, command],
-                             capture=capture))
+    return retry(lambda: run(['ssh', *SSH_OPTIONS, host, command], capture=capture))
 
 
 def located(host, path):
@@ -68,7 +74,7 @@ def located(host, path):
 
 def copy_command(host, source, target):
     return (['cp', str(source), str(target)] if host == LOCAL_HOST
-            else ['scp', '-q', str(source), located(host, target)])
+            else ['scp', *SSH_OPTIONS, '-q', str(source), located(host, target)])
 
 
 def checkpoint_indices(chain):

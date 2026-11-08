@@ -170,7 +170,26 @@ def test_prepare_laplace_and_sample_build_the_gate_checkpoint(tmp_path, gate_env
     assert loop.ssh('local', 'echo local-$((1 + 2))', capture=True).strip() == 'local-3'
     assert loop.located('local', '/data/run/') == '/data/run/' and loop.located('HPC', '/data/run/') == 'HPC:/data/run/'
     assert loop.copy_command('local', '/a/d.tar.gz', '/b/') == ['cp', '/a/d.tar.gz', '/b/']
-    assert loop.copy_command('HPC', '/a/d.tar.gz', '/b/') == ['scp', '-q', '/a/d.tar.gz', 'HPC:/b/']
+    assert loop.copy_command('HPC', '/a/d.tar.gz', '/b/') == ['scp', *loop.SSH_OPTIONS, '-q', '/a/d.tar.gz', 'HPC:/b/']
+    assert 'ServerAliveInterval=15' in loop.SSH_OPTIONS
+    # A hung remote session is a retried failure, not a wait: the chain lost six hours to one in ia-warm9.
+    import subprocess
+    attempts = []
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise subprocess.TimeoutExpired(['ssh'], loop.REMOTE_TIMEOUT)
+        return 'ok'
+    assert loop.retry(flaky, attempts=3, delay=0.) == 'ok' and len(attempts) == 2
+    seen = {}
+    def fake_subprocess_run(command, **kwargs):
+        seen[command[0]] = kwargs.get('timeout'); return SimpleNamespace(stdout='')
+    monkeypatch_run = pytest.MonkeyPatch(); monkeypatch_run.setattr(loop.subprocess, 'run', fake_subprocess_run)
+    try:
+        loop.run(['ssh', 'HPC', 'true']); loop.run(['rsync', 'a', 'b']); loop.run(['python', '-c', 'pass'])
+    finally:
+        monkeypatch_run.undo()
+    assert seen == {'ssh': loop.REMOTE_TIMEOUT, 'rsync': loop.REMOTE_TIMEOUT, 'python': None}
     scheduled = tmp_path / 'laplace-run-scheduled'
     rml.prepare_laplace(SimpleNamespace(run_dir=scheduled, source=source, binary_dir=None, orientation=None,
                                         problem=chain / 'laplace-problem-002.npz',
