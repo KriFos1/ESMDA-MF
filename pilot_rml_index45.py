@@ -452,9 +452,14 @@ def prepare_laplace(args):
             source['optimizer'] = {**source['optimizer'],
                                    key: [list(pair) for pair in validate_tolerance_schedule(parsed)]}
             continue
+        if key == 'tolerance_reevaluate' and separator:
+            if value not in ('0', '1'):
+                raise ValueError('tolerance_reevaluate is 0 or 1')
+            source['optimizer'] = {**source['optimizer'], key: int(value)}
+            continue
         if not separator or key not in source.get('optimizer', {}):
             raise ValueError(f'Unknown optimizer setting {setting!r}; known: '
-                             f'{sorted(source.get("optimizer", {}))} and tolerance_schedule')
+                             f'{sorted(source.get("optimizer", {}))}, tolerance_schedule and tolerance_reevaluate')
         current = source['optimizer'][key]
         source['optimizer'] = {**source['optimizer'], key: type(current)(float(value) if isinstance(current, float)
                                                                          else int(value))}
@@ -895,6 +900,8 @@ def member(args):
             evaluate = model_evaluator(study, inputs, output)
             settings = dict(study['optimizer'])
             schedule = settings.pop('tolerance_schedule', None)
+            if schedule is None:
+                settings.pop('tolerance_reevaluate', None)
             if str(study['optimizer_method']).startswith(LM_FAMILY):
                 forward = (forward_evaluator(study, inputs, output)
                            if study.get('forward_only_candidates') else None)

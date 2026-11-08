@@ -305,7 +305,8 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
                        max_iterations=50, max_rounds=4, max_seconds=3300.,
                        stagnation_tolerance=1e-3, stagnation_iterations=2,
                        relative_gradient_tolerance=1e-3, acceptance=1e-4, start=None,
-                       evaluate_forward=None, tolerance_schedule=None, set_tolerance=None):
+                       evaluate_forward=None, tolerance_schedule=None, set_tolerance=None,
+                       tolerance_reevaluate=1):
     """Trust-region Levenberg-Marquardt for one randomized posterior, parallel candidates.
 
     Each round evaluates ``candidates`` damped Gauss-Newton steps at once (forward
@@ -336,7 +337,10 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     trial comparisons stay consistent. A tolerance at which the incumbent or a
     whole round of candidates stalls is blocked for the rest of the member
     (``blocked_tolerances``): the member keeps the tightest looser tolerance
-    instead of spending its budget on stalled solves.
+    instead of spending its budget on stalled solves. With
+    ``tolerance_reevaluate=0`` the incumbent is not re-evaluated on tightening
+    (one evaluation saved per stage; the incumbent's objective then carries the
+    looser solve's error, below 0.04 chi2 per channel for 1e-2 against 1e-3).
     """
     if (candidates < 1 or max_iterations < 1 or max_rounds < 1 or max_seconds <= 0
             or not 0 < min_trust <= initial_trust <= max_trust or stagnation_iterations < 1
@@ -345,6 +349,8 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
     schedule = validate_tolerance_schedule(tolerance_schedule) if tolerance_schedule is not None else None
     if schedule is not None and set_tolerance is None:
         raise ValueError('A tolerance schedule needs a set_tolerance callable')
+    if int(tolerance_reevaluate) not in (0, 1):
+        raise ValueError('tolerance_reevaluate is 0 or 1')
     center, target, variance = map(np.asarray, (center, target, variance))
     if (center.shape != prior.mean.shape or target.ndim != 1 or variance.shape != target.shape
             or not np.isfinite(center).all() or not np.isfinite(target).all()
@@ -474,6 +480,10 @@ def optimize_member_lm(prior, center, target, variance, evaluate_batch, checkpoi
         if desired >= previous:
             return
         apply_tolerance(desired)
+        if not tolerance_reevaluate:
+            history[-1]['tightened_tolerance'] = desired
+            save()
+            return
         refined = evaluate_points([z])[0]
         if refined is None:
             # The incumbent itself stalls at the tighter tolerance: keep the looser one for this member.

@@ -77,6 +77,8 @@ def main(argv=None):
                         help='New chains: model-error floors on the phase / attenuation standard deviations')
     parser.add_argument('--optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
                         help='MAP optimizer override, e.g. max_seconds=120 or initial_trust=2.0 (repeatable)')
+    parser.add_argument('--first-optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
+                        help="MAP optimizer override for the cold-start point only (repeatable)")
     parser.add_argument('--rh-ranges', type=float, nargs=2, default=None, metavar=('X_FT', 'Z_FT'),
                         help='Prior ln Rh Matern ranges (new chains; default 50 50)')
     parser.add_argument('--latent-ranges', type=float, nargs=2, default=None, metavar=('X_FT', 'Z_FT'),
@@ -120,7 +122,7 @@ def main(argv=None):
     binary_id = hashlib.sha256(args.binary_dir.encode()).hexdigest()[:8]
     solver = [args.solver_grid, args.solver_tolerance, args.evaluation_timeout, args.node_sbatch,
               args.first_map_seconds, args.optimizer_setting, args.accept_time_limit or None, args.adjoint_timeout,
-              args.node_solver]
+              args.node_solver, args.first_optimizer_setting]
     solver_id = ('' if all(value is None for value in solver) else
                  '-s' + hashlib.sha256(json.dumps(solver).encode()).hexdigest()[:6])
     label = args.label or f'ia-{run_dir.name}-{implementation_id()}-b{binary_id}-m{args.map_starts}{solver_id}'
@@ -151,6 +153,8 @@ def main(argv=None):
         command += ['--first-map-seconds', str(args.first_map_seconds)]
     for setting in args.optimizer_setting or []:
         command += ['--optimizer-setting', setting]
+    for setting in args.first_optimizer_setting or []:
+        command += ['--first-optimizer-setting', setting]
     if args.accept_time_limit:
         command += ['--accept-time-limit']
     print(f'{time.strftime("%H:%M:%S")} starting IA controller for {run_dir}', flush=True)

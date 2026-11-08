@@ -260,7 +260,9 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
     node = getattr(args, 'executor', 'slurm') == 'node'
     node_sbatch = getattr(args, 'node_sbatch', None)      # (threads, concurrency): node solves inside sbatch
     first_seconds = getattr(args, 'first_map_seconds', None)
-    first_point = first_seconds is not None and not list(Path(chain).glob('laplace-*.json'))
+    first_settings = getattr(args, 'first_optimizer_setting', None) or []
+    first_point = ((first_seconds is not None or bool(first_settings))
+                   and not list(Path(chain).glob('laplace-*.json')))
 
     def pull():
         retry(lambda: run(['rsync', '-a', '--exclude', 'jobs/', '--exclude', 'deployment.tar.gz',
@@ -287,7 +289,10 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                      *(['--node-solver', *map(str, node_sbatch)] if node_sbatch else []),
                      *(item for setting in (getattr(args, 'optimizer_setting', None) or [])
                        for item in ('--optimizer-setting', setting)),
-                     *(['--optimizer-setting', f'max_seconds={first_seconds}'] if first_point else []),
+                     *(['--optimizer-setting', f'max_seconds={first_seconds}']
+                       if first_point and first_seconds is not None else []),
+                     *(item for setting in (first_settings if first_point else [])
+                       for item in ('--optimizer-setting', setting)),
                      *(['--solver-grid', *map(str, args.solver_grid)] if getattr(args, 'solver_grid', None) else []),
                      *(['--solver-tolerance', str(args.solver_tolerance)]
                        if getattr(args, 'solver_tolerance', None) is not None else []),
@@ -404,6 +409,9 @@ def main(argv=None):
     parser.add_argument('--accept-time-limit', action='store_true',
                         help='Treat a MAP that stopped on its optimizer budget as finished (its best model is '
                              'resampled) instead of resubmitting it: the budget is the design, not an accident')
+    parser.add_argument('--first-optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
+                        help="MAP optimizer override for the chain's first (cold-start) point only, applied after "
+                             '--optimizer-setting (e.g. a looser tolerance_schedule for the cold start; repeatable)')
     parser.add_argument('--first-map-seconds', type=float, default=None,
                         help="Optimizer budget of the chain's first MAP (later points keep --optimizer-setting "
                              'max_seconds): a cold start needs more iterations than warm-started points')

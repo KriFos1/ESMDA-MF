@@ -177,7 +177,14 @@ def test_prepare_laplace_and_sample_build_the_gate_checkpoint(tmp_path, gate_env
                                         optimizer_setting=['tolerance_schedule=[[20,0.01],[6,3e-3],[0,0.001]]']))
     optimizer = json.loads((scheduled / 'study.json').read_text())['optimizer']
     assert optimizer['tolerance_schedule'] == [[20., .01], [6., 3e-3], [0., .001]] and optimizer['candidates'] == 4
-    for bad in ('tolerance_schedule=[[0,0.01],[20,0.001]]', 'tolerance_schedule=nonsense'):
+    quick = tmp_path / 'laplace-run-noreeval'
+    rml.prepare_laplace(SimpleNamespace(run_dir=quick, source=source, binary_dir=None, orientation=None,
+                                        problem=chain / 'laplace-problem-002.npz',
+                                        optimizer_setting=['tolerance_schedule=[[20,0.003],[0,0.001]]',
+                                                           'tolerance_reevaluate=0']))
+    optimizer = json.loads((quick / 'study.json').read_text())['optimizer']
+    assert optimizer['tolerance_reevaluate'] == 0 and optimizer['tolerance_schedule'] == [[20., 3e-3], [0., 1e-3]]
+    for bad in ('tolerance_schedule=[[0,0.01],[20,0.001]]', 'tolerance_schedule=nonsense', 'tolerance_reevaluate=2'):
         with pytest.raises(ValueError):
             rml.prepare_laplace(SimpleNamespace(run_dir=tmp_path / 'bad2', source=source, binary_dir=None,
                                                 orientation=None, problem=chain / 'laplace-problem-002.npz',
@@ -409,6 +416,23 @@ def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, m
     prepare = next(command for command in commands if 'prepare-laplace' in command)
     assert '--binary-dir' not in prepare and '--orientation' not in prepare and '--starts' not in prepare
     assert not {'--solver-grid', '--solver-tolerance', '--evaluation-timeout'} & set(prepare)
+    # Cold-start-only overrides: applied (after the general settings) while the chain has no MAP yet.
+    commands.clear()
+    (tmp_path / 'previous').rename(tmp_path / 'previous2')
+    cold = SimpleNamespace(**{**vars(args), 'optimizer_setting': ['max_seconds=120'],
+                              'first_optimizer_setting': ['tolerance_schedule=[[20,0.01],[0,0.001]]'],
+                              'first_map_seconds': 1200.})
+    (tmp_path / 'chain').mkdir(exist_ok=True)
+    loop.map_stage(cold, tmp_path / 'chain', 7)
+    prepare = next(command for command in commands if 'prepare-laplace' in command)
+    settings = [prepare[i + 1] for i, item in enumerate(prepare) if item == '--optimizer-setting']
+    assert settings == ['max_seconds=120', 'max_seconds=1200.0', 'tolerance_schedule=[[20,0.01],[0,0.001]]']
+    commands.clear()
+    (tmp_path / 'runs' / 'chain-laplace-idx007-test').rename(tmp_path / 'previous3')
+    (tmp_path / 'chain' / 'laplace-006.json').write_text('{}')      # a MAP exists: not the first point
+    loop.map_stage(cold, tmp_path / 'chain', 7)
+    prepare = next(command for command in commands if 'prepare-laplace' in command)
+    assert [prepare[i + 1] for i, item in enumerate(prepare) if item == '--optimizer-setting'] == ['max_seconds=120']
 
 
 def test_multi_start_map_stage_resamples_the_lowest_objective(tmp_path, monkeypatch):

@@ -647,6 +647,28 @@ def test_lm_backs_off_the_tolerance_when_a_whole_round_stalls():
     assert fit['history'][-1]['solver_tolerance'] == 3e-3
 
 
+def test_lm_can_tighten_without_reevaluating_the_incumbent():
+    prior, matrix, target, variance, holder, used = scheduled_case()
+    batches = []
+    def evaluate_batch(models):
+        used.append(holder['tolerance']); batches.append(len(models))
+        return [(matrix @ model, matrix) for model in models]
+    fit = optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, max_iterations=100,
+                             relative_gradient_tolerance=1e-9, stagnation_tolerance=1e-12,
+                             tolerance_schedule=[[20., 1e-2], [1., 3e-3], [0., 1e-3]], tolerance_reevaluate=0,
+                             set_tolerance=lambda value: holder.__setitem__('tolerance', value))
+    tightened = [row for row in fit['history'] if 'tightened_tolerance' in row]
+    assert [row['tightened_tolerance'] for row in tightened] == [3e-3, 1e-3]
+    assert not any('refined_tolerance' in row for row in fit['history'])
+    assert fit['converged'] and fit['solver_tolerance'] == 1e-3
+    # No single-point re-evaluation batches besides the start: every later batch is a round of candidates.
+    assert batches[0] == 1 and all(size == 4 for size in batches[1:])
+    following = fit['history'][fit['history'].index(tightened[0]) + 1]
+    assert following['solver_tolerance'] == 3e-3
+    with pytest.raises(ValueError, match='tolerance_reevaluate'):
+        optimize_member_lm(prior, np.zeros(8), target, variance, evaluate_batch, tolerance_reevaluate=2)
+
+
 def test_lm_rejects_malformed_tolerance_schedules():
     prior, matrix, target, variance, holder, used = scheduled_case()
     evaluate_batch = batch_of(lambda model: (matrix @ model, matrix))
