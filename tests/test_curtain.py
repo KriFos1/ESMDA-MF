@@ -216,6 +216,9 @@ def test_horizontal_length_axis_follows_the_trajectory_not_the_plane(tmp_path, m
     assert to_thl(1000.) == pytest.approx(1000.) and to_plane_thl(to_thl(250.)) == pytest.approx(250.)
     with pytest.raises(ValueError):
         plot_curtain.horizontal_length_map(trajectory, 'measured-depth')
+    to_md, to_plane_md = plot_curtain.horizontal_length_map(trajectory, 'md')
+    assert to_md(0.) == pytest.approx(10000.) and to_md(1000.) == pytest.approx(11000.) and to_md.monotone
+    assert to_plane_md(10500.) == pytest.approx(500.) and plot_curtain.AXIS_LABELS['md'] == 'MD [ft]'
     for axis_kind in ('horizontal-length', 'thl'):
         with pytest.raises(SystemExit):
             plot_curtain.parse_args(['--run-dir', str(tmp_path), '--x-axis', axis_kind])

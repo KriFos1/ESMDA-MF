@@ -74,15 +74,15 @@ def parse_args(argv=None):
     parser.add_argument('--paint', choices=['last', 'nearest-bit'], default='last',
                         help='last: later windows overwrite earlier ones; nearest-bit: each cell comes from '
                              'the window in which it was laterally closest to the bit (at-drilling estimate)')
-    parser.add_argument('--x-axis', choices=['plane', 'horizontal-length', 'thl'], default='plane',
+    parser.add_argument('--x-axis', choices=['plane', 'horizontal-length', 'thl', 'md'], default='plane',
                         help="Horizontal axis labels: 'plane' (the curtain's along-plane X, the projection of the "
                              "well onto its start-to-end vertical plane), 'horizontal-length' (the well's "
-                             'cumulative horizontal path length) or \'thl\' (true horizontal length '
-                             'sqrt(east^2 + north^2) of the trajectory file). The curtain geometry is unchanged, '
-                             'only the tick labels follow the trajectory.')
+                             "cumulative horizontal path length), 'thl' (true horizontal length "
+                             "sqrt(east^2 + north^2) of the trajectory file) or 'md' (measured depth). The "
+                             'curtain geometry is unchanged, only the tick labels follow the trajectory.')
     parser.add_argument('--trajectory', type=Path, default=None,
                         help='Field trajectory (log point, TVD, MD, inclination, azimuth, east, north) for '
-                             '--x-axis horizontal-length / thl')
+                             '--x-axis horizontal-length / thl / md')
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
@@ -291,17 +291,17 @@ def build_curtain(checkpoints, include_variance=False, paint='last'):
     return canvas_rh, canvas_rv, coverage, origin, spacing
 
 
-AXIS_LABELS = {'horizontal-length': 'True horizontal length [ft]', 'thl': 'THL [ft]'}
+AXIS_LABELS = {'horizontal-length': 'True horizontal length [ft]', 'thl': 'THL [ft]', 'md': 'MD [ft]'}
 
 
 def horizontal_length_map(trajectory, definition='horizontal-length'):
     """Map the curtain's along-plane X [ft] to a horizontal length along the well [ft].
 
     Both come from the field trajectory: X is the projection of the east/north position onto
-    the start-to-end direction (the curtain plane). ``'horizontal-length'`` is the cumulative
+    the start-to-end direction (the curtain plane).     ``'horizontal-length'`` is the cumulative
     horizontal distance travelled (cross-track excursions included, zero at the first logging
     point); ``'thl'`` is the true horizontal length sqrt(east^2 + north^2) of the trajectory's
-    coordinates. Linear interpolation between logging points, slope-one extrapolation beyond
+    coordinates; ``'md'`` is the measured depth column. Linear interpolation between logging points, slope-one extrapolation beyond
     the well's ends.
     """
     from field_trajectory import FEET_PER_METER, along_well_trajectory, read_trajectory
@@ -310,6 +310,8 @@ def horizontal_length_map(trajectory, definition='horizontal-length'):
     x = well['X'][:, 0] * FEET_PER_METER
     if definition == 'thl':
         length = np.hypot(values[:, 5], values[:, 6])
+    elif definition == 'md':
+        length = values[:, 2].copy()
     elif definition == 'horizontal-length':
         steps = np.linalg.norm(np.diff(values[:, 5:7], axis=0), axis=1)
         length = np.concatenate([[0.], np.cumsum(steps)])
