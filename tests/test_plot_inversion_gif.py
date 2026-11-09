@@ -28,14 +28,22 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
     write_trajectory(trajectory)
     with pytest.raises(SystemExit):
         gif.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'md'])
+    lwd = tmp_path / 'LWD_resistivity.txt'
+    lwd.write_text('% logpt Res1 Res2\n1 2.0 4.0\n2 20.0 40.0\n3 200.0 400.0\n')
+    with pytest.raises(SystemExit):
+        gif.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--lwd', str(lwd)])
     args = gif.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'md',
-                           '--trajectory', str(trajectory), '--dpi', '25', '--output', str(tmp_path / 'out.gif')])
+                           '--trajectory', str(trajectory), '--lwd', str(lwd), '--dpi', '25',
+                           '--output', str(tmp_path / 'out.gif')])
     monkeypatch.setattr(gif, 'load_benchmark', lambda *a: pytest.fail('loaded a benchmark'))
-    titles = []
+    titles, red_lines = [], []
     import matplotlib.pyplot as plt
     savefig = plt.Figure.savefig
     def inspect(fig, *a, **k):
         titles.append((fig._suptitle.get_text(), [axis.get_xlabel() for axis in fig.axes]))
+        profile = fig.axes[-2]       # the Rh bit-column panel
+        red_lines.append([(line.get_xdata().tolist(), line.get_ydata().tolist()) for line in profile.get_lines()
+                          if line.get_color() == 'red'])
         return savefig(fig, *a, **k)
     monkeypatch.setattr(plt.Figure, 'savefig', inspect)
     output, count = gif.render(args)
@@ -45,6 +53,10 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
         assert image.n_frames == 3
     # The bit of point 1 sits at plane x = 107.5 ft (window centre); its MD label follows the trajectory.
     assert 'MD = 10108 ft' in titles[1][0] and 'MD [ft]' in titles[1][1]
+    # Frame 1 draws the LWD log of points 0-1 (Res1 solid, Res2 dashed) in red against the trajectory TVD.
+    assert red_lines[1][0] == ([pytest.approx(np.log10(2.)), pytest.approx(np.log10(20.))], [8000., 8001.])
+    assert red_lines[1][1][0] == [pytest.approx(np.log10(4.)), pytest.approx(np.log10(40.))]
+    assert len(red_lines[2][0][0]) == 3
 
 
 def test_benchmark_gif_still_requires_no_trajectory(tmp_path):

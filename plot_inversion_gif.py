@@ -47,7 +47,11 @@ def parse_args(argv=None):
     parser.add_argument('--x-axis', choices=['plane', 'horizontal-length', 'thl', 'md'], default='plane',
                         help="Horizontal axis labels (see plot_curtain.py); the geometry stays in the curtain plane")
     parser.add_argument('--trajectory', type=Path, default=None,
-                        help='Field trajectory file for --x-axis horizontal-length / thl / md')
+                        help='Field trajectory file for --x-axis horizontal-length / thl / md and --lwd')
+    parser.add_argument('--lwd', type=Path, default=None,
+                        help='LWD_resistivity.txt (log point, Res1, Res2): drawn in red in the bit-column panels, '
+                             'the log so far against the trajectory TVD and the current point at the bit '
+                             '(needs --trajectory)')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
     parser.add_argument('--uncertainty-white-threshold', type=float, default=.35)
@@ -59,7 +63,19 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.x_axis != 'plane' and args.trajectory is None:
         parser.error(f'--x-axis {args.x_axis} needs --trajectory')
+    if args.lwd is not None and args.trajectory is None:
+        parser.error('--lwd needs --trajectory (TVD of the logging points)')
     return args
+
+
+def lwd_log(lwd, trajectory):
+    """log10 LWD resistivities (points x 2) and the TVD of each logging point."""
+    from field_trajectory import read_trajectory
+    values = np.loadtxt(lwd, comments='%', ndmin=2)
+    tvd = read_trajectory(trajectory)[:, 1]
+    if values.shape != (len(tvd), 3) or np.any(values[:, 1:] <= 0):
+        raise ValueError('LWD rows must match the trajectory logging points with positive resistivities')
+    return np.log10(values[:, 1:]), tvd
 
 
 def checkpoint_paths(run_dir):
@@ -152,6 +168,11 @@ def render(args):
     else:
         profile_limits = {key: (float(min(np.percentile(f['samples'][key], 1) for f in frames)) - .3,
                                 float(max(np.percentile(f['samples'][key], 99) for f in frames)) + .3) for key in KEYS}
+    lwd = lwd_log(args.lwd, args.trajectory) if getattr(args, 'lwd', None) else None
+    if lwd is not None:
+        lwd_values, lwd_tvd = lwd
+        profile_limits = {key: (min(limits[0], float(lwd_values.min()) - .1), max(limits[1], float(lwd_values.max()) + .1))
+                          for key, limits in profile_limits.items()}
     x_axis = getattr(args, 'x_axis', 'plane')
     length_maps = horizontal_length_map(args.trajectory, x_axis) if x_axis != 'plane' else None
     position_label = AXIS_LABELS.get(x_axis, 'X [ft]')
@@ -207,6 +228,15 @@ def render(args):
                 axis.step(mean, depth, where='mid', color='k', lw=1.4, label='ensemble mean')
                 if reference is not None:
                     axis.plot(np.log10(reference[key][:, ref_column]), ref_z, color='red', lw=1.4, label='benchmark')
+                if lwd is not None:
+                    # The LWD log along the well so far (logging points 0..current) against the trajectory TVD,
+                    # and the current point's two readings at the bit.
+                    points = [m['index'] for m in meta[:number + 1]]
+                    for column, style, label in ((0, '-', 'LWD Res1 (log so far)'), (1, '--', 'LWD Res2')):
+                        axis.plot(lwd_values[points, column], lwd_tvd[points], color='red', ls=style, lw=1.,
+                                  alpha=.8, label=label)
+                    axis.scatter(lwd_values[current['index']], [lwd_tvd[current['index']]] * 2, color='red',
+                                 marker='o', s=28, zorder=6, label='LWD at the bit')
                 axis.axhline(bit_z, color=FIDELITY_COLORS[current['fidelity']], ls=':', lw=1.4, label='bit TVD')
                 axis.set_xlim(*profile_limits[key])
                 axis.set_ylim(z_bottom, z_top)
