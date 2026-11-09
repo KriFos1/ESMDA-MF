@@ -74,19 +74,20 @@ def parse_args(argv=None):
     parser.add_argument('--paint', choices=['last', 'nearest-bit'], default='last',
                         help='last: later windows overwrite earlier ones; nearest-bit: each cell comes from '
                              'the window in which it was laterally closest to the bit (at-drilling estimate)')
-    parser.add_argument('--x-axis', choices=['plane', 'horizontal-length'], default='plane',
+    parser.add_argument('--x-axis', choices=['plane', 'horizontal-length', 'thl'], default='plane',
                         help="Horizontal axis labels: 'plane' (the curtain's along-plane X, the projection of the "
-                             "well onto its start-to-end vertical plane) or 'horizontal-length' (the well's true "
-                             'horizontal path length from the trajectory file; the curtain geometry is unchanged, '
-                             'only the tick labels follow the trajectory)')
+                             "well onto its start-to-end vertical plane), 'horizontal-length' (the well's "
+                             'cumulative horizontal path length) or \'thl\' (true horizontal length '
+                             'sqrt(east^2 + north^2) of the trajectory file). The curtain geometry is unchanged, '
+                             'only the tick labels follow the trajectory.')
     parser.add_argument('--trajectory', type=Path, default=None,
                         help='Field trajectory (log point, TVD, MD, inclination, azimuth, east, north) for '
-                             '--x-axis horizontal-length')
+                             '--x-axis horizontal-length / thl')
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
-    if args.x_axis == 'horizontal-length' and args.trajectory is None:
-        parser.error('--x-axis horizontal-length needs --trajectory')
+    if args.x_axis != 'plane' and args.trajectory is None:
+        parser.error(f'--x-axis {args.x_axis} needs --trajectory')
     if (args.dpi < 20 or args.interval <= 0 or args.margin_ft < 0
             or not 0 < args.uncertainty_percentile <= 100
             or not 0 <= args.uncertainty_strength <= 1
@@ -290,22 +291,33 @@ def build_curtain(checkpoints, include_variance=False, paint='last'):
     return canvas_rh, canvas_rv, coverage, origin, spacing
 
 
-def horizontal_length_map(trajectory):
-    """Map the curtain's along-plane X [ft] to the well's true horizontal path length [ft].
+AXIS_LABELS = {'horizontal-length': 'True horizontal length [ft]', 'thl': 'THL [ft]'}
+
+
+def horizontal_length_map(trajectory, definition='horizontal-length'):
+    """Map the curtain's along-plane X [ft] to a horizontal length along the well [ft].
 
     Both come from the field trajectory: X is the projection of the east/north position onto
-    the start-to-end direction (the curtain plane), the length is the cumulative horizontal
-    distance actually travelled (cross-track excursions included). Linear interpolation
-    between logging points, slope-one extrapolation beyond the well's ends.
+    the start-to-end direction (the curtain plane). ``'horizontal-length'`` is the cumulative
+    horizontal distance travelled (cross-track excursions included, zero at the first logging
+    point); ``'thl'`` is the true horizontal length sqrt(east^2 + north^2) of the trajectory's
+    coordinates. Linear interpolation between logging points, slope-one extrapolation beyond
+    the well's ends.
     """
     from field_trajectory import FEET_PER_METER, along_well_trajectory, read_trajectory
     values = read_trajectory(trajectory)
     well, _ = along_well_trajectory(values)
     x = well['X'][:, 0] * FEET_PER_METER
-    steps = np.linalg.norm(np.diff(values[:, 5:7], axis=0), axis=1)
-    length = np.concatenate([[0.], np.cumsum(steps)])
+    if definition == 'thl':
+        length = np.hypot(values[:, 5], values[:, 6])
+    elif definition == 'horizontal-length':
+        steps = np.linalg.norm(np.diff(values[:, 5:7], axis=0), axis=1)
+        length = np.concatenate([[0.], np.cumsum(steps)])
+    else:
+        raise ValueError(f'Unknown horizontal length definition {definition!r}')
     if np.any(np.diff(x) <= 0):
         raise ValueError('The along-plane coordinate must increase along the well to relabel the axis')
+    monotone = bool(np.all(np.diff(length) > 0))
 
     def to_length(plane_x):
         plane_x = np.asarray(plane_x, dtype=float)
@@ -314,23 +326,39 @@ def horizontal_length_map(trajectory):
                         np.where(plane_x > x[-1], length[-1] + (plane_x - x[-1]), inside))
 
     def to_plane(horizontal_length):
+        """Inverse of ``to_length``; only defined when the length increases along the well."""
+        if not monotone:
+            raise ValueError('The length is not monotone along the well: no inverse mapping')
         horizontal_length = np.asarray(horizontal_length, dtype=float)
         inside = np.interp(horizontal_length, length, x)
         return np.where(horizontal_length < length[0], x[0] + (horizontal_length - length[0]),
                         np.where(horizontal_length > length[-1], x[-1] + (horizontal_length - length[-1]), inside))
 
+    to_length.monotone = monotone
     return to_length, to_plane
 
 
-def label_horizontal_length(axis, to_length, to_plane):
-    """Tick the along-plane axis at round values of the true horizontal length."""
+def label_horizontal_length(axis, to_length, to_plane, label='True horizontal length [ft]'):
+    """Tick the along-plane axis in horizontal-length units.
+
+    A monotone length gets ticks at round length values; a length that is not monotone along
+    the well (e.g. THL when the well first approaches the coordinate origin) keeps the axis's
+    own tick positions and labels each with the length there, so the labels can decrease and
+    increase again along the axis.
+    """
     from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator
     x0, x1 = sorted(axis.get_xlim())
-    lengths = MaxNLocator(nbins=7, steps=[1, 2, 2.5, 5, 10]).tick_values(*to_length([x0, x1]))
-    lengths = lengths[(lengths >= to_length(x0)) & (lengths <= to_length(x1))]
-    axis.xaxis.set_major_locator(FixedLocator(to_plane(lengths)))
-    axis.xaxis.set_major_formatter(FixedFormatter([f'{value:g}' for value in lengths]))
-    axis.set_xlabel('True horizontal length [ft]')
+    if getattr(to_length, 'monotone', True):
+        lengths = MaxNLocator(nbins=7, steps=[1, 2, 2.5, 5, 10]).tick_values(*to_length([x0, x1]))
+        lengths = lengths[(lengths >= to_length(x0)) & (lengths <= to_length(x1))]
+        positions = to_plane(lengths)
+    else:
+        positions = np.asarray(axis.get_xticks(), dtype=float)
+        positions = positions[(positions >= x0) & (positions <= x1)]
+        lengths = to_length(positions)
+    axis.xaxis.set_major_locator(FixedLocator(positions))
+    axis.xaxis.set_major_formatter(FixedFormatter([f'{value:.0f}' for value in lengths]))
+    axis.set_xlabel(label)
 
 
 def centers_to_edges(centers):
@@ -384,8 +412,8 @@ def render(checkpoints, args):
     well_z = np.array([result["shift_ft"]["z"] + result["dims"][2] / 2 * spacing[1]
                        for _, result in checkpoints])
     fidelities = [fidelity_of(result) for _, result in checkpoints]
-    length_maps = (horizontal_length_map(args.trajectory)
-                   if getattr(args, 'x_axis', 'plane') == 'horizontal-length' else None)
+    x_axis = getattr(args, 'x_axis', 'plane')
+    length_maps = horizontal_length_map(args.trajectory, x_axis) if x_axis != 'plane' else None
 
     n_panels = 3 if reference else 2
     fig = plt.figure(figsize=(16 if reference else 12, 9))
@@ -435,7 +463,7 @@ def render(checkpoints, args):
             axis.set_xlim(x_edges[0], x_edges[-1])
             axis.set_ylim(z_edges[-1], z_edges[0])
         if length_maps is not None:
-            label_horizontal_length(axis, *length_maps)
+            label_horizontal_length(axis, *length_maps, label=AXIS_LABELS[x_axis])
     axes[0].set_ylabel("TVD [ft]")
     axes[0].legend(loc="upper right", fontsize=8, framealpha=.7)
     if uncertainty_enabled:

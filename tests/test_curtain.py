@@ -210,8 +210,36 @@ def test_horizontal_length_axis_follows_the_trajectory_not_the_plane(tmp_path, m
     assert to_length(0.) == pytest.approx(0.) and to_length(1000.) == pytest.approx(10 * step)
     assert to_length(50.) == pytest.approx(step / 2) and to_plane(to_length(333.)) == pytest.approx(333.)
     assert to_length(-20.) == pytest.approx(-20.) and to_length(1020.) == pytest.approx(10 * step + 20.)
-    with pytest.raises(SystemExit):
-        plot_curtain.parse_args(['--run-dir', str(tmp_path), '--x-axis', 'horizontal-length'])
+    # THL: sqrt(east^2 + north^2) of the trajectory coordinates (the well starts 100 ft from the origin here).
+    to_thl, to_plane_thl = plot_curtain.horizontal_length_map(trajectory, 'thl')
+    assert to_thl(0.) == pytest.approx(0.) and to_thl(100.) == pytest.approx(np.hypot(100., 30.))
+    assert to_thl(1000.) == pytest.approx(1000.) and to_plane_thl(to_thl(250.)) == pytest.approx(250.)
+    with pytest.raises(ValueError):
+        plot_curtain.horizontal_length_map(trajectory, 'measured-depth')
+    for axis_kind in ('horizontal-length', 'thl'):
+        with pytest.raises(SystemExit):
+            plot_curtain.parse_args(['--run-dir', str(tmp_path), '--x-axis', axis_kind])
+    thl_args = plot_curtain.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'thl',
+                                        '--trajectory', str(trajectory)])
+    assert thl_args.x_axis == 'thl' and plot_curtain.AXIS_LABELS['thl'] == 'THL [ft]'
+    # A well that first approaches the coordinate origin: THL decreases then increases, so the axis keeps
+    # its own tick positions and labels them with the THL there (the IA well does this over its first 71 points).
+    rows = [[point + 1, 8000. + point, 10000. + 100. * point, 85., 90., -500. + 100. * point, 50.] for point in range(11)]
+    folded = tmp_path / 'folded.DAT'
+    folded.write_text('% header\n' + '\n'.join(' '.join(f'{v:.4f}' for v in row) for row in rows) + '\n')
+    to_thl, to_plane_thl = plot_curtain.horizontal_length_map(folded, 'thl')
+    assert not to_thl.monotone and to_thl(0.) == pytest.approx(np.hypot(500., 50.))
+    assert to_thl(500.) == pytest.approx(50.) and to_thl(1000.) == pytest.approx(np.hypot(500., 50.))
+    with pytest.raises(ValueError):
+        to_plane_thl(100.)
+    fig, axis = plt.subplots()
+    axis.set_xlim(0., 1000.)
+    plot_curtain.label_horizontal_length(axis, to_thl, to_plane_thl, label='THL [ft]')
+    fig.canvas.draw()
+    ticks = [(float(tick), text.get_text()) for tick, text in zip(axis.get_xticks(), axis.get_xticklabels())]
+    assert ticks and all(float(text) == pytest.approx(to_thl(tick), abs=.5) for tick, text in ticks)
+    assert axis.get_xlabel() == 'THL [ft]'
+    plt.close(fig)
     args = plot_curtain.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'horizontal-length',
                                     '--trajectory', str(trajectory)])
     ensemble = np.array([[0., .2, .4, .6, .1, .1, .1, .1], [.1, .3, .5, .7, .2, .2, .2, .2]])
