@@ -36,14 +36,19 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
                            '--trajectory', str(trajectory), '--lwd', str(lwd), '--dpi', '25',
                            '--output', str(tmp_path / 'out.gif')])
     monkeypatch.setattr(gif, 'load_benchmark', lambda *a: pytest.fail('loaded a benchmark'))
-    titles, red_lines = [], []
+    titles, red_dots = [], []
     import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
     savefig = plt.Figure.savefig
     def inspect(fig, *a, **k):
         titles.append((fig._suptitle.get_text(), [axis.get_xlabel() for axis in fig.axes]))
-        profile = fig.axes[-2]       # the Rh bit-column panel
-        red_lines.append([(line.get_xdata().tolist(), line.get_ydata().tolist()) for line in profile.get_lines()
-                          if line.get_color() == 'red'])
+        dots = {}
+        for name, profile in zip(('Rh', 'Rv'), fig.axes[-2:]):          # the Rh and Rv bit-column panels
+            red = [c for c in profile.collections if hasattr(c, 'get_offsets') and len(c.get_offsets())
+                   and tuple(c.get_facecolor()[0]) == to_rgba('red')]
+            dots[name] = [tuple(map(float, offset)) for c in red for offset in c.get_offsets()]
+            assert not [line for line in profile.get_lines() if line.get_color() == 'red']       # no red line
+        red_dots.append(dots)
         return savefig(fig, *a, **k)
     monkeypatch.setattr(plt.Figure, 'savefig', inspect)
     output, count = gif.render(args)
@@ -53,10 +58,9 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
         assert image.n_frames == 3
     # The bit of point 1 sits at plane x = 107.5 ft (window centre); its MD label follows the trajectory.
     assert 'MD = 10108 ft' in titles[1][0] and 'MD [ft]' in titles[1][1]
-    # Frame 1 draws the LWD log of points 0-1 (Res1 solid, Res2 dashed) in red against the trajectory TVD.
-    assert red_lines[1][0] == ([pytest.approx(np.log10(2.)), pytest.approx(np.log10(20.))], [8000., 8001.])
-    assert red_lines[1][1][0] == [pytest.approx(np.log10(4.)), pytest.approx(np.log10(40.))]
-    assert len(red_lines[2][0][0]) == 3
+    # Frame 1: one red dot per panel at the bit TVD, Res1 (LWD Rh) in the Rh panel, Res2 (LWD Rv) in the Rv panel.
+    assert red_dots[1]['Rh'] == [(pytest.approx(np.log10(20.)), 8001.)]
+    assert red_dots[1]['Rv'] == [(pytest.approx(np.log10(40.)), 8001.)]
 
 
 def test_benchmark_gif_still_requires_no_trajectory(tmp_path):

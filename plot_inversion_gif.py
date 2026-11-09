@@ -49,8 +49,8 @@ def parse_args(argv=None):
     parser.add_argument('--trajectory', type=Path, default=None,
                         help='Field trajectory file for --x-axis horizontal-length / thl / md and --lwd')
     parser.add_argument('--lwd', type=Path, default=None,
-                        help='LWD_resistivity.txt (log point, Res1, Res2): drawn in red in the bit-column panels, '
-                             'the log so far against the trajectory TVD and the current point at the bit '
+                        help='LWD_resistivity.txt (log point, Res1 = LWD Rh, Res2 = LWD Rv): the current point\'s '
+                             'reading is drawn as a red dot at the bit TVD in the Rh and Rv bit-column panels '
                              '(needs --trajectory)')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
@@ -69,7 +69,7 @@ def parse_args(argv=None):
 
 
 def lwd_log(lwd, trajectory):
-    """log10 LWD resistivities (points x 2) and the TVD of each logging point."""
+    """log10 LWD resistivities (points x 2: Rh, Rv) and the TVD of each logging point."""
     from field_trajectory import read_trajectory
     values = np.loadtxt(lwd, comments='%', ndmin=2)
     tvd = read_trajectory(trajectory)[:, 1]
@@ -229,14 +229,9 @@ def render(args):
                 if reference is not None:
                     axis.plot(np.log10(reference[key][:, ref_column]), ref_z, color='red', lw=1.4, label='benchmark')
                 if lwd is not None:
-                    # The LWD log along the well so far (logging points 0..current) against the trajectory TVD,
-                    # and the current point's two readings at the bit.
-                    points = [m['index'] for m in meta[:number + 1]]
-                    for column, style, label in ((0, '-', 'LWD Res1 (log so far)'), (1, '--', 'LWD Res2')):
-                        axis.plot(lwd_values[points, column], lwd_tvd[points], color='red', ls=style, lw=1.,
-                                  alpha=.8, label=label)
-                    axis.scatter(lwd_values[current['index']], [lwd_tvd[current['index']]] * 2, color='red',
-                                 marker='o', s=28, zorder=6, label='LWD at the bit')
+                    # The LWD reading at the bit: Res1 is the LWD Rh, Res2 the LWD Rv.
+                    axis.scatter([lwd_values[current['index'], KEYS.index(key)]], [lwd_tvd[current['index']]],
+                                 color='red', marker='o', s=36, zorder=6, label=f'LWD {key} at the bit')
                 axis.axhline(bit_z, color=FIDELITY_COLORS[current['fidelity']], ls=':', lw=1.4, label='bit TVD')
                 axis.set_xlim(*profile_limits[key])
                 axis.set_ylim(z_bottom, z_top)
