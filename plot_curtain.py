@@ -49,8 +49,11 @@ def parse_args(argv=None):
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True, help="Sequential run output directory")
-    parser.add_argument("--benchmark", type=Path, default=here.parent / "Dashboard/benchmarks/Benchmark-3",
-                        help="Benchmark root for the reference curtain (blank string disables)")
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument("--benchmark", type=Path, default=here.parent / "Dashboard/benchmarks/Benchmark-3",
+                           help="Benchmark root for the reference curtain")
+    reference.add_argument("--no-benchmark", action="store_const", const=None, dest="benchmark",
+                           help="Omit the reference-model panel entirely")
     parser.add_argument("--output", type=Path, default=None, help="Output image (default <run-dir>/curtain.png)")
     parser.add_argument("--margin-ft", type=float, default=50., help="Curtain margin around the well")
     parser.add_argument("--dpi", type=int, default=150)
@@ -71,9 +74,19 @@ def parse_args(argv=None):
     parser.add_argument('--paint', choices=['last', 'nearest-bit'], default='last',
                         help='last: later windows overwrite earlier ones; nearest-bit: each cell comes from '
                              'the window in which it was laterally closest to the bit (at-drilling estimate)')
+    parser.add_argument('--x-axis', choices=['plane', 'horizontal-length'], default='plane',
+                        help="Horizontal axis labels: 'plane' (the curtain's along-plane X, the projection of the "
+                             "well onto its start-to-end vertical plane) or 'horizontal-length' (the well's true "
+                             'horizontal path length from the trajectory file; the curtain geometry is unchanged, '
+                             'only the tick labels follow the trajectory)')
+    parser.add_argument('--trajectory', type=Path, default=None,
+                        help='Field trajectory (log point, TVD, MD, inclination, azimuth, east, north) for '
+                             '--x-axis horizontal-length')
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
+    if args.x_axis == 'horizontal-length' and args.trajectory is None:
+        parser.error('--x-axis horizontal-length needs --trajectory')
     if (args.dpi < 20 or args.interval <= 0 or args.margin_ft < 0
             or not 0 < args.uncertainty_percentile <= 100
             or not 0 <= args.uncertainty_strength <= 1
@@ -277,6 +290,49 @@ def build_curtain(checkpoints, include_variance=False, paint='last'):
     return canvas_rh, canvas_rv, coverage, origin, spacing
 
 
+def horizontal_length_map(trajectory):
+    """Map the curtain's along-plane X [ft] to the well's true horizontal path length [ft].
+
+    Both come from the field trajectory: X is the projection of the east/north position onto
+    the start-to-end direction (the curtain plane), the length is the cumulative horizontal
+    distance actually travelled (cross-track excursions included). Linear interpolation
+    between logging points, slope-one extrapolation beyond the well's ends.
+    """
+    from field_trajectory import FEET_PER_METER, along_well_trajectory, read_trajectory
+    values = read_trajectory(trajectory)
+    well, _ = along_well_trajectory(values)
+    x = well['X'][:, 0] * FEET_PER_METER
+    steps = np.linalg.norm(np.diff(values[:, 5:7], axis=0), axis=1)
+    length = np.concatenate([[0.], np.cumsum(steps)])
+    if np.any(np.diff(x) <= 0):
+        raise ValueError('The along-plane coordinate must increase along the well to relabel the axis')
+
+    def to_length(plane_x):
+        plane_x = np.asarray(plane_x, dtype=float)
+        inside = np.interp(plane_x, x, length)
+        return np.where(plane_x < x[0], length[0] + (plane_x - x[0]),
+                        np.where(plane_x > x[-1], length[-1] + (plane_x - x[-1]), inside))
+
+    def to_plane(horizontal_length):
+        horizontal_length = np.asarray(horizontal_length, dtype=float)
+        inside = np.interp(horizontal_length, length, x)
+        return np.where(horizontal_length < length[0], x[0] + (horizontal_length - length[0]),
+                        np.where(horizontal_length > length[-1], x[-1] + (horizontal_length - length[-1]), inside))
+
+    return to_length, to_plane
+
+
+def label_horizontal_length(axis, to_length, to_plane):
+    """Tick the along-plane axis at round values of the true horizontal length."""
+    from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator
+    x0, x1 = sorted(axis.get_xlim())
+    lengths = MaxNLocator(nbins=7, steps=[1, 2, 2.5, 5, 10]).tick_values(*to_length([x0, x1]))
+    lengths = lengths[(lengths >= to_length(x0)) & (lengths <= to_length(x1))]
+    axis.xaxis.set_major_locator(FixedLocator(to_plane(lengths)))
+    axis.xaxis.set_major_formatter(FixedFormatter([f'{value:g}' for value in lengths]))
+    axis.set_xlabel('True horizontal length [ft]')
+
+
 def centers_to_edges(centers):
     centers = np.asarray(centers, dtype=float).ravel()
     edges = np.empty(centers.size + 1)
@@ -328,10 +384,13 @@ def render(checkpoints, args):
     well_z = np.array([result["shift_ft"]["z"] + result["dims"][2] / 2 * spacing[1]
                        for _, result in checkpoints])
     fidelities = [fidelity_of(result) for _, result in checkpoints]
+    length_maps = (horizontal_length_map(args.trajectory)
+                   if getattr(args, 'x_axis', 'plane') == 'horizontal-length' else None)
 
-    fig = plt.figure(figsize=(16, 9))
-    grid = fig.add_gridspec(2, 3, height_ratios=[3.2, 1], hspace=0.25, wspace=0.12)
-    axes = [fig.add_subplot(grid[0, column]) for column in range(3)]
+    n_panels = 3 if reference else 2
+    fig = plt.figure(figsize=(16 if reference else 12, 9))
+    grid = fig.add_gridspec(2, n_panels, height_ratios=[3.2, 1], hspace=0.25, wspace=0.12)
+    axes = [fig.add_subplot(grid[0, column]) for column in range(n_panels)]
     misfit_axis = fig.add_subplot(grid[1, :])
 
     true_field = reference["rh"] if reference else None
@@ -343,15 +402,13 @@ def render(checkpoints, args):
     shared = dict(cmap=cmap, vmin=vmin, vmax=vmax)
     value_norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
 
-    panels = [("Reference log10 Rh", np.log10(true_field), reference["x_edges"], reference["z_edges"]) if reference
-              else ("Reference log10 Rh (unavailable)", None, x_edges, z_edges),
-               (f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rh", np.log10(np.exp(canvas_rh)).T, x_edges, z_edges),
-               (f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rv", np.log10(np.exp(canvas_rv)).T, x_edges, z_edges)]
+    panels = [(f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rh", np.log10(np.exp(canvas_rh)).T, x_edges, z_edges),
+                (f"{getattr(args, 'estimate_label', 'Estimated')} log10 Rv", np.log10(np.exp(canvas_rv)).T, x_edges, z_edges)]
+    if reference:
+        panels.insert(0, ("Reference log10 Rh", np.log10(true_field), reference["x_edges"], reference["z_edges"]))
     for panel_index, (axis, (title, field, xedge, zedge)) in enumerate(zip(axes, panels)):
-        if field is None:
-            axis.text(.5, .5, "no benchmark", ha="center", va="center", transform=axis.transAxes)
-        elif uncertainty_enabled and panel_index in (1, 2):
-            variance = (variance_rh if panel_index == 1 else variance_rv).T
+        if uncertainty_enabled and (not reference or panel_index > 0):
+            variance = (variance_rh if panel_index == int(bool(reference)) else variance_rv).T
             rgba = uncertainty_rgba(field, variance, cmap, value_norm, variance_scale,
                                     args.uncertainty_strength,
                                     args.uncertainty_white_threshold)
@@ -377,6 +434,8 @@ def render(checkpoints, args):
         if getattr(args, 'shared_extents', False):
             axis.set_xlim(x_edges[0], x_edges[-1])
             axis.set_ylim(z_edges[-1], z_edges[0])
+        if length_maps is not None:
+            label_horizontal_length(axis, *length_maps)
     axes[0].set_ylabel("TVD [ft]")
     axes[0].legend(loc="upper right", fontsize=8, framealpha=.7)
     if uncertainty_enabled:

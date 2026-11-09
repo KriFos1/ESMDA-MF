@@ -172,3 +172,62 @@ def test_trimmed_and_cached_checkpoints_render_the_same_curtain(tmp_path, monkey
     monkeypatch.setattr(plot_curtain.pickle, 'load', lambda stream: loads.append(1) or real_load(stream))
     assert [index for index, _ in plot_curtain.load_checkpoints(tmp_path, cache)] == [0, 1, 2]
     assert loads == []                                     # unchanged files come from the cache
+
+
+def test_no_benchmark_renders_two_estimate_panels(tmp_path, monkeypatch):
+    import plot_curtain
+
+    args = plot_curtain.parse_args(['--run-dir', str(tmp_path), '--no-benchmark',
+                                    '--uncertainty-lightness'])
+    ensemble = np.array([[0., .2, .4, .6, .1, .1, .1, .1],
+                         [.1, .3, .5, .7, .2, .2, .2, .2]])
+    result = {'dims': (2, 1, 2), 'spacing_ft': (5., 5., 5.),
+              'shift_ft': {'x': 0., 'z': 0.}, 'posterior_params': ensemble,
+              'selected_fidelity': '1D'}
+    captured = []
+    savefig = plt.Figure.savefig
+    def inspect(fig, *args, **kwargs):
+        captured.extend(axis.get_title() for axis in fig.axes)
+        return savefig(fig, *args, **kwargs)
+    monkeypatch.setattr(plt.Figure, 'savefig', inspect)
+    monkeypatch.setattr(plot_curtain, 'load_reference', lambda *args: pytest.fail('loaded a reference'))
+    assert plot_curtain.render([(0, result)], args).is_file()
+    assert [title for title in captured if title] == ['Estimated log10 Rh', 'Estimated log10 Rv']
+
+
+def test_horizontal_length_axis_follows_the_trajectory_not_the_plane(tmp_path, monkeypatch):
+    import plot_curtain
+    # A well heading east with a northward zigzag: the plane X is the east coordinate, the true
+    # horizontal length is longer by the zigzag.
+    rows = []
+    for point in range(11):
+        east, north = 100. * point, (30. if point % 2 else 0.)
+        rows.append([point + 1, 8000. + point, 10000. + 100. * point, 85., 90., east, north])
+    trajectory = tmp_path / 'trajectory.DAT'
+    trajectory.write_text('% header\n' + '\n'.join(' '.join(f'{v:.4f}' for v in row) for row in rows) + '\n')
+    to_length, to_plane = plot_curtain.horizontal_length_map(trajectory)
+    step = np.hypot(100., 30.)
+    assert to_length(0.) == pytest.approx(0.) and to_length(1000.) == pytest.approx(10 * step)
+    assert to_length(50.) == pytest.approx(step / 2) and to_plane(to_length(333.)) == pytest.approx(333.)
+    assert to_length(-20.) == pytest.approx(-20.) and to_length(1020.) == pytest.approx(10 * step + 20.)
+    with pytest.raises(SystemExit):
+        plot_curtain.parse_args(['--run-dir', str(tmp_path), '--x-axis', 'horizontal-length'])
+    args = plot_curtain.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'horizontal-length',
+                                    '--trajectory', str(trajectory)])
+    ensemble = np.array([[0., .2, .4, .6, .1, .1, .1, .1], [.1, .3, .5, .7, .2, .2, .2, .2]])
+    checkpoints = [(index, {'dims': (2, 1, 2), 'spacing_ft': (5., 5., 5.), 'shift_ft': {'x': 100. * index, 'z': 0.},
+                            'posterior_params': ensemble, 'selected_fidelity': '1D'}) for index in range(11)]
+    labels, xlabels = [], []
+    savefig = plt.Figure.savefig
+    def inspect(fig, *a, **k):
+        fig.canvas.draw()
+        for axis in fig.axes[:2]:
+            labels.append([(float(tick), text.get_text()) for tick, text in zip(axis.get_xticks(), axis.get_xticklabels())])
+            xlabels.append(axis.get_xlabel())
+        return savefig(fig, *a, **k)
+    monkeypatch.setattr(plt.Figure, 'savefig', inspect)
+    assert plot_curtain.render(checkpoints, args).is_file()
+    assert xlabels[:2] == ['True horizontal length [ft]'] * 2
+    for tick, text in labels[0]:
+        assert float(text) == pytest.approx(to_length(tick), abs=1e-6)       # label = true length at that position
+    assert any(float(text) > tick + 1. for tick, text in labels[0] if tick > 100.)   # longer than the plane X
