@@ -29,7 +29,7 @@ Rh and Rv alike (values outside take the end colours). With the linear scale the
 bit-column panels are in ohm m too, on a logarithmic axis. ``--inversion-speed``
 prints, for every logging point, how fast its 2D inversion advanced along the
 well: the MD step from the previous logging point over the time its 2D MAP took
-to solve, in m/s.
+to solve, in m/h.
 """
 
 import argparse
@@ -97,7 +97,7 @@ def parse_args(argv=None):
                         help='Resistivity [ohm m] at the two ends of the colour scale, for Rh and Rv and all frames '
                              '(default: 2nd and 98th percentile of the benchmark, or of the final curtain)')
     parser.add_argument('--inversion-speed', action='store_true',
-                        help='Print the 2D inversion speed of every logging point [m/s]: its MD step from the '
+                        help='Print the 2D inversion speed of every logging point [m/h]: its MD step from the '
                              'previous logging point over the time its 2D MAP took to solve (needs --trajectory)')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
@@ -253,7 +253,7 @@ def map_colorbar(fig, axes, norm_, cmap, label, fixed=False):
 
 
 def inversion_speeds(meta, measured_depth_m):
-    """2D inversion speed of every inverted logging point: {index: (MD step [m], solve time [s], speed [m/s])}.
+    """2D inversion speed of every inverted logging point: {index: (MD step [m], solve time [s], speed [m/h])}.
 
     The step is the MD from the previously inverted logging point (for the first point: to the next
     one), the time is the 2D MAP solve time recorded in the checkpoint. Points without a 2D solve
@@ -267,7 +267,7 @@ def inversion_speeds(meta, measured_depth_m):
             speeds[point['index']] = None
             continue
         step = abs(float(measured_depth_m[point['index']] - measured_depth_m[neighbour['index']]))
-        speeds[point['index']] = (step, float(seconds), step / float(seconds))
+        speeds[point['index']] = (step, float(seconds), 3600. * step / float(seconds))
     return speeds
 
 
@@ -275,7 +275,7 @@ def speed_text(speed):
     if speed is None:
         return '2D inversion speed: n/a (no 2D solve)'
     step, seconds, value = speed
-    return f'2D inversion speed: {value:.4f} m/s ({step:.2f} m in {seconds:.0f} s)'
+    return f'2D inversion speed: {value:5.1f} m/h ({step:.2f} m in {seconds:.0f} s)'
 
 
 def lwd_log(lwd, trajectory):

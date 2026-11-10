@@ -260,10 +260,11 @@ def test_inversion_speed_is_the_md_step_over_the_2d_solve_time():
     meta = [{'index': 0, 'map_seconds': 50.}, {'index': 2, 'map_seconds': None}, {'index': 3, 'map_seconds': 4.}]
     measured_depth = np.array([100., 103., 106., 110.])                 # [m]
     speeds = gif.inversion_speeds(meta, measured_depth)
-    assert speeds[0] == pytest.approx((6., 50., .12))                   # first point: the step to the next inverted one
+    assert speeds[0] == pytest.approx((6., 50., 432.))                  # first point: the step to the next inverted one
     assert speeds[2] is None                                            # no 2D solve at this point
-    assert speeds[3] == pytest.approx((4., 4., 1.))                     # 4 m from point 2 in 4 s
-    assert gif.speed_text(speeds[3]) == '2D inversion speed: 1.0000 m/s (4.00 m in 4 s)'
+    assert speeds[3] == pytest.approx((4., 4., 3600.))                  # 4 m from point 2 in 4 s: 1 m/s = 3600 m/h
+    assert gif.speed_text(speeds[3]) == '2D inversion speed: 3600.0 m/h (4.00 m in 4 s)'
+    assert gif.speed_text((3.048, 159., 69.01)) == '2D inversion speed:  69.0 m/h (3.05 m in 159 s)'   # fixed width
     assert gif.speed_text(None) == '2D inversion speed: n/a (no 2D solve)'
     assert gif.inversion_speeds(meta[:1], measured_depth) == {0: None}  # a single point has no step
 
@@ -321,9 +322,9 @@ def test_linear_color_scale_between_fixed_limits_and_the_speed_readout(tmp_path,
     assert all('ensemble mean (geometric)' in labels for labels in last['lines'])
     assert frames[1]['dots'] == [[(pytest.approx(20.), 8001.)], [(pytest.approx(40.), 8001.)]]
     # Speed: 100 ft = 30.48 m of MD per point over the 2D solve time; point 1 had no 2D solve.
-    assert [frame['speed'] for frame in frames] == [['2D inversion speed: 0.3048 m/s (30.48 m in 100 s)'],
+    assert [frame['speed'] for frame in frames] == [['2D inversion speed: 1097.3 m/h (30.48 m in 100 s)'],
                                                     ['2D inversion speed: n/a (no 2D solve)'],
-                                                    ['2D inversion speed: 0.0762 m/s (30.48 m in 400 s)']]
+                                                    ['2D inversion speed: 274.3 m/h (30.48 m in 400 s)']]
 
 
 def test_fixed_color_limits_on_the_log10_scale(tmp_path, monkeypatch):
