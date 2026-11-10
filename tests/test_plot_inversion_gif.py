@@ -151,6 +151,85 @@ def test_moving_view_follows_the_bit_and_plain_panels_drop_the_variance_wash(tmp
         assert np.array_equal(washed[painted & ~whitened][:, 3], plain[painted & ~whitened][:, 3])
 
 
+def is_round(values):
+    """Equally spaced multiples of a 1 / 2 / 2.5 / 5 x 10^k step."""
+    steps = np.diff(values)
+    mantissa = steps[0] / 10. ** np.floor(np.log10(steps[0]))
+    return bool(np.allclose(steps, steps[0]) and min(abs(mantissa - nice) for nice in (1., 2., 2.5, 5.)) < 1e-9
+                and abs(values[0] / steps[0] - round(values[0] / steps[0])) < 1e-9)
+
+
+def test_unit_locator_puts_round_metre_ticks_on_a_feet_axis():
+    from field_trajectory import FEET_PER_METER
+    locator = gif.UnitLocator(FEET_PER_METER)
+    ticks = locator.tick_values(8400., 8000.)                           # an inverted TVD axis, in feet
+    assert np.array_equal(ticks, locator.tick_values(8000., 8400.))
+    inside = ticks[(ticks >= 8000.) & (ticks <= 8400.)] / FEET_PER_METER
+    assert len(inside) >= 4 and is_round(inside)                        # e.g. 2440, 2460, ... m
+    assert not is_round(ticks[(ticks >= 8000.) & (ticks <= 8400.)])     # and therefore not round in feet
+
+
+@pytest.mark.parametrize('x_axis', ['md', 'plane'])
+def test_length_unit_m_labels_the_horizontal_and_tvd_axes_in_metres(tmp_path, monkeypatch, x_axis):
+    import re
+    import matplotlib.pyplot as plt
+    from matplotlib.text import Text
+    from field_trajectory import FEET_PER_METER
+
+    write_chain(tmp_path, points=6, nz=40)                              # 200 ft of TVD
+    options = ['--run-dir', str(tmp_path), '--no-benchmark', '--length-unit', 'm', '--dpi', '25',
+               '--output', str(tmp_path / 'out.gif')]
+    if x_axis == 'md':                                                  # moving view, 2 x 2 maps, MD axis
+        trajectory = tmp_path / 'trajectory.DAT'
+        write_trajectory(trajectory, points=6)
+        options += ['--x-axis', 'md', '--trajectory', str(trajectory), '--view-points', '4',
+                    '--view-bit-position', '3', '--plain-panels']
+        maps, with_x_ticks, with_y_ticks = 4, [2, 3], [0, 2]
+        xlabels, ylabels, position = ['', '', 'MD [m]', 'MD [m]'], ['TVD [m]', '', 'TVD [m]', ''], 'MD = 3080.8 m'
+        plane_of = lambda length: length * FEET_PER_METER - 10000.      # MD [m] -> plane x [ft]
+    else:                                                               # whole curtain, stacked maps, plane axis
+        maps, with_x_ticks, with_y_ticks = 2, [0, 1], [0, 1]
+        xlabels, ylabels, position = ['', 'X [m]'], ['TVD [m]', 'TVD [m]'], 'X = 32.8 m'
+        plane_of = lambda length: length * FEET_PER_METER
+    args = gif.parse_args(options)
+    assert args.length_unit == 'm' and gif.parse_args(options[:3]).length_unit == 'ft'
+    with pytest.raises(SystemExit):
+        gif.parse_args([*options, '--length-unit', 'km'])
+    frames = []
+    savefig = plt.Figure.savefig
+    def ticks(axis):
+        return [(tick.get_loc(), tick.label1.get_text()) for tick in axis.get_major_ticks()]
+    def inspect(fig, *a, **k):
+        fig.canvas.draw()
+        map_axes, profiles = fig.axes[:maps], fig.axes[-2:]
+        frames.append({'texts': [text.get_text() for text in fig.findobj(Text)],
+                       'xlabels': [axis.get_xlabel() for axis in map_axes],
+                       'ylabels': [axis.get_ylabel() for axis in map_axes],
+                       'profile_ylabels': [axis.get_ylabel() for axis in profiles],
+                       'profile_titles': [axis.get_title() for axis in profiles],
+                       'suptitle': fig._suptitle.get_text(),
+                       'x': [(sorted(map_axes[place].get_xlim()), ticks(map_axes[place].xaxis)) for place in with_x_ticks],
+                       'y': [(sorted(axis.get_ylim()), ticks(axis.yaxis))
+                             for axis in [*(map_axes[place] for place in with_y_ticks), profiles[0]]]})
+        return savefig(fig, *a, **k)
+    monkeypatch.setattr(plt.Figure, 'savefig', inspect)
+    output, count = gif.render(args)
+    assert output.is_file() and count == 6 and len(frames) == 6
+    for frame in frames:
+        assert not [text for text in frame['texts'] if re.search(r'\bft\b', text)]      # nothing is left in feet
+        assert frame['xlabels'] == xlabels and frame['ylabels'] == ylabels
+        assert frame['profile_ylabels'] == ['TVD [m]', '']
+        for to_feet, axes in ((plane_of, frame['x']), (lambda length: length * FEET_PER_METER, frame['y'])):
+            for (low, high), marks in axes:
+                shown = [(location, text) for location, text in marks if low <= location <= high]
+                assert len(shown) >= 2 and is_round([float(text) for _, text in shown])     # round metres ...
+                for location, text in shown:
+                    assert location == pytest.approx(to_feet(float(text)), abs=1e-6)        # ... at their place in feet
+    # The bit of point 1 sits at plane x = 107.5 ft: MD 10107.5 ft with the trajectory.
+    assert position in frames[1]['suptitle']
+    assert all(title.endswith(f'bit column at {position}') for title in frames[1]['profile_titles'])
+
+
 def test_gif_skips_a_newest_checkpoint_that_is_still_being_written(tmp_path, capsys):
     write_chain(tmp_path, points=3)
     complete = (tmp_path / 'inversion_results_assim_2.pkl').read_bytes()

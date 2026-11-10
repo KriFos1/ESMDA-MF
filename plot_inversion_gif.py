@@ -16,6 +16,8 @@ with the bit: N logging points wide, the bit ``--view-bit-position`` points from
 its left edge, so each frame shows the estimate around the bit as it stood when
 that point was inverted. ``--plain-panels`` adds the same two maps without the
 variance wash under the washed ones (2 x 2: Rh column, Rv column).
+``--length-unit m`` labels the horizontal and TVD axes and the positions in the
+titles in metres; the geometry itself stays in feet.
 """
 
 import argparse
@@ -33,15 +35,19 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import AutoLocator, FuncFormatter, Locator
 import numpy as np
 from scipy.stats import norm
 
+from field_trajectory import FEET_PER_METER
 from plot_curtain import (AXIS_LABELS, CHECKPOINT_RE, fidelity_of, horizontal_length_map, hue_colormap,
                           label_horizontal_length, member_fields, paint_point, uncertainty_rgba)
 from plot_curtain_section import FIDELITY_COLORS, draw_path, load_benchmark
 
 KEYS = ('Rh', 'Rv')
 UNPAINTED = '0.86'      # moving view: background of cells that hold no model yet
+FEET_PER_UNIT = {'ft': 1., 'm': FEET_PER_METER}     # --length-unit: the geometry is in feet, only the labels change
+POSITION_DECIMALS = {'ft': 0, 'm': 1}               # decimals of the bit position in the titles
 
 
 def parse_args(argv=None):
@@ -69,6 +75,9 @@ def parse_args(argv=None):
     parser.add_argument('--plain-panels', action='store_true',
                         help='Add the Rh and Rv maps without the variance wash under the washed ones '
                              '(2 x 2: Rh column, Rv column)')
+    parser.add_argument('--length-unit', choices=list(FEET_PER_UNIT), default='ft',
+                        help='Unit of the horizontal (X / MD / THL) and TVD axes and of the bit position in the '
+                             'titles; the inputs and the geometry are in feet either way')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
     parser.add_argument('--uncertainty-white-threshold', type=float, default=.35)
@@ -137,6 +146,48 @@ def view_columns(x_edges, limits):
     first = int(np.clip(np.floor((limits[0] - x_edges[0]) / dx), 0, columns))
     last = int(np.clip(np.ceil((limits[1] - x_edges[0]) / dx), 0, columns))
     return first, last
+
+
+class UnitLocator(Locator):
+    """Round tick values of a display unit on an axis whose coordinates are in feet."""
+
+    def __init__(self, feet_per_unit):
+        self.feet_per_unit = feet_per_unit
+        self.rounded = AutoLocator()
+
+    def set_axis(self, axis):
+        super().set_axis(axis)
+        self.rounded.set_axis(axis)         # as many ticks as fit the axis, like the default locator
+
+    def __call__(self):
+        return self.tick_values(*self.axis.get_view_interval())
+
+    def tick_values(self, vmin, vmax):
+        low, high = sorted((vmin, vmax))
+        return self.rounded.tick_values(low / self.feet_per_unit, high / self.feet_per_unit) * self.feet_per_unit
+
+
+def tick_in_unit(axis, feet_per_unit):
+    """Tick a feet axis (``axes.xaxis`` or ``axes.yaxis``) at round values of the display unit."""
+    if feet_per_unit != 1.:
+        axis.set_major_locator(UnitLocator(feet_per_unit))
+        axis.set_major_formatter(FuncFormatter(lambda value, _: f'{value / feet_per_unit:g}'))
+
+
+def maps_in_unit(length_maps, feet_per_unit):
+    """``horizontal_length_map``'s pair with the length in the display unit (plane x stays in feet)."""
+    to_length, to_plane = length_maps
+    if feet_per_unit == 1.:
+        return to_length, to_plane
+
+    def unit_length(plane_x):
+        return to_length(plane_x) / feet_per_unit
+
+    def unit_plane(length):
+        return to_plane(np.asarray(length, dtype=float) * feet_per_unit)
+
+    unit_length.monotone = getattr(to_length, 'monotone', True)
+    return unit_length, unit_plane
 
 
 def map_colorbar(fig, axes, norm_, cmap, label):
@@ -269,9 +320,13 @@ def render(args):
         profile_limits = {key: (min(limits[0], float(lwd_values.min()) - .1), max(limits[1], float(lwd_values.max()) + .1))
                           for key, limits in profile_limits.items()}
     x_axis = getattr(args, 'x_axis', 'plane')
-    length_maps = horizontal_length_map(args.trajectory, x_axis) if x_axis != 'plane' else None
-    position_label = AXIS_LABELS.get(x_axis, 'X [ft]')
-    position_of = (lambda x: float(length_maps[0](x))) if length_maps else (lambda x: float(x))
+    unit = getattr(args, 'length_unit', 'ft')
+    feet = FEET_PER_UNIT[unit]
+    length_maps = (maps_in_unit(horizontal_length_map(args.trajectory, x_axis), feet)
+                   if x_axis != 'plane' else None)
+    position_label = AXIS_LABELS.get(x_axis, 'X [ft]').replace('[ft]', f'[{unit}]')
+    depth_label = f'TVD [{unit}]'
+    position_of = (lambda x: float(length_maps[0](x))) if length_maps else (lambda x: float(x) / feet)
     cmap = hue_colormap()
     white_std = np.sqrt(args.uncertainty_white_threshold * scale)
     path_x = np.array([m['bit'][0] for m in meta])
@@ -310,6 +365,9 @@ def render(args):
                 if length_maps is not None:
                     label_horizontal_length(axis, *length_maps, label=position_label)
                     axis.set_xlabel('')
+                else:
+                    tick_in_unit(axis.xaxis, feet)
+                tick_in_unit(axis.yaxis, feet)
 
             if plain:
                 # 2 x 2: Rh column and Rv column, the washed maps over the plain ones.
@@ -324,7 +382,7 @@ def render(args):
                     axis.set_title(f'Estimated log10 {KEYS[column]} (at bit), '
                                    + ('variance wash' if row == 0 else 'no variance wash'), fontsize=11)
                     if column == 0:
-                        axis.set_ylabel('TVD [ft]')
+                        axis.set_ylabel(depth_label)
                     else:
                         axis.tick_params(labelleft=False)
                     if row == 0:
@@ -340,7 +398,7 @@ def render(args):
                 maps = [fig.add_subplot(maps_grid[row]) for row in range(2)]
                 for axis, key in zip(maps, KEYS):
                     draw_map(axis, key, washed=True)
-                    axis.set_ylabel('TVD [ft]')
+                    axis.set_ylabel(depth_label)
                     axis.set_title(f'Estimated log10 {key} (at bit)')
                     bar = fig.colorbar(ScalarMappable(norm=norms[key], cmap=cmap), ax=axis, fraction=.02, pad=.01)
                     bar.set_label(f'log10 {key} [ohm m]')
@@ -352,7 +410,8 @@ def render(args):
             depth, samples = frame['depth'], frame['samples']
             bit_x, bit_z = current['bit']
             ref_column = int(np.argmin(np.abs(ref_x - bit_x))) if reference is not None else None
-            position_text = f'{position_label.split(" [")[0]} = {position_of(bit_x):.0f} ft'
+            position_text = (f'{position_label.split(" [")[0]} = '
+                             f'{position_of(bit_x):.{POSITION_DECIMALS[unit]}f} {unit}')
             for axis, key in zip(profiles, KEYS):
                 low, high = np.percentile(samples[key], [1, 99], axis=0)
                 mean = samples[key].mean(axis=0)
@@ -373,7 +432,8 @@ def render(args):
                 axis.set_xlabel(f'log10 {key} [ohm m]')
                 axis.set_title(f'log10 {key}, bit column at {position_text}', fontsize=10)
                 axis.grid(alpha=.3)
-            profiles[0].set_ylabel('TVD [ft]')
+            tick_in_unit(profiles[0].yaxis, feet)       # the two panels share the TVD axis and its ticker
+            profiles[0].set_ylabel(depth_label)
             profiles[1].tick_params(labelleft=False)
             profiles[0].legend(fontsize=8, loc='lower right', framealpha=.8)
 
