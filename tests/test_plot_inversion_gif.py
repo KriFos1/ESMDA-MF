@@ -36,12 +36,18 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
                            '--trajectory', str(trajectory), '--lwd', str(lwd), '--dpi', '25',
                            '--output', str(tmp_path / 'out.gif')])
     monkeypatch.setattr(gif, 'load_benchmark', lambda *a: pytest.fail('loaded a benchmark'))
-    titles, red_dots = [], []
+    titles, red_dots, bits = [], [], []
     import matplotlib.pyplot as plt
     from matplotlib.colors import to_rgba
     savefig = plt.Figure.savefig
     def inspect(fig, *a, **k):
         titles.append((fig._suptitle.get_text(), [axis.get_xlabel() for axis in fig.axes]))
+        markers = [tuple(map(float, c.get_offsets()[0])) for axis in fig.axes[:2] for c in axis.collections
+                   if c.get_zorder() == 6]                                  # the bit crosses of the Rh and Rv maps
+        paths = [np.asarray(c.get_offsets()) for axis in fig.axes[:2] for c in axis.collections if c.get_zorder() == 4]
+        lines = [float(line.get_ydata()[0]) for axis in fig.axes[-2:] for line in axis.get_lines()
+                 if line.get_label() == 'bit TVD']
+        bits.append({'markers': markers, 'paths': paths, 'tvd_lines': lines})
         dots = {}
         for name, profile in zip(('Rh', 'Rv'), fig.axes[-2:]):          # the Rh and Rv bit-column panels
             red = [c for c in profile.collections if hasattr(c, 'get_offsets') and len(c.get_offsets())
@@ -56,8 +62,11 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
     from PIL import Image
     with Image.open(output) as image:
         assert image.n_frames == 3
-    # The bit of point 1 sits at plane x = 107.5 ft (window centre); its MD label follows the trajectory.
-    assert 'MD = 10108 ft' in titles[1][0] and 'MD [ft]' in titles[1][1]
+    # Point 1: the title, the bit crosses, the path and the bit TVD lines are the trajectory's logging point
+    # (plane x 100 ft, TVD 8001 ft, MD 10100 ft), not the window centre (107.5 ft, 10 ft).
+    assert 'MD = 10100 ft' in titles[1][0] and 'MD [ft]' in titles[1][1]
+    assert bits[1]['markers'] == [pytest.approx((100., 8001.))] * 2 and bits[1]['tvd_lines'] == [8001.] * 2
+    assert len(bits[1]['paths']) == 2 and all(np.allclose(path, [[0., 8000.], [100., 8001.]]) for path in bits[1]['paths'])
     # Frame 1: one red dot per panel at the bit TVD, Res1 (LWD Rh) in the Rh panel, Res2 (LWD Rv) in the Rv panel.
     assert red_dots[1]['Rh'] == [(pytest.approx(np.log10(20.)), 8001.)]
     assert red_dots[1]['Rv'] == [(pytest.approx(np.log10(40.)), 8001.)]
@@ -185,7 +194,7 @@ def test_length_unit_m_labels_the_horizontal_and_tvd_axes_in_metres(tmp_path, mo
         options += ['--x-axis', 'md', '--trajectory', str(trajectory), '--view-points', '4',
                     '--view-bit-position', '3', '--plain-panels']
         maps, with_x_ticks, with_y_ticks = 4, [2, 3], [0, 2]
-        xlabels, ylabels, position = ['', '', 'MD [m]', 'MD [m]'], ['TVD [m]', '', 'TVD [m]', ''], 'MD = 3080.8 m'
+        xlabels, ylabels, position = ['', '', 'MD [m]', 'MD [m]'], ['TVD [m]', '', 'TVD [m]', ''], 'MD = 3078.5 m'
         plane_of = lambda length: length * FEET_PER_METER - 10000.      # MD [m] -> plane x [ft]
     else:                                                               # whole curtain, stacked maps, plane axis
         maps, with_x_ticks, with_y_ticks = 2, [0, 1], [0, 1]
@@ -225,7 +234,7 @@ def test_length_unit_m_labels_the_horizontal_and_tvd_axes_in_metres(tmp_path, mo
                 assert len(shown) >= 2 and is_round([float(text) for _, text in shown])     # round metres ...
                 for location, text in shown:
                     assert location == pytest.approx(to_feet(float(text)), abs=1e-6)        # ... at their place in feet
-    # The bit of point 1 sits at plane x = 107.5 ft: MD 10107.5 ft with the trajectory.
+    # Point 1: MD 10100 ft in the trajectory; without one the window centre at plane x = 107.5 ft.
     assert position in frames[1]['suptitle']
     assert all(title.endswith(f'bit column at {position}') for title in frames[1]['profile_titles'])
 

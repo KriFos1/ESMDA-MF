@@ -18,6 +18,10 @@ that point was inverted. ``--plain-panels`` adds the same two maps without the
 variance wash under the washed ones (2 x 2: Rh column, Rv column).
 ``--length-unit m`` labels the horizontal and TVD axes and the positions in the
 titles in metres; the geometry itself stays in feet.
+
+With ``--trajectory`` the well path, the bit marker, the bit TVD line and the
+position in the titles are the trajectory's own logging points; without it they
+are the window centres, i.e. those positions snapped to the cell grid.
 """
 
 import argparse
@@ -104,6 +108,14 @@ def parse_args(argv=None):
     return args
 
 
+def trajectory_positions(trajectory):
+    """Along-plane x and TVD [ft] of every logging point of a field trajectory."""
+    from field_trajectory import along_well_trajectory, read_trajectory
+    values = read_trajectory(trajectory)
+    well, _ = along_well_trajectory(values)
+    return well['X'][:, 0] * FEET_PER_METER, values[:, 1].copy()
+
+
 def logging_positions(trajectory, meta):
     """Along-plane x [ft] of the logging points by index.
 
@@ -111,9 +123,7 @@ def logging_positions(trajectory, meta):
     checkpoints' window centres are used (interpolated over missing indices).
     """
     if trajectory is not None:
-        from field_trajectory import FEET_PER_METER, along_well_trajectory, read_trajectory
-        well, _ = along_well_trajectory(read_trajectory(trajectory))
-        return well['X'][:, 0] * FEET_PER_METER
+        return trajectory_positions(trajectory)[0]
     indices = np.array([m['index'] for m in meta])
     if len(indices) < 2:
         raise ValueError('A moving view needs at least two logging points')
@@ -297,6 +307,14 @@ def collect(args):
 
 def render(args):
     meta, frames, scale, x_edges, z_edges = collect(args)
+    if getattr(args, 'trajectory', None) is not None:
+        # Field data: draw the bit where the trajectory puts it. The window centre the checkpoints give
+        # is that position snapped to the cell grid (half a cell along the well, up to a cell in TVD).
+        well_x, well_z = trajectory_positions(args.trajectory)
+        if max(point['index'] for point in meta) >= len(well_x):
+            raise ValueError('The trajectory has fewer logging points than the chain')
+        for point in meta:
+            point['bit'] = (float(well_x[point['index']]), float(well_z[point['index']]))
     x0, x1, z_top, z_bottom = x_edges[0], x_edges[-1], z_edges[0], z_edges[-1]
     if args.benchmark:
         reference, ref_x_edges, ref_z_edges = load_benchmark(args.benchmark)
