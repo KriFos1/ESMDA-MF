@@ -6,13 +6,15 @@ import pytest
 import plot_inversion_gif as gif
 
 
-def write_chain(run_dir, points=3, nx=3, nz=4):
+def write_chain(run_dir, points=3, nx=3, nz=4, map_seconds=None):
     rng = np.random.default_rng(5)
     for index in range(points):
         ensemble = rng.normal(size=(6, 2 * nx * nz))
         result = {'dims': (nx, 1, nz), 'spacing_ft': (5., 5., 5.), 'shift_ft': {'x': 100. * index, 'z': 0.},
                   'posterior_ensemble_params': ensemble, 'posterior_params': ensemble.copy(),
                   'rv_ratio_bounds': (1., 3.), 'anisotropy': 'log_clipped', 'selected_fidelity': '2D'}
+        if map_seconds is not None and map_seconds[index] is not None:
+            result['laplace'] = {'map_seconds': map_seconds[index]}      # the 2D MAP solve time of the point
         with open(run_dir / f'inversion_results_assim_{index}.pkl', 'wb') as stream:
             pickle.dump(result, stream)
 
@@ -36,12 +38,13 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
                            '--trajectory', str(trajectory), '--lwd', str(lwd), '--dpi', '25',
                            '--output', str(tmp_path / 'out.gif')])
     monkeypatch.setattr(gif, 'load_benchmark', lambda *a: pytest.fail('loaded a benchmark'))
-    titles, red_dots, bits = [], [], []
+    titles, red_dots, bits, texts = [], [], [], []
     import matplotlib.pyplot as plt
     from matplotlib.colors import to_rgba
     savefig = plt.Figure.savefig
     def inspect(fig, *a, **k):
         titles.append((fig._suptitle.get_text(), [axis.get_xlabel() for axis in fig.axes]))
+        texts.extend(text.get_text() for text in fig.texts)
         markers = [tuple(map(float, c.get_offsets()[0])) for axis in fig.axes[:2] for c in axis.collections
                    if c.get_zorder() == 6]                                  # the bit crosses of the Rh and Rv maps
         paths = [np.asarray(c.get_offsets()) for axis in fig.axes[:2] for c in axis.collections if c.get_zorder() == 4]
@@ -70,6 +73,7 @@ def test_field_gif_without_benchmark_labels_the_axis_by_measured_depth(tmp_path,
     # Frame 1: one red dot per panel at the bit TVD, Res1 (LWD Rh) in the Rh panel, Res2 (LWD Rv) in the Rv panel.
     assert red_dots[1]['Rh'] == [(pytest.approx(np.log10(20.)), 8001.)]
     assert red_dots[1]['Rv'] == [(pytest.approx(np.log10(40.)), 8001.)]
+    assert texts and not [text for text in texts if 'inversion speed' in text]       # only with --inversion-speed
 
 
 def test_benchmark_gif_still_requires_no_trajectory(tmp_path):
@@ -237,6 +241,108 @@ def test_length_unit_m_labels_the_horizontal_and_tvd_axes_in_metres(tmp_path, mo
     # Point 1: MD 10100 ft in the trajectory; without one the window centre at plane x = 107.5 ft.
     assert position in frames[1]['suptitle']
     assert all(title.endswith(f'bit column at {position}') for title in frames[1]['profile_titles'])
+
+
+def test_color_and_speed_options_are_validated(tmp_path):
+    base = ['--run-dir', str(tmp_path), '--no-benchmark']
+    args = gif.parse_args(base)
+    assert args.color_scale == 'log10' and args.color_limits is None and not args.inversion_speed
+    assert gif.parse_args([*base, '--color-scale', 'linear', '--color-limits', '1', '12']).color_limits == [1., 12.]
+    assert gif.parse_args([*base, '--color-scale', 'linear', '--color-limits', '0', '12']).color_limits == [0., 12.]
+    for bad in (['--color-limits', '12', '1'], ['--color-limits', '0', '12'],              # log10 needs positive limits
+                ['--color-scale', 'linear', '--color-limits', '3', '3'], ['--color-scale', 'sqrt'],
+                ['--inversion-speed']):                                                    # needs the trajectory's MD
+        with pytest.raises(SystemExit):
+            gif.parse_args([*base, *bad])
+
+
+def test_inversion_speed_is_the_md_step_over_the_2d_solve_time():
+    meta = [{'index': 0, 'map_seconds': 50.}, {'index': 2, 'map_seconds': None}, {'index': 3, 'map_seconds': 4.}]
+    measured_depth = np.array([100., 103., 106., 110.])                 # [m]
+    speeds = gif.inversion_speeds(meta, measured_depth)
+    assert speeds[0] == pytest.approx((6., 50., .12))                   # first point: the step to the next inverted one
+    assert speeds[2] is None                                            # no 2D solve at this point
+    assert speeds[3] == pytest.approx((4., 4., 1.))                     # 4 m from point 2 in 4 s
+    assert gif.speed_text(speeds[3]) == '2D inversion speed: 1.0000 m/s (4.00 m in 4 s)'
+    assert gif.speed_text(None) == '2D inversion speed: n/a (no 2D solve)'
+    assert gif.inversion_speeds(meta[:1], measured_depth) == {0: None}  # a single point has no step
+
+
+def test_linear_color_scale_between_fixed_limits_and_the_speed_readout(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize, to_rgba
+
+    write_chain(tmp_path, map_seconds=[100., None, 400.])
+    trajectory = tmp_path / 'trajectory.DAT'
+    write_trajectory(trajectory)                                        # MD 10000, 10100, 10200 ft
+    lwd = tmp_path / 'LWD_resistivity.txt'
+    lwd.write_text('% logpt Res1 Res2\n1 2.0 4.0\n2 20.0 40.0\n3 200.0 400.0\n')
+    args = gif.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--x-axis', 'md', '--trajectory', str(trajectory),
+                           '--lwd', str(lwd), '--plain-panels', '--color-scale', 'linear', '--color-limits', '0.8', '1.1',
+                           '--inversion-speed', '--dpi', '25', '--output', str(tmp_path / 'out.gif')])
+    frames = []
+    savefig = plt.Figure.savefig
+    def inspect(fig, *a, **k):
+        maps, bars, profiles = fig.axes[:4], fig.axes[4:6], fig.axes[-2:]
+        frames.append({'titles': [axis.get_title() for axis in maps],
+                       'bars': [(bar.get_ylabel(), bar.get_ylim(), [float(tick) for tick in bar.get_yticks()]) for bar in bars],
+                       'plain': [np.asarray(axis.images[0].get_array()) for axis in maps[2:]],
+                       'profiles': [(axis.get_xscale(), axis.get_xlabel(), axis.get_title()) for axis in profiles],
+                       'lines': [[line.get_label() for line in axis.get_lines()] for axis in profiles],
+                       'dots': [[tuple(map(float, c.get_offsets()[0])) for c in axis.collections
+                                 if len(c.get_offsets()) == 1 and tuple(c.get_facecolor()[0]) == to_rgba('red')]
+                                for axis in profiles],
+                       'speed': [text.get_text() for text in fig.texts if 'inversion speed' in text.get_text()]})
+        return savefig(fig, *a, **k)
+    monkeypatch.setattr(plt.Figure, 'savefig', inspect)
+    output, count = gif.render(args)
+    assert output.is_file() and count == 3
+    last = frames[-1]
+    assert last['titles'] == ['Estimated Rh (at bit), variance wash', 'Estimated Rv (at bit), variance wash',
+                              'Estimated Rh (at bit), no variance wash', 'Estimated Rv (at bit), no variance wash']
+    for (label, limits, ticks), key in zip(last['bars'], gif.KEYS):
+        assert label == f'{key} [ohm m]' and limits == pytest.approx((.8, 1.1))    # ohm m, not log10, the given limits
+        assert ticks[0] == .8 and ticks[-1] == 1.1 and ticks == sorted(ticks)      # both ends are ticked
+    # The plain maps are the posterior-mean resistivity [ohm m] on the linear colour scale, clipped at its ends.
+    monkeypatch.undo()
+    _, collected, _, _, _ = gif.collect(args)
+    colour, scale = gif.hue_colormap(), Normalize(.8, 1.1, clip=True)
+    for image, key in zip(last['plain'], gif.KEYS):
+        resistivity = 10. ** collected[-1]['log10'][key].T
+        painted = np.isfinite(resistivity)
+        beyond = (resistivity[painted] < .8) | (resistivity[painted] > 1.1)
+        assert beyond.any() and not beyond.all()                                  # some cells take the end colours
+        assert np.allclose(image[painted], colour(scale(resistivity[painted])))
+        assert not image[~painted].any()
+        assert not np.allclose(image[painted], colour(Normalize(np.log10(.8), np.log10(1.1), clip=True)(
+            np.log10(resistivity[painted]))))                                      # and not the log10 colours
+    # The bit-column panels are in ohm m too (logarithmic axis): the LWD dots of point 1 are 20 and 40 ohm m.
+    assert last['profiles'] == [('log', f'{key} [ohm m]', f'{key}, bit column at MD = 10200 ft') for key in gif.KEYS]
+    assert all('ensemble mean (geometric)' in labels for labels in last['lines'])
+    assert frames[1]['dots'] == [[(pytest.approx(20.), 8001.)], [(pytest.approx(40.), 8001.)]]
+    # Speed: 100 ft = 30.48 m of MD per point over the 2D solve time; point 1 had no 2D solve.
+    assert [frame['speed'] for frame in frames] == [['2D inversion speed: 0.3048 m/s (30.48 m in 100 s)'],
+                                                    ['2D inversion speed: n/a (no 2D solve)'],
+                                                    ['2D inversion speed: 0.0762 m/s (30.48 m in 400 s)']]
+
+
+def test_fixed_color_limits_on_the_log10_scale(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    write_chain(tmp_path)
+    args = gif.parse_args(['--run-dir', str(tmp_path), '--no-benchmark', '--color-limits', '1', '100', '--dpi', '25',
+                           '--output', str(tmp_path / 'out.gif')])
+    bars = []
+    savefig = plt.Figure.savefig
+    def inspect(fig, *a, **k):
+        bars.append([(bar.get_ylabel(), bar.get_ylim(), [float(tick) for tick in bar.get_yticks()])
+                     for bar in fig.axes[2:4]])                         # stacked layout: two maps, their bars, two columns
+        return savefig(fig, *a, **k)
+    monkeypatch.setattr(plt.Figure, 'savefig', inspect)
+    gif.render(args)
+    for (label, limits, ticks), key in zip(bars[-1], gif.KEYS):
+        assert label == f'log10 {key} [ohm m]' and limits == pytest.approx((0., 2.))
+        assert ticks[0] == 0. and ticks[-1] == 2.
 
 
 def test_gif_skips_a_newest_checkpoint_that_is_still_being_written(tmp_path, capsys):

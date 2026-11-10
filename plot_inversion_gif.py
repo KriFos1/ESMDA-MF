@@ -22,6 +22,14 @@ titles in metres; the geometry itself stays in feet.
 With ``--trajectory`` the well path, the bit marker, the bit TVD line and the
 position in the titles are the trajectory's own logging points; without it they
 are the window centres, i.e. those positions snapped to the cell grid.
+
+``--color-scale linear`` colours the maps by resistivity in ohm m instead of its
+log10, and ``--color-limits MIN MAX`` fixes the two ends of the colour scale for
+Rh and Rv alike (values outside take the end colours). With the linear scale the
+bit-column panels are in ohm m too, on a logarithmic axis. ``--inversion-speed``
+prints, for every logging point, how fast its 2D inversion advanced along the
+well: the MD step from the previous logging point over the time its 2D MAP took
+to solve, in m/s.
 """
 
 import argparse
@@ -82,6 +90,15 @@ def parse_args(argv=None):
     parser.add_argument('--length-unit', choices=list(FEET_PER_UNIT), default='ft',
                         help='Unit of the horizontal (X / MD / THL) and TVD axes and of the bit position in the '
                              'titles; the inputs and the geometry are in feet either way')
+    parser.add_argument('--color-scale', choices=['log10', 'linear'], default='log10',
+                        help='Colour the maps by log10 resistivity or linearly by resistivity [ohm m]; with linear '
+                             'the bit-column panels are in ohm m as well, on a logarithmic axis')
+    parser.add_argument('--color-limits', type=float, nargs=2, default=None, metavar=('MIN', 'MAX'),
+                        help='Resistivity [ohm m] at the two ends of the colour scale, for Rh and Rv and all frames '
+                             '(default: 2nd and 98th percentile of the benchmark, or of the final curtain)')
+    parser.add_argument('--inversion-speed', action='store_true',
+                        help='Print the 2D inversion speed of every logging point [m/s]: its MD step from the '
+                             'previous logging point over the time its 2D MAP took to solve (needs --trajectory)')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
     parser.add_argument('--uncertainty-white-threshold', type=float, default=.35)
@@ -95,6 +112,14 @@ def parse_args(argv=None):
         parser.error(f'--x-axis {args.x_axis} needs --trajectory')
     if args.lwd is not None and args.trajectory is None:
         parser.error('--lwd needs --trajectory (TVD of the logging points)')
+    if args.inversion_speed and args.trajectory is None:
+        parser.error('--inversion-speed needs --trajectory (MD of the logging points)')
+    if args.color_limits is not None:
+        low, high = args.color_limits
+        if not (np.isfinite(low) and np.isfinite(high) and low < high):
+            parser.error('--color-limits must be two increasing resistivities')
+        if args.color_scale == 'log10' and low <= 0:
+            parser.error('--color-limits must be positive on the log10 colour scale')
     if args.view_points is None:
         if args.view_bit_position is not None:
             parser.error('--view-bit-position needs --view-points')
@@ -200,16 +225,57 @@ def maps_in_unit(length_maps, feet_per_unit):
     return unit_length, unit_plane
 
 
-def map_colorbar(fig, axes, norm_, cmap, label):
-    """One colour bar to the right of a column of equal-aspect maps, aligned with their drawn boxes."""
+def limit_ticks(bar, norm_):
+    """Tick both ends of a colour bar with fixed limits; its own ticks too close to an end make way."""
+    low, high = norm_.vmin, norm_.vmax
+    margin = .05 * (high - low)
+    inner = [tick for tick in bar.get_ticks() if low + margin < tick < high - margin]
+    bar.set_ticks([low, *inner, high])
+
+
+def map_colorbar(fig, axes, norm_, cmap, label, fixed=False):
+    """One colour bar to the right of a column of equal-aspect maps, aligned with their drawn boxes.
+
+    ``fixed``: the limits were chosen by the user, so both ends are ticked and drawn as arrows
+    (values beyond them take the end colours).
+    """
     for axis in axes:
         axis.apply_aspect()
     boxes = [axis.get_position() for axis in axes]
     right = max(box.x1 for box in boxes)
     bottom, top = min(box.y0 for box in boxes), max(box.y1 for box in boxes)
-    bar = fig.colorbar(ScalarMappable(norm=norm_, cmap=cmap), cax=fig.add_axes([right + .008, bottom, .011, top - bottom]))
+    bar = fig.colorbar(ScalarMappable(norm=norm_, cmap=cmap), cax=fig.add_axes([right + .008, bottom, .011, top - bottom]),
+                       extend='both' if fixed else 'neither')
+    if fixed:
+        limit_ticks(bar, norm_)
     bar.set_label(label)
     return bar
+
+
+def inversion_speeds(meta, measured_depth_m):
+    """2D inversion speed of every inverted logging point: {index: (MD step [m], solve time [s], speed [m/s])}.
+
+    The step is the MD from the previously inverted logging point (for the first point: to the next
+    one), the time is the 2D MAP solve time recorded in the checkpoint. Points without a 2D solve
+    (1D only) or without a neighbour map to None.
+    """
+    speeds = {}
+    for place, point in enumerate(meta):
+        neighbour = meta[place - 1] if place else (meta[1] if len(meta) > 1 else None)
+        seconds = point.get('map_seconds')
+        if neighbour is None or seconds is None or not seconds > 0:
+            speeds[point['index']] = None
+            continue
+        step = abs(float(measured_depth_m[point['index']] - measured_depth_m[neighbour['index']]))
+        speeds[point['index']] = (step, float(seconds), step / float(seconds))
+    return speeds
+
+
+def speed_text(speed):
+    if speed is None:
+        return '2D inversion speed: n/a (no 2D solve)'
+    step, seconds, value = speed
+    return f'2D inversion speed: {value:.4f} m/s ({step:.2f} m in {seconds:.0f} s)'
 
 
 def lwd_log(lwd, trajectory):
@@ -276,7 +342,8 @@ def collect(args):
         result = load(path)
         meta.append({'index': int(CHECKPOINT_RE.search(path.name).group(1)), 'dims': result['dims'],
                      'spacing': (result['spacing_ft'][0], result['spacing_ft'][2]), 'shift': result['shift_ft'],
-                     'fidelity': fidelity_of(result), 'bit': bit_position(result)})
+                     'fidelity': fidelity_of(result), 'bit': bit_position(result),
+                     'map_seconds': (result.get('laplace') or {}).get('map_seconds')})
     spacing = meta[0]['spacing']
     origin = (min(m['shift']['x'] for m in meta), min(m['shift']['z'] for m in meta))
     n_x = int(round((max(m['shift']['x'] + m['dims'][0] * spacing[0] for m in meta) - origin[0]) / spacing[0]))
@@ -326,7 +393,18 @@ def render(args):
         # Field data: the final curtain sets the colour scale, the bit columns set the profile axes.
         reference = None
         logs = {key: frames[-1]['log10'][key][np.isfinite(frames[-1]['log10'][key])] for key in KEYS}
-    norms = {key: Normalize(*np.nanpercentile(logs[key], [2, 98]), clip=True) for key in KEYS}
+    # Everything is held in log10 ohm m; a linear colour scale shows it in ohm m.
+    linear = getattr(args, 'color_scale', 'log10') == 'linear'
+    color_limits = getattr(args, 'color_limits', None)
+    in_scale = ((lambda log10_values: 10. ** np.asarray(log10_values, dtype=float)) if linear
+                else (lambda log10_values: log10_values))
+    quantity = {key: key if linear else f'log10 {key}' for key in KEYS}
+    if color_limits is not None:
+        ends = tuple(color_limits) if linear else tuple(np.log10(color_limits))
+        norms = {key: Normalize(*ends, clip=True) for key in KEYS}
+    else:
+        norms = {key: Normalize(*np.nanpercentile(in_scale(logs[key]), [2, 98]), clip=True) for key in KEYS}
+    mean_label = 'ensemble mean (geometric)' if linear else 'ensemble mean'
     if reference is not None:
         profile_limits = {key: (float(np.nanmin(logs[key])) - .8, float(np.nanmax(logs[key])) + .6) for key in KEYS}
     else:
@@ -356,6 +434,10 @@ def render(args):
     positions = logging_positions(getattr(args, 'trajectory', None), meta) if view else None
     view_text = (f'view of {args.view_points} logging points: {args.view_bit_position} behind the bit, '
                  f'{args.view_points - args.view_bit_position} ahead; ' if view else '')
+    speeds = None
+    if getattr(args, 'inversion_speed', False):
+        from field_trajectory import read_trajectory
+        speeds = inversion_speeds(meta, read_trajectory(args.trajectory)[:, 2] / FEET_PER_METER)
 
     workdir = Path(tempfile.mkdtemp(prefix='inversion-gif-'))
     try:
@@ -368,7 +450,8 @@ def render(args):
             def draw_map(axis, key, washed):
                 """One estimate map up to this frame, with or without the variance wash."""
                 if last > first:
-                    rgba = uncertainty_rgba(frame['log10'][key][first:last].T, frame['variance'][key][first:last].T,
+                    rgba = uncertainty_rgba(in_scale(frame['log10'][key][first:last]).T,
+                                            frame['variance'][key][first:last].T,
                                             cmap, norms[key], scale if washed else 0.,
                                             args.uncertainty_strength, args.uncertainty_white_threshold)
                     axis.imshow(rgba, extent=(x_edges[first], x_edges[last], z_edges[0], z_edges[-1]),
@@ -397,7 +480,7 @@ def render(args):
                 for place, axis in enumerate(maps):
                     row, column = divmod(place, 2)
                     draw_map(axis, KEYS[column], washed=row == 0)
-                    axis.set_title(f'Estimated log10 {KEYS[column]} (at bit), '
+                    axis.set_title(f'Estimated {quantity[KEYS[column]]} (at bit), '
                                    + ('variance wash' if row == 0 else 'no variance wash'), fontsize=11)
                     if column == 0:
                         axis.set_ylabel(depth_label)
@@ -408,7 +491,8 @@ def render(args):
                     else:
                         axis.set_xlabel(position_label)
                 for column, key in enumerate(KEYS):
-                    map_colorbar(fig, maps[column::2], norms[key], cmap, f'log10 {key} [ohm m]')
+                    map_colorbar(fig, maps[column::2], norms[key], cmap, f'{quantity[key]} [ohm m]',
+                                 fixed=color_limits is not None)
             else:
                 fig = plt.figure(figsize=(15, 15))
                 outer = fig.add_gridspec(2, 1, height_ratios=[2.7, 1.5], hspace=.16)
@@ -417,9 +501,12 @@ def render(args):
                 for axis, key in zip(maps, KEYS):
                     draw_map(axis, key, washed=True)
                     axis.set_ylabel(depth_label)
-                    axis.set_title(f'Estimated log10 {key} (at bit)')
-                    bar = fig.colorbar(ScalarMappable(norm=norms[key], cmap=cmap), ax=axis, fraction=.02, pad=.01)
-                    bar.set_label(f'log10 {key} [ohm m]')
+                    axis.set_title(f'Estimated {quantity[key]} (at bit)')
+                    bar = fig.colorbar(ScalarMappable(norm=norms[key], cmap=cmap), ax=axis, fraction=.02, pad=.01,
+                                       extend='both' if color_limits is not None else 'neither')
+                    if color_limits is not None:
+                        limit_ticks(bar, norms[key])
+                    bar.set_label(f'{quantity[key]} [ohm m]')
                 maps[1].set_xlabel(position_label)
 
             profile_grid = outer[1].subgridspec(1, 2, wspace=.08)
@@ -433,22 +520,31 @@ def render(args):
             for axis, key in zip(profiles, KEYS):
                 low, high = np.percentile(samples[key], [1, 99], axis=0)
                 mean = samples[key].mean(axis=0)
-                axis.fill_betweenx(depth, low, high, step='mid', color='0.6', alpha=.5, lw=0, label='ensemble p1-p99')
+                if linear:
+                    # Resistivity in ohm m; the band and the LWD readings span decades, so the axis is logarithmic.
+                    axis.set_xscale('log')
+                    axis.xaxis.set_major_formatter(FuncFormatter(
+                        lambda value, _: f'{value:.0f}' if value >= 1 else f'{value:g}'))
+                axis.fill_betweenx(depth, in_scale(low), in_scale(high), step='mid', color='0.6', alpha=.5, lw=0,
+                                   label='ensemble p1-p99')
                 for sign in (-1, 1):
-                    axis.step(mean + sign * norm.ppf(.99) * white_std, depth, where='mid', color='tab:purple',
-                              ls='--', lw=1., label='white threshold (p1-p99 equiv.)' if sign > 0 else None)
-                axis.step(mean, depth, where='mid', color='k', lw=1.4, label='ensemble mean')
+                    axis.step(in_scale(mean + sign * norm.ppf(.99) * white_std), depth, where='mid',
+                              color='tab:purple', ls='--', lw=1.,
+                              label='white threshold (p1-p99 equiv.)' if sign > 0 else None)
+                axis.step(in_scale(mean), depth, where='mid', color='k', lw=1.4, label=mean_label)
                 if reference is not None:
-                    axis.plot(np.log10(reference[key][:, ref_column]), ref_z, color='red', lw=1.4, label='benchmark')
+                    axis.plot(in_scale(np.log10(reference[key][:, ref_column])), ref_z, color='red', lw=1.4,
+                              label='benchmark')
                 if lwd is not None:
                     # The LWD reading at the bit: Res1 is the LWD Rh, Res2 the LWD Rv.
-                    axis.scatter([lwd_values[current['index'], KEYS.index(key)]], [lwd_tvd[current['index']]],
+                    axis.scatter([float(in_scale(lwd_values[current['index'], KEYS.index(key)]))],
+                                 [lwd_tvd[current['index']]],
                                  color='red', marker='o', s=36, zorder=6, label=f'LWD {key} at the bit')
                 axis.axhline(bit_z, color=FIDELITY_COLORS[current['fidelity']], ls=':', lw=1.4, label='bit TVD')
-                axis.set_xlim(*profile_limits[key])
+                axis.set_xlim(*in_scale(profile_limits[key]))
                 axis.set_ylim(z_bottom, z_top)
-                axis.set_xlabel(f'log10 {key} [ohm m]')
-                axis.set_title(f'log10 {key}, bit column at {position_text}', fontsize=10)
+                axis.set_xlabel(f'{quantity[key]} [ohm m]')
+                axis.set_title(f'{quantity[key]}, bit column at {position_text}', fontsize=10)
                 axis.grid(alpha=.3)
             tick_in_unit(profiles[0].yaxis, feet)       # the two panels share the TVD axis and its ticker
             profiles[0].set_ylabel(depth_label)
@@ -466,6 +562,11 @@ def render(args):
             fig.suptitle(f'{args.run_dir.name}: logging point {current["index"]} ({current["fidelity"]}), '
                          f'{position_text}\n{view_text}variance wash p{args.uncertainty_percentile:g} of the final '
                          f'curtain, white above {args.uncertainty_white_threshold:g}', fontsize=12, y=.975)
+            if speeds is not None:
+                # The speed readout sits in the top right corner, above the second title line.
+                fig.text(.988, .993, speed_text(speeds[current['index']]), ha='right', va='top', fontsize=11,
+                         family='monospace', bbox={'boxstyle': 'round,pad=0.3', 'facecolor': 'white',
+                                                   'edgecolor': '0.5'})
             fig.savefig(workdir / f'frame-{frame_number:04d}.png', dpi=args.dpi)
             plt.close(fig)
             print(f'frame {frame_number + 1}/{len(frames)}', end='\r', flush=True)
