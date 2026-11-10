@@ -10,6 +10,12 @@ envelope (as in ``plot_curtain_overview.py``). Window, colour bars, profile axes
 and the variance scale (percentile of the final curtain) are fixed over all
 frames. Checkpoints are read one at a time; the curtain is painted
 incrementally exactly as ``plot_curtain.build_curtain`` does.
+
+``--view-points N`` replaces the fixed full-curtain window by a view that moves
+with the bit: N logging points wide, the bit ``--view-bit-position`` points from
+its left edge, so each frame shows the estimate around the bit as it stood when
+that point was inverted. ``--plain-panels`` adds the same two maps without the
+variance wash under the washed ones (2 x 2: Rh column, Rv column).
 """
 
 import argparse
@@ -26,6 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 from scipy.stats import norm
 
@@ -34,6 +41,7 @@ from plot_curtain import (AXIS_LABELS, CHECKPOINT_RE, fidelity_of, horizontal_le
 from plot_curtain_section import FIDELITY_COLORS, draw_path, load_benchmark
 
 KEYS = ('Rh', 'Rv')
+UNPAINTED = '0.86'      # moving view: background of cells that hold no model yet
 
 
 def parse_args(argv=None):
@@ -52,6 +60,15 @@ def parse_args(argv=None):
                         help='LWD_resistivity.txt (log point, Res1 = LWD Rh, Res2 = LWD Rv): the current point\'s '
                              'reading is drawn as a red dot at the bit TVD in the Rh and Rv bit-column panels '
                              '(needs --trajectory)')
+    parser.add_argument('--view-points', type=int, default=None, metavar='N',
+                        help='Moving view: show N logging points around the bit instead of the whole curtain '
+                             '(the positions come from --trajectory when given, else from the checkpoints)')
+    parser.add_argument('--view-bit-position', type=int, default=None, metavar='K',
+                        help='Logging points between the left edge of the moving view and the bit (K behind, '
+                             'N - K ahead; default three quarters of N)')
+    parser.add_argument('--plain-panels', action='store_true',
+                        help='Add the Rh and Rv maps without the variance wash under the washed ones '
+                             '(2 x 2: Rh column, Rv column)')
     parser.add_argument('--uncertainty-percentile', type=float, default=95.)
     parser.add_argument('--uncertainty-strength', type=float, default=.75)
     parser.add_argument('--uncertainty-white-threshold', type=float, default=.35)
@@ -65,7 +82,73 @@ def parse_args(argv=None):
         parser.error(f'--x-axis {args.x_axis} needs --trajectory')
     if args.lwd is not None and args.trajectory is None:
         parser.error('--lwd needs --trajectory (TVD of the logging points)')
+    if args.view_points is None:
+        if args.view_bit_position is not None:
+            parser.error('--view-bit-position needs --view-points')
+    else:
+        if args.view_points < 2:
+            parser.error('--view-points must be at least 2')
+        if args.view_bit_position is None:
+            args.view_bit_position = int(round(.75 * args.view_points))
+        if not 0 <= args.view_bit_position <= args.view_points:
+            parser.error('--view-bit-position must lie between 0 and --view-points')
     return args
+
+
+def logging_positions(trajectory, meta):
+    """Along-plane x [ft] of the logging points by index.
+
+    The trajectory gives every logging point, also those not yet inverted; without one the
+    checkpoints' window centres are used (interpolated over missing indices).
+    """
+    if trajectory is not None:
+        from field_trajectory import FEET_PER_METER, along_well_trajectory, read_trajectory
+        well, _ = along_well_trajectory(read_trajectory(trajectory))
+        return well['X'][:, 0] * FEET_PER_METER
+    indices = np.array([m['index'] for m in meta])
+    if len(indices) < 2:
+        raise ValueError('A moving view needs at least two logging points')
+    return np.interp(np.arange(indices.max() + 1), indices, [m['bit'][0] for m in meta])
+
+
+def view_limits(positions, index, points, bit_position):
+    """Plane-x limits of a view ``points`` logging points wide with the bit ``bit_position`` points from the left.
+
+    Logging points before the first or after the last one are extrapolated with the end spacing,
+    so the bit keeps its place in the view at both ends of the well.
+    """
+    positions = np.asarray(positions, dtype=float)
+    last = len(positions) - 1
+
+    def at(point):
+        if point < 0:
+            return positions[0] + point * (positions[1] - positions[0])
+        if point > last:
+            return positions[last] + (point - last) * (positions[last] - positions[last - 1])
+        return positions[point]
+
+    return float(at(index - bit_position)), float(at(index + points - bit_position))
+
+
+def view_columns(x_edges, limits):
+    """Canvas column range [first, last) that intersects the view; empty when it lies outside the canvas."""
+    dx = x_edges[1] - x_edges[0]
+    columns = len(x_edges) - 1
+    first = int(np.clip(np.floor((limits[0] - x_edges[0]) / dx), 0, columns))
+    last = int(np.clip(np.ceil((limits[1] - x_edges[0]) / dx), 0, columns))
+    return first, last
+
+
+def map_colorbar(fig, axes, norm_, cmap, label):
+    """One colour bar to the right of a column of equal-aspect maps, aligned with their drawn boxes."""
+    for axis in axes:
+        axis.apply_aspect()
+    boxes = [axis.get_position() for axis in axes]
+    right = max(box.x1 for box in boxes)
+    bottom, top = min(box.y0 for box in boxes), max(box.y1 for box in boxes)
+    bar = fig.colorbar(ScalarMappable(norm=norm_, cmap=cmap), cax=fig.add_axes([right + .008, bottom, .011, top - bottom]))
+    bar.set_label(label)
+    return bar
 
 
 def lwd_log(lwd, trajectory):
@@ -92,6 +175,16 @@ def load(path):
         return pickle.load(stream)
 
 
+def readable_paths(paths):
+    """Drop the newest checkpoint if it cannot be read yet (a running chain may still be writing it)."""
+    try:
+        load(paths[-1])
+    except (EOFError, pickle.UnpicklingError):
+        print(f'skipping {paths[-1].name}: still being written')
+        return paths[:-1]
+    return paths
+
+
 def bit_position(result):
     dx, dz = result['spacing_ft'][0], result['spacing_ft'][2]
     return (result['shift_ft']['x'] + result['dims'][0] / 2 * dx, result['shift_ft']['z'] + result['dims'][2] / 2 * dz)
@@ -113,6 +206,8 @@ def column_samples(result):
 def collect(args):
     """Pass 1: window extent and path; pass 2: incremental at-bit painting, one snapshot per frame."""
     paths = checkpoint_paths(args.run_dir)
+    if paths:
+        paths = readable_paths(paths)
     if not paths:
         raise RuntimeError(f'No checkpoints in {args.run_dir}')
     meta = []
@@ -183,33 +278,73 @@ def render(args):
     path_z = np.array([m['bit'][1] for m in meta])
     fidelities = [m['fidelity'] for m in meta]
     counts_total = {fidelity: fidelities.count(fidelity) for fidelity in FIDELITY_COLORS}
+    view = getattr(args, 'view_points', None) is not None
+    plain = bool(getattr(args, 'plain_panels', False))
+    positions = logging_positions(getattr(args, 'trajectory', None), meta) if view else None
+    view_text = (f'view of {args.view_points} logging points: {args.view_bit_position} behind the bit, '
+                 f'{args.view_points - args.view_bit_position} ahead; ' if view else '')
 
     workdir = Path(tempfile.mkdtemp(prefix='inversion-gif-'))
     try:
         for frame_number, frame in enumerate(frames):
             number, current = frame['number'], frame['meta']
-            fig = plt.figure(figsize=(15, 15))
-            outer = fig.add_gridspec(2, 1, height_ratios=[2.7, 1.5], hspace=.16)
-            maps_grid = outer[0].subgridspec(2, 1, hspace=.22)
-            maps = [fig.add_subplot(maps_grid[row]) for row in range(2)]
-            for axis, key in zip(maps, KEYS):
-                rgba = uncertainty_rgba(frame['log10'][key].T, frame['variance'][key].T, cmap, norms[key], scale,
-                                        args.uncertainty_strength, args.uncertainty_white_threshold)
-                axis.imshow(rgba, extent=(x0, x1, z_edges[0], z_edges[-1]), origin='lower',
-                            interpolation='nearest', aspect='auto')
+            limits = (view_limits(positions, current['index'], args.view_points, args.view_bit_position)
+                      if view else (x0, x1))
+            first, last = view_columns(x_edges, limits)
+
+            def draw_map(axis, key, washed):
+                """One estimate map up to this frame, with or without the variance wash."""
+                if last > first:
+                    rgba = uncertainty_rgba(frame['log10'][key][first:last].T, frame['variance'][key][first:last].T,
+                                            cmap, norms[key], scale if washed else 0.,
+                                            args.uncertainty_strength, args.uncertainty_white_threshold)
+                    axis.imshow(rgba, extent=(x_edges[first], x_edges[last], z_edges[0], z_edges[-1]),
+                                origin='lower', interpolation='nearest', aspect='auto')
                 draw_path(axis, path_x[:number + 1], path_z[:number + 1], fidelities[:number + 1], 1.6, 4)
                 axis.scatter([current['bit'][0]], [current['bit'][1]], marker='x', color='k', s=60, zorder=6)
-                axis.set_xlim(x0, x1)
+                axis.set_xlim(*limits)
                 axis.set_ylim(z_bottom, z_top)
                 axis.set_aspect('equal', adjustable='box')
-                axis.set_ylabel('TVD [ft]')
-                axis.set_title(f'Estimated log10 {key} (at bit)')
-                bar = fig.colorbar(ScalarMappable(norm=norms[key], cmap=cmap), ax=axis, fraction=.02, pad=.01)
-                bar.set_label(f'log10 {key} [ohm m]')
+                if view:
+                    axis.set_facecolor(UNPAINTED)       # no model there yet; white is the variance threshold
                 if length_maps is not None:
                     label_horizontal_length(axis, *length_maps, label=position_label)
                     axis.set_xlabel('')
-            maps[1].set_xlabel(position_label)
+
+            if plain:
+                # 2 x 2: Rh column and Rv column, the washed maps over the plain ones.
+                fig = plt.figure(figsize=(15, 13))
+                outer = fig.add_gridspec(2, 1, height_ratios=[1.45, 1.], hspace=.2, left=.065, right=.945,
+                                         top=.875, bottom=.055)
+                maps_grid = outer[0].subgridspec(2, 2, hspace=.12, wspace=.2)
+                maps = [fig.add_subplot(maps_grid[row, column]) for row in range(2) for column in range(2)]
+                for place, axis in enumerate(maps):
+                    row, column = divmod(place, 2)
+                    draw_map(axis, KEYS[column], washed=row == 0)
+                    axis.set_title(f'Estimated log10 {KEYS[column]} (at bit), '
+                                   + ('variance wash' if row == 0 else 'no variance wash'), fontsize=11)
+                    if column == 0:
+                        axis.set_ylabel('TVD [ft]')
+                    else:
+                        axis.tick_params(labelleft=False)
+                    if row == 0:
+                        axis.tick_params(labelbottom=False)
+                    else:
+                        axis.set_xlabel(position_label)
+                for column, key in enumerate(KEYS):
+                    map_colorbar(fig, maps[column::2], norms[key], cmap, f'log10 {key} [ohm m]')
+            else:
+                fig = plt.figure(figsize=(15, 15))
+                outer = fig.add_gridspec(2, 1, height_ratios=[2.7, 1.5], hspace=.16)
+                maps_grid = outer[0].subgridspec(2, 1, hspace=.22)
+                maps = [fig.add_subplot(maps_grid[row]) for row in range(2)]
+                for axis, key in zip(maps, KEYS):
+                    draw_map(axis, key, washed=True)
+                    axis.set_ylabel('TVD [ft]')
+                    axis.set_title(f'Estimated log10 {key} (at bit)')
+                    bar = fig.colorbar(ScalarMappable(norm=norms[key], cmap=cmap), ax=axis, fraction=.02, pad=.01)
+                    bar.set_label(f'log10 {key} [ohm m]')
+                maps[1].set_xlabel(position_label)
 
             profile_grid = outer[1].subgridspec(1, 2, wspace=.08)
             profiles = [fig.add_subplot(profile_grid[0])]
@@ -246,11 +381,13 @@ def render(args):
             handles = [Line2D([], [], color=color, lw=2.2, marker='o', ms=4, mec='k', mew=.3,
                               label=f'{fidelity} points ({counts[fidelity]} of {counts_total[fidelity]})')
                        for fidelity, color in FIDELITY_COLORS.items()]
-            fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(.5, .935), ncol=2, fontsize=10,
-                       frameon=False)
+            if view:
+                handles.append(Patch(facecolor=UNPAINTED, edgecolor='0.6', label='not yet inverted'))
+            fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(.5, .935), ncol=len(handles),
+                       fontsize=10, frameon=False)
             fig.suptitle(f'{args.run_dir.name}: logging point {current["index"]} ({current["fidelity"]}), '
-                         f'{position_text}\nvariance wash p{args.uncertainty_percentile:g} of the final curtain, '
-                         f'white above {args.uncertainty_white_threshold:g}', fontsize=12, y=.975)
+                         f'{position_text}\n{view_text}variance wash p{args.uncertainty_percentile:g} of the final '
+                         f'curtain, white above {args.uncertainty_white_threshold:g}', fontsize=12, y=.975)
             fig.savefig(workdir / f'frame-{frame_number:04d}.png', dpi=args.dpi)
             plt.close(fig)
             print(f'frame {frame_number + 1}/{len(frames)}', end='\r', flush=True)
