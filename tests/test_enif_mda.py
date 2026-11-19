@@ -93,3 +93,50 @@ def test_driver_runs_the_gated_chain_with_enif(tmp_path, gate_environment):
     for flags in (['--lateral-update', 'ridge'], ['--cascade-threshold', '5', '--likelihood-weight', '.5']):
         with pytest.raises(SystemExit):
             driver.parse_args(['--output-dir', str(tmp_path / 'x'), '--analysis', 'enif', *flags])
+
+
+@pytest.mark.parametrize('statistic', ['mean', 'members'])
+def test_driver_reweights_the_enif_precision(tmp_path, gate_environment, statistic):
+    import json
+    import pickle
+    import run_chain_laplace_loop as loop
+    import sequential_matern_1d as driver
+    _, reference = gate_environment
+    common = ['--reference', str(reference), '--stop', '2', '--ensemble-size', '40', '--mda-steps', '3',
+              '--memory-ft', '20', '--analysis', 'enif']
+    plain, output = tmp_path / 'plain', tmp_path / statistic
+    assert driver.main([*common, '--output-dir', str(plain)]) == 0
+    assert driver.main([*common, '--output-dir', str(output), '--student-weights', statistic,
+                        '--student-rounds', '2', '--student-scales', '.2', '.1', '.1', '.05']) == 0
+    study = json.loads((output / 'study.json').read_text())
+    assert study['increment_prior']['weights'] == statistic and study['increment_prior']['rounds'] == 2
+    assert json.loads((plain / 'study.json').read_text())['increment_prior'] == 'none'
+    history = json.loads((output / 'history.json').read_text())
+    assert [[entry['round'] for entry in record['reweighting']] for record in history] == [[1, 2], [1, 2]]
+    assert json.loads((plain / 'history.json').read_text())[0]['reweighting'] == []
+    # Every round starts from the carried prior: the recorded steps are those of the last round only.
+    assert [step['step'] for step in history[0]['steps']] == [0, 1, 2, 3]
+    assert history[1]['posterior']['mean_prediction_1d_misfit'] < history[1]['prior']['mean_prediction_1d_misfit']
+    # The gate statistic is that of the Matern round: the same number as in the chain without reweighting.
+    before_history = json.loads((plain / 'history.json').read_text())
+    assert history[0]['gate']['post_member_median_misfit'] == pytest.approx(
+        before_history[0]['gate']['post_member_median_misfit'])
+    assert history[0]['gate']['reweighted_post_member_median_misfit'] == pytest.approx(
+        history[0]['posterior']['member_1d_misfit_median'])
+    assert 'update' not in before_history[0]['gate']
+    with open(output / 'inversion_results_assim_0.pkl', 'rb') as stream:
+        saved = pickle.load(stream)
+    with open(plain / 'inversion_results_assim_0.pkl', 'rb') as stream:
+        before = pickle.load(stream)
+    np.testing.assert_allclose(saved['prior_params'], before['prior_params'])        # same carried prior
+    assert not np.allclose(saved['post_mda_params'], before['post_mda_params'])      # another precision
+    arguments = loop.driver_arguments(study, 4)
+    assert arguments[arguments.index('--student-weights') + 1] == statistic
+    assert arguments[arguments.index('--student-rounds') + 1] == '2'
+    position = arguments.index('--student-scales')
+    assert arguments[position + 1:position + 5] == ['0.2', '0.1', '0.1', '0.05']
+    resumed = driver.parse_args(['--output-dir', str(output), *arguments])
+    assert resumed.student_weights == statistic and list(resumed.student_scales) == [.2, .1, .1, .05]
+    assert '--student-weights' not in loop.driver_arguments({**study, 'increment_prior': 'none'}, 4)
+    with pytest.raises(SystemExit):
+        driver.parse_args(['--output-dir', str(tmp_path / 'x'), '--student-weights', 'mean'])

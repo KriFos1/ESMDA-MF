@@ -59,7 +59,7 @@ def main(argv=None):
     import re
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--benchmark', type=Path, default=here.parent / 'Dashboard/benchmarks/Benchmark-3')
+    parser.add_argument('--benchmark', type=Path, default=here.parent / 'data-Benchmark-3/Benchmark-3')
     parser.add_argument('--output-dir', type=Path, required=True, help='Fresh directory for generated observations')
     parser.add_argument('--noise-fraction', type=float, default=.025)
     args = parser.parse_args(argv)

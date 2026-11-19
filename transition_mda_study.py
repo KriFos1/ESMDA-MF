@@ -105,7 +105,7 @@ def score_study(output, threshold, count):
 
 
 def updater_for(state, cells, threshold, distance_localization=None):
-    from pipt.update_schemes.update_methods_ns.approx_update import approx_update
+    from pet_compat import ApproxUpdater as approx_update
 
     ne = state.shape[1]
     updater = approx_update()

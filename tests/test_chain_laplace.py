@@ -240,6 +240,22 @@ def test_loop_helpers_find_pending_gates_and_parse_sacct(tmp_path):
     assert arguments[arguments.index('--memory-ft') + 1] == '50.0'
     assert arguments[arguments.index('--gate-threshold') + 1] == '10.0'
     assert '--memory-ft' not in loop.driver_arguments({**study, 'relaxation': 'none', 'gate': 'none'}, 51)
+    assert '--model-error' not in arguments and '--model-error' not in loop.driver_arguments(
+        {**study, 'model_error': 'none'}, 51)
+    with_error = loop.driver_arguments({**study, 'model_error': {'file': '/tmp/table.json'}}, 51)
+    assert with_error[with_error.index('--model-error') + 1] == '/tmp/table.json'
+    # The mean factor is always explicit: chains from before the default became 4 used 1.
+    assert arguments[arguments.index('--memory-mean-factor') + 1] == '1.0'
+    kept = {'memory_ft': 50., 'adaptive': {'ahead_factor': 1., 'surprise_factor': 1., 'taper_ft': 40.,
+                                             'surprise_misfit': [3., 25.], 'mean_factor': 4.}}
+    arguments = loop.driver_arguments({**study, 'relaxation': kept}, 51)
+    assert arguments[arguments.index('--memory-mean-factor') + 1] == '4.0'
+    assert not [argument for argument in arguments if 'surprise' in argument]
+    # Chains started with the removed options (ahead factor, latent factor, surprise) cannot be resumed.
+    for removed in ({'ahead_factor': .5, 'surprise_factor': 1.}, {'latent_factor': 3.},
+                    {'surprise_factor': .4, 'surprise_misfit': [300., 1500.], 'surprise_trigger': 'forecast'}):
+        with pytest.raises(ValueError, match='removed'):
+            loop.driver_arguments({**study, 'relaxation': {'memory_ft': 50., 'adaptive': removed}}, 51)
     # The resumed driver keeps the chain's own reference (its run.json supplies the data).
     assert '--reference' not in arguments
     referenced = loop.driver_arguments({**study, 'reference': '/runs/ref'}, 51)
@@ -294,7 +310,7 @@ def test_loop_pause_file_stops_before_any_work(tmp_path, monkeypatch):
 def test_map_stage_adopts_a_job_or_result_left_by_a_previous_controller(tmp_path, monkeypatch, remote_state):
     import run_chain_laplace_loop as loop
     monkeypatch.setattr(loop, 'ROOT', tmp_path)
-    member = tmp_path / 'runs' / 'chain-laplace-idx007-test' / 'member-000'
+    member = tmp_path / 'runs' / '2d-solves' / 'test' / 'idx007' / 'member-000'
     member.mkdir(parents=True)                       # prepared and deployed earlier
     (member.parent / 'study.json').write_text(json.dumps({'count': 1}))
     commands, waited = [], []
@@ -330,7 +346,7 @@ def test_map_stage_adopts_a_job_or_result_left_by_a_previous_controller(tmp_path
 def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, monkeypatch):
     import run_chain_laplace_loop as loop
     monkeypatch.setattr(loop, 'ROOT', tmp_path)
-    member = tmp_path / 'runs' / 'chain-laplace-idx007-test' / 'member-000'
+    member = tmp_path / 'runs' / '2d-solves' / 'test' / 'idx007' / 'member-000'
     commands = []
 
     def fake_run(command, capture=False, env=None):
@@ -365,7 +381,7 @@ def test_fresh_map_stage_passes_the_build_and_orientation_to_prepare(tmp_path, m
 def test_multi_start_map_stage_resamples_the_lowest_objective(tmp_path, monkeypatch):
     import run_chain_laplace_loop as loop
     monkeypatch.setattr(loop, 'ROOT', tmp_path)
-    run_dir = tmp_path / 'runs' / 'chain-laplace-idx007-test'
+    run_dir = tmp_path / 'runs' / '2d-solves' / 'test' / 'idx007'
     commands, submitted = [], []
     objectives = {0: 40., 1: 12., 2: 25.}
 
@@ -848,3 +864,107 @@ def test_gate_export_uses_the_requested_2d_prior(tmp_path, gate_environment):
     assert arguments[arguments.index('--two-d-prior') + 1] == 'ensemble_precision'
     assert arguments[arguments.index('--lateral-update') + 1] == 'ridge'
     assert arguments[arguments.index('--gate-threshold') + 1] == '10.0'
+
+
+def test_merged_logging_points_enter_the_2d_stage_with_their_shares(tmp_path, gate_environment):
+    import run_chain_laplace_loop as loop
+    _, reference = gate_environment
+    plain = chain_laplace.load_problem(run_chain(tmp_path, reference, 'plain') / 'laplace-problem-002.npz')
+    chain = run_chain(tmp_path, reference, 'merged', '--merge-behind', '1', '2', '5', '--merge-shares',
+                      '.5', '.3', '.2', '.1')
+    study = json.loads((chain / 'study.json').read_text())
+    assert study['merge']['behind'] == [1, 2, 5] and study['merge']['shares'] == [.5, .3, .2, .1]
+    problem = chain_laplace.load_problem(chain / 'laplace-problem-002.npz')
+    # Gate point 2 first, then the points 1 and 2 indices behind it; the point before the well start is skipped.
+    assert problem['tool_indices'].tolist() == [2, 1, 0] and problem['merge_shares'].tolist() == [.5, .3, .2]
+    count = len(plain['observations'])
+    assert problem['merge_channels'].tolist() == [count] * 3 and len(problem['mask']) == 3 * len(plain['mask'])
+    np.testing.assert_array_equal(problem['observations'][:count], plain['observations'])
+    np.testing.assert_allclose(problem['observations'][count:], 2.)          # the data of points 1 and 0
+    np.testing.assert_allclose(problem['measurement_variance'], np.tile(plain['variance'], 3))
+    np.testing.assert_allclose(problem['variance'], np.concatenate([plain['variance'] / share
+                                                                    for share in (.5, .3, .2)]))
+    np.testing.assert_array_equal(problem['prior_ensemble'], plain['prior_ensemble'])   # the 1D stage is unchanged
+    block, observations, variance, mask = chain_laplace.current_point(problem)
+    assert block == slice(0, count) and len(mask) == len(plain['mask'])
+    np.testing.assert_array_equal(observations, plain['observations'])
+    np.testing.assert_allclose(variance, plain['variance'])
+    assert chain_laplace.current_point(plain)[0] == slice(None) and chain_laplace.merge_record(plain) is None
+    # Default shares: half for the current point, the rest split over the offsets.
+    assert driver.parse_args(['--output-dir', 'x', '--gate-threshold', '1', '--merge-behind', '5', '10']
+                             ).merge_shares == [.5, .25, .25]
+    arguments = loop.driver_arguments(study, 4)
+    position = arguments.index('--merge-behind')
+    assert arguments[position + 1:position + 4] == ['1', '2', '5']
+    assert driver.parse_args(['--output-dir', str(chain), *arguments]).merge_shares == [.5, .3, .2, .1]
+    assert '--merge-behind' not in loop.driver_arguments({**study, 'merge': 'none'}, 4)
+    # Own history only: point 2 has the points 1 and 2 behind it in this chain, but not the point 5 behind,
+    # so nothing is merged and the problem is the plain one; with offsets 1 and 2 only, it merges.
+    assert not study['merge']['own_history'] and '--merge-own-history' not in arguments
+    waiting = run_chain(tmp_path, reference, 'waiting', '--merge-behind', '1', '2', '5', '--merge-own-history')
+    waiting_study = json.loads((waiting / 'study.json').read_text())
+    assert waiting_study['merge']['own_history'] and '--merge-own-history' in loop.driver_arguments(waiting_study, 4)
+    unmerged = chain_laplace.load_problem(waiting / 'laplace-problem-002.npz')
+    assert 'tool_indices' not in unmerged and chain_laplace.merge_record(unmerged) is None
+    np.testing.assert_array_equal(unmerged['observations'], plain['observations'])
+    np.testing.assert_array_equal(unmerged['variance'], plain['variance'])
+    ready = run_chain(tmp_path, reference, 'ready', '--merge-behind', '1', '2', '--merge-own-history')
+    assert chain_laplace.load_problem(ready / 'laplace-problem-002.npz')['tool_indices'].tolist() == [2, 1, 0]
+    with pytest.raises(SystemExit):
+        driver.parse_args(['--output-dir', 'x', '--gate-threshold', '1', '--merge-own-history'])
+    for flags in (['--merge-behind', '5'], ['--gate-threshold', '1', '--merge-shares', '.5'],
+                  ['--gate-threshold', '1', '--merge-behind', '5', '--merge-shares', '.5'],
+                  ['--gate-threshold', '1', '--merge-behind', '0']):
+        with pytest.raises(SystemExit):
+            driver.parse_args(['--output-dir', 'x', *flags])
+
+    # The 2D stage: the solver study lists the tool positions; the checkpoint keeps the gate point's own data.
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'study.json').write_text(json.dumps({
+        'method': 'standalone_original_prior_rml', 'index': 45, 'count': 25, 'seed': 1,
+        'ratio_max': 3., 'optimizer_method': rml.LM_OPTIMIZER, 'optimizer': {'candidates': 4},
+        'resources': {'memory_gib': 48, 'walltime': '01:00:00'},
+        'simulator': {'backend': 'local', 'cpus': 8, 'ranks': 2, 'concurrency': 4, 'physical_cores': True},
+        'inputs_sha256': 'unused'}))
+    run_dir = tmp_path / 'laplace-run'
+    rml.prepare_laplace(SimpleNamespace(run_dir=run_dir, source=source, binary_dir=None, orientation=None,
+                                        problem=chain / 'laplace-problem-002.npz'))
+    solver_study = json.loads((run_dir / 'study.json').read_text())
+    assert solver_study['tool_indices'] == [2, 1, 0] and rml.tool_indices(solver_study) == [2, 1, 0]
+    # Real time: the three tool positions run side by side, in an allocation three times as large.
+    script = (run_dir / 'rml-array.sbatch').read_text()
+    assert solver_study['position_concurrency'] == 3
+    assert '--nodes=1-3' in script and '--ntasks=24' in script and '--mem=144G' in script
+    serial = tmp_path / 'laplace-run-serial'
+    rml.prepare_laplace(SimpleNamespace(run_dir=serial, source=source, binary_dir=None, orientation=None,
+                                        problem=chain / 'laplace-problem-002.npz', position_concurrency=1))
+    script = (serial / 'rml-array.sbatch').read_text()
+    assert '--nodes=1\n' in script and '--ntasks=8' in script and '--mem=48G' in script
+    with np.load(run_dir / 'inputs.npz') as inputs:
+        np.testing.assert_allclose(inputs['variance'], problem['variance'])
+        assert len(inputs['mask']) == 3 * len(plain['mask'])
+    prior = rml.load_prior(solver_study, run_dir)
+    member = run_dir / 'member-000'
+    member.mkdir()
+    nd = len(problem['observations'])
+    jacobian = np.zeros((nd, 60))
+    jacobian[:, 12:18] = 1. / 6.
+    prediction = np.full(nd, float(prior.mean[12:18].mean()))
+    np.savez(member / 'fit.npz', model=prior.mean, z=np.zeros(60), prediction=prediction)
+    np.savez(member / 'laplace.npz', model=prior.mean, prediction=prediction, jacobian=jacobian)
+    (member / 'result.json').write_text(json.dumps({'reason': 'objective_stagnation', 'converged': True,
+                                                    'accepted_iterations': 3, 'seconds_this_attempt': 9.}))
+    assert chain_laplace.main(['sample', '--chain', str(chain), '--map', str(run_dir),
+                               '--count', '40', '--seed', '1']) == 0
+    with open(chain / 'inversion_results_assim_2.pkl', 'rb') as stream:
+        saved = pickle.load(stream)
+    np.testing.assert_array_equal(saved['observations'], plain['observations'])
+    np.testing.assert_allclose(saved['data_covariance'], plain['variance'])
+    assert len(saved['observation_mask']) == len(plain['mask']) and len(saved['posterior_predictions'][0]) == count
+    assert saved['merged_points'] == {'tool_indices': [2, 1, 0], 'shares': [.5, .3, .2], 'channels': [count] * 3}
+    expected = float(np.mean((prediction[:count] - plain['observations']) ** 2 / plain['variance']))
+    assert saved['posterior_misfit'][0] == pytest.approx(expected)
+    laplace = json.loads((chain / 'laplace-002.json').read_text())['posterior']
+    assert laplace['map_2d_misfit'] == pytest.approx(expected) and laplace['merge']['tool_indices'] == [2, 1, 0]
+    assert laplace['merge']['map_2d_misfit_all_points'] < expected          # points 1 and 0 fit better
