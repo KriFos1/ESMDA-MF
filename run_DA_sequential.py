@@ -648,11 +648,11 @@ def _auto_adaloc_config(localization_threshold, cells):
 
 
 def _configure_auto_adaloc(updater, localization_threshold, cells, member_count):
-    from pipt.misc_tools.cov_regularization import localization
+    from pet_compat import auto_adaptive_localization
 
     config = _auto_adaloc_config(localization_threshold, cells)
     updater.keys_da = {'localization': config}
-    updater.localization = localization(config, [], [], updater.list_states, member_count)
+    updater.localization = auto_adaptive_localization(localization_threshold, cells)
     return config
 
 
@@ -1009,7 +1009,7 @@ def main(argv=None):
     background, reservoir, mode_std = prior_parameters_ln(args)
     projection = (args.prior_style == 'blocky' and args.prior_projection == 'on'
                   and args.regularization != 'tv')
-    from pipt.update_schemes.update_methods_ns.approx_update import approx_update
+    from pet_compat import ApproxUpdater as approx_update
     benchmark = args.benchmark.resolve()
     resume_checkpoint = (args.resume_checkpoint.resolve()
                          if args.resume_checkpoint is not None else None)

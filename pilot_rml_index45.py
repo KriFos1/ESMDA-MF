@@ -25,7 +25,7 @@ TERMINAL_REASONS = ('relative_gradient', 'objective_stagnation', 'nonlinearity_l
                     'iteration_limit', 'gradient_tolerance', 'stalled', 'no_acceptable_trial')
 MODULES = ['pilot_rml_index45.py', 'matern_prior.py', 'rml_standalone.py', 'background_prior.py',
            'lm_laplace.py', 'rolling_prior.py', 'esmda_core.py', 'esmda_remote2d.py',
-           'run_DA_sequential.py', 'tv_regularization.py', 'sparse_precision.py']
+           'run_DA_sequential.py', 'tv_regularization.py', 'sparse_precision.py', 'increment_prior.py']
 
 
 def digest(path):
@@ -79,6 +79,11 @@ def load_base_prior(study, directory=None):
         if directory is None:
             raise ValueError('An ensemble-precision prior needs the run directory')
         return EnsemblePrecisionPrior.load(Path(directory) / prior['file'])
+    if prior.get('type') == 'student_increment':
+        from increment_prior import IncrementPrior
+        if directory is None:
+            raise ValueError('An increment prior needs the run directory')
+        return IncrementPrior.load(Path(directory) / prior['file'])
     if prior.get('type') == 'ensemble_spatial':
         from lm_laplace import SpatialPrior
         if directory is None:
@@ -396,6 +401,9 @@ def prepare_laplace(args):
     simulator = {key: value for key, value in (('binary_dir', args.binary_dir),
                                                ('orientation', args.orientation)) if value is not None}
     source['simulator'] = {**source['simulator'], **simulator}
+    slurm = {key: getattr(args, key) for key in ('partition', 'account', 'qos') if getattr(args, key, None) is not None}
+    if slurm:
+        source['resources'] = {**source.get('resources', {}), **slurm}
     for setting in getattr(args, 'optimizer_setting', None) or []:
         key, separator, value = setting.partition('=')
         if not separator or key not in source.get('optimizer', {}):
@@ -411,7 +419,8 @@ def prepare_laplace(args):
         # Single-rank standalone solves (no srun); fwd2D handles both receiver groups in one process.
         source['simulator'] = {**source['simulator'], 'ranks': 1, 'cpus': threads, 'mkl_threads': threads,
                                'concurrency': concurrency, 'srun_steps': False, 'physical_cores': False,
-                               **({'hdfql': str(args.hdfql)} if getattr(args, 'hdfql', None) else {})}
+                               **({'hdfql': str(args.hdfql)} if getattr(args, 'hdfql', None) else {}),
+                               **({'oneapi': str(args.oneapi)} if getattr(args, 'oneapi', None) else {})}
         source['execution'], source['clean_jobs'] = 'node', True
     problem_path = args.problem.resolve()
     problem = load_problem(problem_path)
@@ -424,7 +433,21 @@ def prepare_laplace(args):
         weight = float(args.likelihood_weight)
     observations, variance = problem['observations'], problem['variance']
     output.mkdir(parents=True)
-    if getattr(args, 'prior', 'carried') == 'matern':
+    if getattr(args, 'increment_prior', None) is not None:
+        # One reweighting round of a Student-t increment prior: a Gaussian increment prior with the face
+        # weights of the previous round's model (increment_prior.py); the controller iterates the rounds.
+        from increment_prior import IncrementPrior
+        prior = IncrementPrior.load(args.increment_prior)
+        if prior.shape != (2, nx, nz):
+            raise ValueError('The increment prior does not match the window')
+        prior.save(output / 'prior-increment.npz')
+        center = prior.mean
+        prior_spec = {'type': 'student_increment', 'file': 'prior-increment.npz', 'shape': [nx, nz],
+                      'sha256': digest(output / 'prior-increment.npz'),
+                      'source': str(Path(args.increment_prior).resolve())}
+        covariance_note = ('Gaussian increment prior with face weights (one reweighting round of a Student-t '
+                           'increment prior) and a cellwise Gaussian anchor')
+    elif getattr(args, 'prior', 'carried') == 'matern':
         matern = json.loads((problem_path.parent / 'study.json').read_text())['prior']
         if matern.get('family') != 'matern':
             raise ValueError('The chain study does not record a Matern prior')
@@ -485,9 +508,24 @@ def prepare_laplace(args):
             count = n_starts + 1
         start_note = (f'{n_starts} starts from carried-ensemble members {members.tolist()} '
                       f'(seed {start_seed}); prior and data shared')
-    atomic_npz(output / 'inputs.npz', prior_centers=np.tile(center, (count, 1)),
-               measurement_noise=np.zeros((count, len(observations))),
-               targets=np.tile(observations, (count, 1)),
+    centers, noise = np.tile(center, (count, 1)), np.zeros((count, len(observations)))
+    n_rml = getattr(args, 'rml', 0)
+    if n_rml:
+        # Randomized maximum likelihood: every member minimises the same objective around its own prior
+        # draw and its own perturbed data. For a linear forward map the minimisers are exact posterior
+        # samples, so their spread against the Laplace spread measures what the single Gaussian misses.
+        if n_starts or start_file is not None:
+            raise ValueError('Use --rml without --starts / --start-models')
+        if problem['prior_type'] != 'ensemble_precision' or getattr(args, 'prior', 'carried') == 'matern':
+            raise ValueError('--rml is implemented for the carried ensemble_precision prior')
+        rng = np.random.default_rng(getattr(args, 'rml_seed', 0))
+        count = int(n_rml)
+        centers = prior.sample(count, int(rng.integers(2 ** 31 - 1))).T
+        noise = np.sqrt(variance / weight) * rng.normal(size=(count, len(observations)))
+        start_note = (f'RML: {count} members, each with its own prior draw as centre and start and its own '
+                      f"perturbed data (seed {getattr(args, 'rml_seed', 0)})")
+    atomic_npz(output / 'inputs.npz', prior_centers=centers, measurement_noise=noise,
+               targets=observations[None, :] + noise,
                observations=observations, variance=variance / weight, mask=problem['mask'], **starts,
                **{key: value for key, value in problem.items() if key.startswith('well_')})
     study = {**source, 'method': 'chain_laplace_map', 'index': problem['index'], 'count': count,
@@ -500,8 +538,10 @@ def prepare_laplace(args):
              'parameterization': 'raw Gaussian state; Rh clipped only in physical forward map; '
                                  f"anisotropy {problem['anisotropy']}",
              'covariance_note': covariance_note,
-             'randomization_note': (f'MAP: unperturbed observations, Cd / {weight:g} (2D share of the data '
+             'randomization_note': (f'Cd / {weight:g} (2D share of the data energy), {start_note}' if n_rml else
+                                    f'MAP: unperturbed observations, Cd / {weight:g} (2D share of the data '
                                     f'energy), {start_note}'),
+             **({'rml': {'count': int(n_rml), 'seed': getattr(args, 'rml_seed', 0)}} if n_rml else {}),
              'save_jacobian': True,
              'chain': {'run': str(problem_path.parent), 'problem': str(problem_path),
                        'problem_sha256': digest(problem_path), 'probe': problem['probe'],
@@ -522,6 +562,18 @@ def prepare_laplace(args):
     elif start_file is not None:
         study['starts'] = {'count': count, 'labels': labels, 'file': str(Path(start_file).resolve()),
                            'file_sha256': digest(start_file)}
+    if 'tool_indices' in problem:
+        study['tool_indices'] = [int(index) for index in np.ravel(problem['tool_indices'])]
+        if len(problem['mask']) != len(study['tool_indices']) * len(problem['tools']) * 8:
+            raise ValueError('A merged problem needs one full channel mask per tool position')
+        # Real time: the tool positions are solved side by side unless told otherwise; the allocation
+        # then holds that many times the solver tasks (write_array). Node studies clean one shared
+        # job directory per call and stay serial.
+        requested = getattr(args, 'position_concurrency', None)
+        positions = len(study['tool_indices']) if requested is None else int(requested)
+        if not 1 <= positions <= len(study['tool_indices']):
+            raise ValueError('--position-concurrency must lie between 1 and the number of tool positions')
+        study['position_concurrency'] = 1 if study.get('execution') == 'node' else positions
     study.pop('reused_inputs_sha256', None)
     study.pop('cascade', None)
     study['inputs_sha256'] = digest(output / 'inputs.npz')
@@ -539,21 +591,20 @@ def write_array(output, study):
     """
     simulator = study['simulator']
     resources = study.get('resources', {'memory_gib': 8, 'walltime': '04:00:00'})
-    tasks = simulator.get('concurrency', 1) * simulator.get('ranks', 1)
+    positions = int(study.get('position_concurrency', 1))
+    tasks = simulator.get('concurrency', 1) * simulator.get('ranks', 1) * positions
     # Slurm counts hyperthreads as CPUs here (2 per core). Physical-core steps
     # (`srun --hint=nomultithread --cpus-per-task=C`) each consume 2C CPUs, so the
     # allocation must hold 2C per task or concurrent candidate steps queue.
     cpus = simulator['cpus'] * (2 if simulator.get('physical_cores') else 1)
     script = f'''#!/bin/bash
 #SBATCH --job-name=rml-index{study['index']}
-#SBATCH --partition=comp
-#SBATCH --account=energytech
-#SBATCH --qos=normal
-#SBATCH --array=0-{study['count'] - 1}
-#SBATCH --nodes=1
+#SBATCH --partition={resources.get('partition', 'comp')}
+{''.join(f'#SBATCH --{key}={resources.get(key, default)}' + chr(10) for key, default in (('account', 'energytech'), ('qos', 'normal')) if resources.get(key, default))}#SBATCH --array=0-{study['count'] - 1}
+#SBATCH --nodes={'1' if positions == 1 else f'1-{positions}'}
 #SBATCH --ntasks={tasks}
 #SBATCH --cpus-per-task={cpus}
-#SBATCH --mem={resources['memory_gib']}G
+#SBATCH --mem={resources['memory_gib'] * positions}G
 #SBATCH --time={resources['walltime']}
 #SBATCH --output=member-%A_%a.log
 set -euo pipefail
@@ -565,6 +616,8 @@ export PXWF_SRC="$RML_PROJECT/pxwf-src"
 # Solver threads are set per srun step by the worker; keep Python single-threaded.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export MPLBACKEND=Agg
+# Intel MPI must use Slurm's PMI2 library for srun --mpi=pmi2 steps.
+export I_MPI_PMI_LIBRARY="${{I_MPI_PMI_LIBRARY:-{simulator.get('pmi', '/usr/lib64/libpmi2.so')}}}"
 ulimit -s unlimited 2>/dev/null || true
 cd "$RML_PROJECT"
 exec "$RML_PYTHON" -B -u pilot_rml_index45.py "${{RML_ACTION:-member}}" --run-dir "$RML_RUN" --member "$SLURM_ARRAY_TASK_ID"
@@ -625,6 +678,7 @@ def evaluation_setup(study, inputs, output):
         adapter.run_grad_multi = cleaned(adapter.run_grad_multi)
     well = {key[5:]: value for key, value in inputs.items() if key.startswith('well_')}
     cells = solver_dims[0] * solver_dims[2]
+    adapter.backend()                                   # built once, before tool positions run side by side
     lower, upper = study['rh_limits']
 
     def physical_parameters(raw):
@@ -670,6 +724,30 @@ def grid_maps(study):
     return expand, contract, (nx, ny, rows), (dx, dy, 1.)
 
 
+def tool_indices(study):
+    """Logging points whose tool positions are simulated in the window, in data-vector order.
+
+    One point (``index``) by default. With ``tool_indices`` (merged logging points) the observations,
+    variances and channel mask of the problem are those of the listed points, concatenated.
+    """
+    return [int(index) for index in study.get('tool_indices') or [study['index']]]
+
+
+def over_positions(study, call):
+    """``call(index)`` for every tool position, side by side when the study allows it.
+
+    With ``position_concurrency`` > 1 the positions are solved concurrently: each is its own solver
+    batch (own job directory, own srun steps), and the allocation holds that many times the tasks.
+    """
+    indices = tool_indices(study)
+    workers = min(int(study.get('position_concurrency', 1)), len(indices))
+    if workers <= 1:
+        return [call(index) for index in indices]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(call, indices))
+
+
 def phase_flags(inputs):
     from esmda_core import phase_channels
     from esmda_remote2d import UDAR_COMPONENTS
@@ -690,8 +768,8 @@ def forward_evaluator(study, inputs, output):
 
     def predict_batch(raws):
         parameters = [physical_parameters(np.asarray(raw, dtype=float))[0] for raw in raws]
-        predictions = np.asarray(adapter.run_pred_multi(parameters, study['index'], study['shift_ft'], well),
-                                 dtype=float)
+        predictions = np.concatenate(over_positions(study, lambda index: np.asarray(
+            adapter.run_pred_multi(parameters, index, study['shift_ft'], well), dtype=float)), axis=1)
         return align_phases(predictions[:, inputs['mask']], inputs['observations'], phase, axis=1)
 
     return predict_batch
@@ -722,8 +800,13 @@ def model_evaluator(study, inputs, output):
     def evaluate_batch(raws):
         """Forward + Jacobian for several raw states at once; None marks a failed solve."""
         converted = [physical_parameters(raw) for raw in raws]
-        results = adapter.run_grad_multi([parameters for parameters, _, _ in converted],
-                                         study['index'], study['shift_ft'], well)
+        fields = [parameters for parameters, _, _ in converted]
+        per_point = over_positions(study, lambda index: adapter.run_grad_multi(fields, index, study['shift_ft'],
+                                                                               well))
+        # One (prediction, j_rh, j_rv) per model, the tool positions stacked along the data axis.
+        results = [(None, None, None) if any(part[1] is None for part in parts) else
+                   tuple(np.concatenate([part[item] for part in parts], axis=0) for item in range(3))
+                   for parts in zip(*per_point)]
         return [None if j_rh is None else compose(raw, rh, latent, prediction, j_rh, j_rv)
                 for raw, (_, rh, latent), (prediction, j_rh, j_rv) in zip(raws, converted, results)]
 
@@ -799,8 +882,10 @@ def forward_start(args):
     output.mkdir(exist_ok=True)
     started = time.monotonic()
     adapter, well, physical_parameters = evaluation_setup(study, inputs, output)
-    full = np.asarray(adapter.run_pred_multi([physical_parameters(inputs['start_models'][args.member])[0]],
-                                             study['index'], study['shift_ft'], well), dtype=float)[0]
+    start = [physical_parameters(inputs['start_models'][args.member])[0]]
+    adapter.backend()                                   # built once, before the positions run side by side
+    full = np.concatenate(over_positions(study, lambda index: np.asarray(
+        adapter.run_pred_multi(start, index, study['shift_ft'], well), dtype=float)[0]))
     from esmda_core import align_phases
     prediction = align_phases(full[inputs['mask']], inputs['observations'], phase_flags(inputs))
     atomic_npz(output / 'forward.npz', prediction=prediction, prediction_full=full,
@@ -974,7 +1059,7 @@ def bundle(args):
     with tarfile.open(destination, 'w:gz') as archive:
         add_code(archive)
         for name in ('study.json', 'inputs.npz', 'rml-array.sbatch', 'prior-ensemble.npz',
-                     'prior-moments.npz', 'prior-precision.npz'):
+                     'prior-moments.npz', 'prior-precision.npz', 'prior-increment.npz'):
             if not (directory / name).exists():
                 continue
             archive.add(directory / name, arcname=f'run/{name}')
@@ -1046,20 +1131,35 @@ def main(argv=None):
                                 help='Multi-start test: this many members, each starting from a distinct '
                                      'carried-ensemble member (default 0: one member from the prior mean)')
     laplace_parser.add_argument('--start-seed', type=int, default=0, help='Selects the starting members')
+    laplace_parser.add_argument('--rml', type=int, default=0,
+                                help='Randomized maximum likelihood test of the Laplace step: this many members, '
+                                     'each with its own prior draw (centre and start) and perturbed data')
+    laplace_parser.add_argument('--rml-seed', type=int, default=0, help='Seed of the RML prior draws and data noise')
     laplace_parser.add_argument('--optimizer-setting', action='append', default=None, metavar='KEY=VALUE',
                                 help='Override one optimizer setting of the source study (repeatable)')
     laplace_parser.add_argument('--node-solver', type=int, nargs=2, default=None, metavar=('THREADS', 'CONCURRENCY'),
                                 help='Prepare for a plain compute node: single-rank solves with THREADS threads, '
                                      'CONCURRENCY candidate solves at once, scratch removed per evaluation')
     laplace_parser.add_argument('--hdfql', default=None, help='Directory with libHDFql.so on the execution host')
+    for option in ('partition', 'account', 'qos'):
+        laplace_parser.add_argument(f'--{option}', default=None,
+                                    help=f'Slurm {option} of the MAP array job ("" omits account/qos)')
+    laplace_parser.add_argument('--oneapi', default=None, help='oneAPI environment script on the execution host')
     laplace_parser.add_argument('--include-mean-start', action='store_true',
                                 help='With --starts: member 0 starts from the prior mean, the others from members')
     laplace_parser.add_argument('--start-models', type=Path, default=None,
                                 help='Multi-start test from explicit models (npz: models k x n, labels)')
+    laplace_parser.add_argument('--position-concurrency', type=int, default=None,
+                                help='Merged problems: tool positions solved side by side (default: all; the '
+                                     'allocation holds that many times the solver tasks). 1 = one after another')
     laplace_parser.add_argument('--likelihood-weight', type=float, default=None,
                                 help="Replace the problem's likelihood weight (Cd / weight)")
     laplace_parser.add_argument('--prior-scale', type=float, default=None,
                                 help='Multiply every prior standard deviation by this factor (>1 weakens the prior)')
+    laplace_parser.add_argument('--increment-prior', type=Path, default=None,
+                                help='npz of an increment_prior.IncrementPrior: replaces the carried prior by '
+                                     'a Gaussian increment prior with face weights (one reweighting round of '
+                                     'a Student-t increment prior)')
     laplace_parser.add_argument('--prior', choices=['carried', 'matern'], default='carried',
                                 help="carried: the exported problem's prior; matern: the chain's stationary "
                                      'Matern prior')

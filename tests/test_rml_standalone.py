@@ -232,6 +232,65 @@ def test_physical_cap_and_anisotropy_chain_rule(monkeypatch, tmp_path):
     np.testing.assert_array_equal(jacobian, actual[[1, 0]])
 
 
+def test_merged_logging_points_stack_along_the_data_axis(monkeypatch, tmp_path):
+    import esmda_remote2d
+    import pilot_rml_index45 as runner
+
+    response = np.arange(1., 33.).reshape(8, 4)
+    class Backend:
+        def trusts_ad(self, fidelity):
+            return True
+    class Adapter:
+        calls = []
+        def backend(self):
+            return Backend()
+        def run_grad_multi(self, parameter_list, index, shift, well):
+            self.calls.append(index)
+            results = []
+            for number, parameters in enumerate(parameter_list):
+                rh = parameters['rh'].reshape(2, 1, 2, order='F')[:, 0, :].ravel()
+                rv = parameters['rv'].reshape(2, 1, 2, order='F')[:, 0, :].ravel()
+                # The response scales with the tool position; model 1 fails at position 7.
+                failed = index == 7 and number == 1
+                results.append((index * (response @ (rh + rv)), None if failed else index * response,
+                                None if failed else index * response))
+            return results
+        def run_pred_multi(self, parameter_list, index, shift, well):
+            return [prediction for prediction, _, _ in self.run_grad_multi(parameter_list, index, shift, well)]
+    monkeypatch.setattr(esmda_remote2d, 'make_remote2d', lambda *args: Adapter())
+    import run_DA_sequential as sequential
+    for name in ('dims', 'dX', 'dY', 'dZ', 'min_ratio', 'max_ratio', 'log_rv_cap', 'anisotropy'):
+        monkeypatch.setattr(sequential, name, getattr(sequential, name))
+    monkeypatch.setenv('SLURM_JOB_ID', 'test')
+    monkeypatch.setenv('SLURM_CPUS_PER_TASK', '5')
+    study = {'dims': [2, 1, 2], 'spacing_ft': [5., 5., 5.], 'ratio_min': 1.,
+             'ratio_max': 3., 'log_rv_cap': np.log(40.), 'rh_limits': [-1., np.log(40.)],
+             'simulator': {'backend': 'local', 'cpus': 5, 'concurrency': 1},
+             'tools': [], 'index': 9, 'shift_ft': {}}
+    amplitudes = np.isin(np.arange(8), [3, 5])
+    raw = np.array([.5, 0., 1.4, 2., -.1, .1, 0., .2])
+    assert runner.tool_indices(study) == [9] and runner.tool_indices({**study, 'tool_indices': [9, 7]}) == [9, 7]
+    single, single_jacobian = runner.model_evaluator(study, {'mask': amplitudes, 'observations': np.zeros(2)},
+                                                     tmp_path)(raw)
+    merged = {**study, 'tool_indices': [9, 7]}
+    inputs = {'mask': np.tile(amplitudes, 2) & (np.arange(16) != 13), 'observations': np.zeros(3)}
+    Adapter.calls.clear()
+    evaluate = runner.model_evaluator(merged, inputs, tmp_path)
+    prediction, jacobian = evaluate(raw)
+    assert Adapter.calls == [9, 7]
+    # Point 9 keeps both channels, point 7 only the first: [9: ch3, ch5 | 7: ch3].
+    np.testing.assert_allclose(prediction, [single[0], single[1], single[0] * 7 / 9])
+    np.testing.assert_allclose(jacobian, np.vstack([single_jacobian, single_jacobian[:1] * 7 / 9]))
+    batch = evaluate.batch([raw, raw + .01])
+    assert batch[1] is None and batch[0][1].shape == (3, 8)       # a failure at any position fails the model
+    forward = runner.forward_evaluator(merged, inputs, tmp_path)([raw])
+    np.testing.assert_allclose(forward[0], prediction)
+    # Side by side: same stacking order, whatever order the positions finish in.
+    side_by_side, jacobian_side = runner.model_evaluator({**merged, 'position_concurrency': 2}, inputs, tmp_path)(raw)
+    np.testing.assert_array_equal(side_by_side, prediction)
+    np.testing.assert_array_equal(jacobian_side, jacobian)
+
+
 from rml_standalone import (LM_OPTIMIZER, candidate_dampings, optimize_member_lm, step_size,
                             trust_damping)
 

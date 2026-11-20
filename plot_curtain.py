@@ -56,6 +56,11 @@ def parse_args(argv=None):
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument('--log10-limits', type=float, nargs=2, default=None)
     parser.add_argument('--shared-extents', action='store_true')
+    parser.add_argument('--stack-threshold', type=int, default=100,
+                        help='Stack the three curtain panels vertically above this many logging points '
+                             '(0 = always stack, a huge value = never)')
+    parser.add_argument('--misfit-axis', choices=['x', 'index'], default='x',
+                        help='Misfit panel abscissa: bit x in ft (default) or the logging point index')
     parser.add_argument('--estimate-label', default='Estimated')
     parser.add_argument('--colormap', choices=['viridis', 'hue'], default='viridis',
                         help="Value colours of all panels: 'viridis', or 'hue' (constant HLS lightness, "
@@ -71,6 +76,9 @@ def parse_args(argv=None):
     parser.add_argument('--paint', choices=['last', 'nearest-bit'], default='last',
                         help='last: later windows overwrite earlier ones; nearest-bit: each cell comes from '
                              'the window in which it was laterally closest to the bit (at-drilling estimate)')
+    parser.add_argument("--gif", type=Path, default=None,
+                        help="Write an animated GIF that grows the curtain one logging point per frame")
+    parser.add_argument("--gif-fps", type=float, default=2.0)
     parser.add_argument("--follow", action="store_true", help="Keep re-rendering as checkpoints appear")
     parser.add_argument("--interval", type=float, default=60., help="Follow-mode poll interval, seconds")
     args = parser.parse_args(argv)
@@ -329,10 +337,21 @@ def render(checkpoints, args):
                        for _, result in checkpoints])
     fidelities = [fidelity_of(result) for _, result in checkpoints]
 
-    fig = plt.figure(figsize=(16, 9))
-    grid = fig.add_gridspec(2, 3, height_ratios=[3.2, 1], hspace=0.25, wspace=0.12)
-    axes = [fig.add_subplot(grid[0, column]) for column in range(3)]
-    misfit_axis = fig.add_subplot(grid[1, :])
+    point_size = float(np.clip(600. / max(len(checkpoints), 1), 1.5, 18.))
+    stacked = len(checkpoints) > getattr(args, 'stack_threshold', 100)
+    if stacked:
+        fig = plt.figure(figsize=(12, 14))
+        grid = fig.add_gridspec(4, 2, height_ratios=[1, 1, 1, .75], width_ratios=[1, .02], hspace=.3, wspace=.03)
+        axes = [fig.add_subplot(grid[row, 0]) for row in range(3)]
+        colorbar_axis = fig.add_subplot(grid[:3, 1])
+        misfit_axis = fig.add_subplot(grid[3, 0])
+    else:
+        fig = plt.figure(figsize=(16, 7.5))
+        grid = fig.add_gridspec(2, 4, height_ratios=[2.2, 1], width_ratios=[1, 1, 1, .035],
+                                hspace=0.3, wspace=0.08)
+        axes = [fig.add_subplot(grid[0, column]) for column in range(3)]
+        colorbar_axis = fig.add_subplot(grid[0, 3])
+        misfit_axis = fig.add_subplot(grid[1, :3])
 
     true_field = reference["rh"] if reference else None
     scale = np.log10(true_field) if true_field is not None else np.log10(np.exp(canvas_rh))
@@ -357,27 +376,37 @@ def render(checkpoints, args):
                                     args.uncertainty_white_threshold)
             axis.imshow(rgba, extent=(xedge[0], xedge[-1], zedge[0], zedge[-1]),
                         origin="lower", interpolation="nearest", aspect="auto")
-            value_map = ScalarMappable(norm=value_norm, cmap=cmap)
-            value_map.set_array([])
-            fig.colorbar(value_map, ax=axis, fraction=0.046, pad=0.02)
         else:
-            mesh = axis.pcolormesh(xedge, zedge, field, shading="auto", **shared)
-            fig.colorbar(mesh, ax=axis, fraction=0.046, pad=0.02)
+            axis.pcolormesh(xedge, zedge, field, shading="auto", **shared)
         for fidelity, color, marker in (("2D", "tab:orange", "o"), ("1D", "tab:blue", "s")):
             pick = np.array([chosen == fidelity for chosen in fidelities])
             if pick.any():
-                axis.scatter(well_x[pick], well_z[pick], c=color, marker=marker, s=18,
-                             zorder=3, label=f"{fidelity} points ({int(pick.sum())})")
-        axis.plot(well_x, well_z, color="white", lw=1.0, zorder=2)
-        axis.scatter(well_x[-1:], well_z[-1:], marker="x", color="red", s=60, zorder=4, label="latest")
+                axis.scatter(well_x[pick], well_z[pick], c=color, marker=marker, s=point_size,
+                             zorder=3, linewidths=0, label=f"{fidelity} points ({int(pick.sum())})")
+        axis.plot(well_x, well_z, color="white", lw=0.5, zorder=2)
+        axis.scatter(well_x[-1:], well_z[-1:], marker="x", color="red", s=40, zorder=4, label="latest")
         axis.set_title(title)
-        axis.set_xlabel("X [ft]")
         axis.set_aspect("equal", adjustable="box")
         axis.invert_yaxis()
-        if getattr(args, 'shared_extents', False):
+        if stacked or getattr(args, 'shared_extents', False):
             axis.set_xlim(x_edges[0], x_edges[-1])
             axis.set_ylim(z_edges[-1], z_edges[0])
-    axes[0].set_ylabel("TVD [ft]")
+    # One shared colorbar at the right, a single x label, and y tick labels on the left panel only
+    value_map = ScalarMappable(norm=value_norm, cmap=cmap)
+    value_map.set_array([])
+    fig.colorbar(value_map, cax=colorbar_axis)
+    if stacked:
+        for axis in axes[:2]:
+            axis.tick_params(labelbottom=False)
+        axes[2].set_xlabel("X [ft]")
+        for axis in axes:
+            axis.set_ylabel("TVD [ft]")
+    else:
+        axes[1].set_xlabel("X [ft]")
+        axes[0].set_ylabel("TVD [ft]")
+        if all(np.allclose(axis.get_ylim(), axes[0].get_ylim()) for axis in axes[1:]):
+            for axis in axes[1:]:
+                axis.tick_params(labelleft=False)
     axes[0].legend(loc="upper right", fontsize=8, framealpha=.7)
     if uncertainty_enabled:
         mid_color = cmap(value_norm((vmin + vmax) / 2.))[:3]
@@ -392,12 +421,24 @@ def render(checkpoints, args):
                    loc="upper center", bbox_to_anchor=(.5, .95), ncol=3,
                    fontsize=8, title_fontsize=8, frameon=False)
 
-    draw_misfit(misfit_axis, checkpoints)
+    if getattr(args, 'misfit_axis', 'x') == 'x':
+        draw_misfit(misfit_axis, checkpoints, position={index: float(x) for (index, _), x in zip(checkpoints, well_x)},
+                    position_label="Bit X [ft]")
+        if stacked:
+            misfit_axis.set_xlim(x_edges[0], x_edges[-1])
+    else:
+        draw_misfit(misfit_axis, checkpoints)
     counts = {fidelity: fidelities.count(fidelity) for fidelity in ("1D", "2D")}
     painted = ' - at-drilling (nearest-bit) estimate' if paint == 'nearest-bit' else ''
     fig.suptitle(f"Inversion curtain - {len(checkpoints)} points "
                  f"(1D: {counts['1D']}, 2D: {counts['2D']}) - {args.run_dir.name}{painted}", y=0.98)
-    fig.subplots_adjust(top=0.87 if uncertainty_enabled else 0.92)
+    fig.subplots_adjust(top=(0.89 if stacked else 0.87) if uncertainty_enabled else 0.92)
+
+    if stacked:
+        # Equal aspect shrinks the curtain boxes: give the misfit panel the same horizontal extent
+        axes[2].apply_aspect()
+        box, misfit_box = axes[2].get_position(), misfit_axis.get_position()
+        misfit_axis.set_position([box.x0, misfit_box.y0, box.width, misfit_box.height])
 
     output = args.output or (args.run_dir / "curtain.png")
     fig.savefig(output, dpi=args.dpi)
@@ -441,16 +482,41 @@ def draw_misfit(misfit_axis, checkpoints, position=None, position_label="Logging
         threshold = next((value for value in thresholds if value is not None), None)
         if threshold is not None:
             misfit_axis.axhline(threshold, color="red", ls="--", lw=1, label=f"threshold {threshold:g}")
-        misfit_axis.legend(fontsize=8, loc="best")
+        if position is None:
+            misfit_axis.legend(fontsize=8, loc="best")
+        else:
+            misfit_axis.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1.), borderaxespad=0.)
     misfit_axis.set_xlabel(position_label)
     misfit_axis.set_ylabel("Reduced misfit")
     misfit_axis.grid(alpha=.25)
+
+
+def make_gif(args):
+    import copy
+    import tempfile
+    from PIL import Image
+    checkpoints = load_checkpoints(args.run_dir)
+    if not checkpoints:
+        raise RuntimeError("No complete checkpoints found yet")
+    frames = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for n in range(1, len(checkpoints) + 1):
+            frame_args = copy.copy(args)
+            frame_args.output = Path(tmp) / f"frame-{n:04d}.png"
+            frames.append(Image.open(render(checkpoints[:n], frame_args)).convert("P", palette=Image.ADAPTIVE))
+            print(f"frame {n}/{len(checkpoints)}", flush=True)
+        frames[0].save(args.gif, save_all=True, append_images=frames[1:], loop=0,
+                       duration=int(1000 / args.gif_fps))
+    print(f"Wrote {args.gif}")
+    return 0
 
 
 def main(argv=None):
     args = parse_args(argv)
     if not args.run_dir.is_dir():
         raise FileNotFoundError(f"Run directory not found: {args.run_dir}")
+    if args.gif:
+        return make_gif(args)
     if not args.follow:
         checkpoints = load_checkpoints(args.run_dir)
         if not checkpoints:

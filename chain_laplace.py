@@ -42,7 +42,8 @@ def digest(path):
 
 def export_problem(path, *, index, state, observations, variance, mask, shift, movement, dims,
                    spacing, tools, anisotropy, anisotropy_moments, ranges, probe, well,
-                   likelihood_weight=1., prior_type='matern_cellwise'):
+                   likelihood_weight=1., prior_type='matern_cellwise', tool_indices=None, merge_shares=None,
+                   merge_channels=None, measurement_variance=None):
     """Save everything the Laplace stage needs for one gate-open logging point.
 
     ``state`` is the ensemble the 2D prior is built from; the 2D stage
@@ -63,6 +64,17 @@ def export_problem(path, *, index, state, observations, variance, mask, shift, m
               'anisotropy': np.array(anisotropy),
               'anisotropy_moments': np.asarray(anisotropy_moments, dtype=float),
               'ranges': np.asarray(ranges, dtype=float), 'probe': np.array(json.dumps(probe))}
+    if tool_indices is not None:
+        # Merged logging points: observations, variance (Cd / share) and mask are those of the listed
+        # points, concatenated, the gate point first; measurement_variance is the variance before sharing.
+        counts = np.asarray(merge_channels, dtype=int)
+        if (int(tool_indices[0]) != int(index) or len(merge_shares) != len(tool_indices) != len(counts)
+                or counts.sum() != len(values['observations']) or len(measurement_variance) != counts.sum()
+                or len(values['mask']) % len(tool_indices) or values['mask'].sum() != counts.sum()):
+            raise ValueError('Merged problem: the gate point comes first and every point needs a share, '
+                             'its retained channel count and a full channel mask')
+        values.update(tool_indices=np.asarray(tool_indices, dtype=int), merge_shares=np.asarray(merge_shares, float),
+                      merge_channels=counts, measurement_variance=np.asarray(measurement_variance, dtype=float))
     values.update({f'well_{key}': np.asarray(value) for key, value in well.items()})
     with Path(path).open('xb') as stream:
         np.savez_compressed(stream, **values)
@@ -82,6 +94,27 @@ def load_problem(path):
     problem['likelihood_weight'] = float(problem.get('likelihood_weight', 1.))
     problem['prior_type'] = str(problem.get('prior_type', 'matern_cellwise'))
     return problem
+
+
+def current_point(problem):
+    """Data of the gate point itself: (slice of the data vector, observations, reference variance, mask).
+
+    For a merged problem (several tool positions) this is the first block, with the variance before
+    sharing, so misfits and checkpoints stay comparable with single-point problems.
+    """
+    if 'merge_channels' not in problem:
+        return slice(None), problem['observations'], problem['variance'], problem['mask']
+    block = slice(0, int(problem['merge_channels'][0]))
+    channels = len(problem['mask']) // len(problem['merge_channels'])
+    return block, problem['observations'][block], problem['measurement_variance'][block], problem['mask'][:channels]
+
+
+def merge_record(problem):
+    if 'merge_channels' not in problem:
+        return None
+    return {'tool_indices': [int(v) for v in problem['tool_indices']],
+            'shares': [float(v) for v in problem['merge_shares']],
+            'channels': [int(v) for v in problem['merge_channels']]}
 
 
 def ensemble_moments(state, cells, floors=STD_FLOORS):
@@ -185,8 +218,10 @@ def laplace_posterior(chain, problem_path, laplace_run, count, seed):
     models, z, linear = laplace_samples(prior, prior.mean, z_map, jacobian, variance / weight, count, seed)
     models = cap_rh(clamp_log_rh(models), RH_CAP_OHMM)
     linearized = prediction[:, None] + linear
-    linear_misfit = np.mean((linearized - observations[:, None]) ** 2 / variance[:, None], axis=0)
-    map_misfit = measurement_misfit(prediction, observations, variance)
+    # Misfits are those of the gate point's own data (all data unless logging points were merged).
+    block, own_observations, own_variance, _ = current_point(problem)
+    linear_misfit = np.mean((linearized[block] - own_observations[:, None]) ** 2 / own_variance[:, None], axis=0)
+    map_misfit = measurement_misfit(prediction[block], own_observations, own_variance)
     manifest = json.loads((Path(study['reference']) / 'run.json').read_text())
     climatological = matern_reference(manifest, problem['anisotropy'], *problem['anisotropy_moments'])
     truth = reference_truth(Path(manifest['benchmark']))
@@ -202,6 +237,9 @@ def laplace_posterior(chain, problem_path, laplace_run, count, seed):
                  'map_whitened_offset_per_dim': float(z_map @ z_map / n),
                  'prior_rh_rmse_log10': rh_rmse(problem['prior_ensemble'], meta, truth),
                  'likelihood_weight': weight, 'prior_type': map_study['prior']['type'],
+                 **({} if merge_record(problem) is None else
+                    {'merge': {**merge_record(problem), 'map_2d_misfit_all_points': measurement_misfit(
+                        prediction, observations, problem['measurement_variance'])}}),
                  **ensemble_diagnostics(models, nx, nz, climatological, problem['anisotropy']),
                  **spread_summary(models, nx, nz)}
     return {'problem': problem, 'map_study': map_study, 'result': result, 'model': model,
@@ -233,14 +271,15 @@ def sample(args):
     checkpoint = chain / f'inversion_results_assim_{index}.pkl'
     probe = problem['probe']
     reverted = bool(probe.get('reverted', True))
+    block, own_observations, own_variance, own_mask = current_point(problem)
     results = {'prior_params': problem['prior_ensemble'], 'post_mda_params': models.copy(),
                'post_1d_params': problem['prior_ensemble'],
                'posterior_ensemble_params': models.T.copy(), 'posterior_params': [model.copy()],
-               'posterior_predictions': [prediction.copy()], 'posterior_misfit': [map_misfit],
+               'posterior_predictions': [prediction[block].copy()], 'posterior_misfit': [map_misfit],
                'laplace_linearized_misfit': out['linear_misfit'].tolist(),
-               'observations': problem['observations'], 'data_covariance': problem['variance'],
-               'observation_mask': problem['mask'],
-               'masked_channels': int((~problem['mask']).sum()), 'dims': (nx, ny, nz),
+               'observations': own_observations, 'data_covariance': own_variance,
+               'observation_mask': own_mask, 'merged_points': merge_record(problem),
+               'masked_channels': int((~own_mask).sum()), 'dims': (nx, ny, nz),
                'spacing_ft': (dx, dy, dz), 'shift_ft': problem['shift_ft'],
                'window_movement': tuple(int(m) for m in problem['movement']),
                'previous_index': gate.get('previous_index'), 'logging_index': index,
@@ -322,11 +361,12 @@ def carry(args):
     nx, ny, nz = problem['dims']
     dx, dy, dz = problem['spacing']
     state, probe = problem['prior_ensemble'], problem['probe']
+    _, own_observations, own_variance, own_mask = current_point(problem)
     results = {'prior_params': state, 'post_mda_params': state.copy(), 'post_1d_params': state,
                'posterior_ensemble_params': state.T.copy(), 'posterior_params': state.T.copy(),
                'posterior_predictions': None, 'posterior_misfit': None,
-               'observations': problem['observations'], 'data_covariance': problem['variance'],
-               'observation_mask': problem['mask'], 'dims': (nx, ny, nz), 'spacing_ft': (dx, dy, dz),
+               'observations': own_observations, 'data_covariance': own_variance,
+               'observation_mask': own_mask, 'dims': (nx, ny, nz), 'spacing_ft': (dx, dy, dz),
                'shift_ft': problem['shift_ft'], 'window_movement': tuple(int(m) for m in problem['movement']),
                'previous_index': gate.get('previous_index'), 'logging_index': index,
                'tools': problem['tools'],

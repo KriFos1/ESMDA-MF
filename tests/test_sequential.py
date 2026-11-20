@@ -233,11 +233,11 @@ def test_paired_mean_correction_damps_only_to_respect_rh_bounds():
 
 
 def test_auto_adaloc_sigmoid_midpoint_is_requested_threshold():
-    from pipt.misc_tools.cov_regularization import localization
+    from pet_compat import auto_adaptive_localization
 
     config = sequential._auto_adaloc_config(.7, 12)
     assert config == {'field': [12, 1, 1], 'autoadaloc': .3, 'type': 'sigm'}
-    localizer = localization(config, [], [], ['rh', 'rv'], 4)
+    localizer = auto_adaptive_localization(.7, 12)
     correlations = np.array([[.69], [.7], [.71]])
     taper = localizer.tapering_function(correlations, np.zeros_like(correlations))
     assert taper[0, 0] < .5 < taper[2, 0]

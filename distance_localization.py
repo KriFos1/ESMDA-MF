@@ -20,20 +20,22 @@ class FurrerBengtssonLocalization:
         self.shape = shape
         self.channels = channels
         self.index = index
-        # PET's first axis holds the two parameter blocks; positions are (z, x, block).
+        # PET's first axis holds the two parameter blocks; positions are (x, z-cell, block).
         config = {'field': [2, nx, nz], 'actnum': None}
         config[('em', float(index), 'model')] = {
-            'taper_func': 'fb', 'position': [[iz, ix, 0], [iz, ix, 1]],
+            'taper_func': 'fb', 'position': [[ix, iz, 0], [ix, iz, 1]],
             'range': [rz / dz, ':'], 'anisotropi': [(rx / dx) / (rz / dz), 0.]}
         with open(path, 'xb') as stream:
             pickle.dump(config, stream)
         self.input = {'field': config['field'], 'dist_loc': str(path)}
-        # Imported here: the module path exists only in the PET release the cascade was built on.
-        from pipt.misc_tools.cov_regularization import localization
-        self.pet = localization(self.input, [float(index)], ['em'], ['model'], members)
+        # Imported here: PET is only needed when a localization is built.
+        import pandas as pd
+        from pipt.localization import DistanceLocalization
         self.prior_info = {'model': {'active': 2 * nx * nz, 'nx': nx, 'ny': 2, 'nz': nz}}
-        mask = self.pet.localize(['em'], [float(index)], ['model'], members,
-                                 self.prior_info, [[channels]])
+        observed = pd.DataFrame({'em': [np.empty(channels)]}, index=[float(index)])
+        self.pet = DistanceLocalization(info=self.input, data=observed, parameters=['model'],
+                                        ensemble_size=members, prior_info=self.prior_info)
+        mask = self.pet()
         self.weights = mask[:, 0].toarray().ravel()
         if self.weights.shape != (2 * nx * nz,) or np.any(self.weights < 0):
             raise ValueError('PET mask does not match the stacked state')
@@ -43,13 +45,9 @@ class FurrerBengtssonLocalization:
             raise ValueError('PET mask orientation or protected collar is invalid')
 
     def configure(self, updater):
-        updater.keys_da = {'localization': self.input, 'truedataindex': [float(self.index)]}
+        updater.keys_da = {'localization': self.input}
         updater.localization = self.pet
-        updater.ne = updater.proj.shape[0]
         updater.list_states = ['model']
-        updater.list_datatypes = ['em']
-        updater.assim_index = [0, [0]]
-        updater.obs_data = [{'em': np.empty(self.channels)}]
         updater.prior_info = self.prior_info
 
 

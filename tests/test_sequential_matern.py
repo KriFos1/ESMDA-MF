@@ -191,6 +191,52 @@ def test_driver_applies_the_memory_relaxation_between_points(tmp_path, driver_en
     assert study['relaxation']['memory_ft'] == 10.
 
 
+def test_relaxation_accepts_one_factor_per_cell():
+    prior = small_prior()
+    state = prior.sample(5, 3)
+    rho = np.full(48, .5)
+    relaxed = driver.relax_to_prior(prior, state, rho, np.random.default_rng(0))
+    assert relaxed.shape == state.shape
+    np.testing.assert_array_equal(driver.relax_to_prior(prior, state, np.ones(48), np.random.default_rng(0)), state)
+
+
+def test_mean_memory_factor_in_the_relaxation():
+    prior = small_prior()
+    state = prior.sample(40, 3) + 1.5
+    rng = lambda: np.random.default_rng(1)
+    # One factor per cell is shared by the ln Rh and latent blocks.
+    same = driver.relax_to_prior(prior, state, np.full(48, .8), rng())
+    np.testing.assert_allclose(driver.relax_to_prior(prior, state, np.full(96, .8), rng()), same)
+    # Long mean memory: the ensemble mean stays, the spread still relaxes toward the prior's.
+    kept = driver.relax_to_prior(prior, state, .5, rng(), rho_mean=1.)
+    np.testing.assert_allclose(kept.mean(axis=1), state.mean(axis=1), atol=1.5)
+    plain = driver.relax_to_prior(prior, state, .5, rng())
+    offset = lambda x: np.abs(x.mean(axis=1) - prior.mean).mean()
+    assert offset(kept) > offset(plain) and abs(offset(kept) - offset(state)) < .3
+    np.testing.assert_allclose(driver.relax_to_prior(prior, state, .5, rng(), rho_mean=.5).mean(axis=1) - prior.mean,
+                               .5 * (state.mean(axis=1) - prior.mean), atol=.5)
+
+
+def test_driver_mean_memory_factor_defaults_to_four(tmp_path, driver_environment):
+    _, reference = driver_environment
+    common = ['--reference', str(reference), '--stop', '3', '--ensemble-size', '12', '--mda-steps', '2',
+              '--memory-ft', '10']
+    default, same = tmp_path / 'default', tmp_path / 'same'
+    driver.main([*common, '--output-dir', str(default)])
+    history = json.loads((default / 'history.json').read_text())
+    assert history[0]['relaxation_rho_mean'] is None
+    assert np.isclose(history[1]['relaxation_rho'], np.exp(-5. / 10.), atol=1e-3)
+    assert np.isclose(history[1]['relaxation_rho_mean'], np.exp(-5. / 40.), atol=1e-3)
+    study = json.loads((default / 'study.json').read_text())
+    assert study['relaxation']['adaptive'] == {'mean_factor': 4.}
+    driver.main([*common, '--output-dir', str(same), '--memory-mean-factor', '1'])
+    history = json.loads((same / 'history.json').read_text())
+    assert history[1]['relaxation_rho_mean'] is None
+    assert json.loads((same / 'study.json').read_text())['relaxation']['adaptive'] == {'mean_factor': 1.}
+    with pytest.raises(SystemExit):
+        driver.main([*common, '--output-dir', str(tmp_path / 'gone'), '--memory-surprise-factor', '.3'])
+
+
 def test_driver_resumes_from_the_last_checkpoint(tmp_path, driver_environment):
     _, reference = driver_environment
     output = tmp_path / 'resumable'
@@ -222,3 +268,36 @@ def test_driver_resumes_from_the_last_checkpoint(tmp_path, driver_environment):
     (other / 'run.json').write_text((reference / 'run.json').read_text())
     with pytest.raises(ValueError, match='started from'):
         driver.main(['--reference', str(other), *common[2:], '--stop', '4', '--resume'])
+
+
+def test_model_error_inflates_the_update_covariance_only(tmp_path, driver_environment):
+    _, reference = driver_environment
+    common = ['--reference', str(reference), '--stop', '2', '--ensemble-size', '12', '--mda-steps', '2']
+    plain = tmp_path / 'plain'
+    driver.main([*common, '--output-dir', str(plain)])
+    tools = json.loads((plain / 'study.json').read_text())['tools']
+    components = list(driver.UDAR_COMPONENTS)
+    table = tmp_path / 'model-error.json'
+    factor = np.full((len(tools), len(components)), 2.)
+    table.write_text(json.dumps({'tools': tools, 'components': components, 'factor_1d': factor.tolist(),
+                                 'factor_2d': np.zeros_like(factor).tolist()}))
+    factors = driver.model_error_factors(table, [tuple(tool) for tool in tools])
+    assert factors[0].shape == (len(tools) * len(components),) and not factors[1].any()
+    np.testing.assert_array_equal(factors[0], 2.)
+    output = tmp_path / 'inflated'
+    driver.main([*common, '--output-dir', str(output), '--model-error', str(table)])
+    with open(output / 'inversion_results_assim_1.pkl', 'rb') as stream:
+        saved = pickle.load(stream)
+    with open(plain / 'inversion_results_assim_1.pkl', 'rb') as stream:
+        before = pickle.load(stream)
+    # The measurement covariance (misfits, gate) is unchanged; the update uses Cd (1 + factor^2).
+    np.testing.assert_allclose(saved['data_covariance'], before['data_covariance'])
+    np.testing.assert_allclose(saved['update_covariance'], 5. * saved['data_covariance'])
+    assert not np.allclose(saved['post_mda_params'], before['post_mda_params'])   # a weaker update
+    np.testing.assert_allclose(before['update_covariance'], before['data_covariance'])
+    assert json.loads((output / 'study.json').read_text())['model_error']['file'] == str(table.resolve())
+    assert json.loads((plain / 'study.json').read_text())['model_error'] == 'none'
+    table.write_text(json.dumps({'tools': tools[:-1], 'components': components, 'factor_1d': factor[:-1].tolist(),
+                                 'factor_2d': factor[:-1].tolist()}))
+    with pytest.raises(ValueError, match='does not match'):
+        driver.model_error_factors(table, [tuple(tool) for tool in tools])

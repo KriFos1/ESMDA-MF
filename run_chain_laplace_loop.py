@@ -10,6 +10,16 @@ sample``) and resumes the chain. It stops once the checkpoint for
 appears in the chain directory. A restarted controller adopts a MAP job that
 is still in flight (or already finished) for the pending point instead of
 submitting a second one.
+
+python -B -u run_chain_laplace_loop.py --chain runs/$NAME --stop 281 \
+  --source references/map-source --label $(date +%Y%m%d) --map-starts 1 \
+  --optimizer-setting stagnation_tolerance=0.01 --optimizer-setting stagnation_iterations=1 \
+  --optimizer-setting max_rounds=2 \
+  --binary-dir $HOME/3DgigNew/uta2d_v2/adjoint-2d-v2-orient --orientation bedding \
+  --executor node --host localhost --hpc-root $HOME/pxwf-runs-local --hpc-python $(which python) \
+  --node-threads 3 --node-concurrency 4 --node-hdfql $HOME/3DgigNew/uta2d_v2/adjoint-2d-v2-orient \
+  --oneapi $HOME/3DgigNew/uta2d_v2/oneapi-local-vars.sh
+
 """
 
 import argparse
@@ -88,12 +98,32 @@ def driver_arguments(study, stop):
                  '--anisotropy-std', str(anisotropy['state_moments'][1]), '--resume']
     if study.get('relaxation') not in (None, 'none'):
         arguments += ['--memory-ft', str(study['relaxation']['memory_ft'])]
+        adaptive = study['relaxation'].get('adaptive') or {}
+        if (adaptive.get('ahead_factor', 1.) != 1 or adaptive.get('latent_factor', 1.) != 1
+                or adaptive.get('surprise_factor', 1.) != 1):
+            raise ValueError('This chain was started with memory options that were removed (ahead factor / '
+                             'taper, latent factor, surprise) and cannot be resumed with this code')
+        # Always explicit: chains started before the default became 4 carry no entry and used 1.
+        arguments += ['--memory-mean-factor', str(adaptive.get('mean_factor', 1.))]
     if study.get('gate') not in (None, 'none'):
-        arguments += ['--gate-threshold', str(study['gate']['threshold']), '--on-gate', 'stop']
+        arguments += ['--gate-threshold', str(study['gate']['threshold']), '--on-gate', 'stop',
+                      '--gate-covariance', study['gate'].get('covariance', 'measurement')]
     if study.get('analysis', 'esmda') not in ('esmda', None):
         arguments += ['--analysis', study['analysis']['method']]
     if study.get('two_d_prior', 'matern_cellwise') != 'matern_cellwise':
         arguments += ['--two-d-prior', study['two_d_prior']]
+    if isinstance(study.get('model_error'), dict):
+        arguments += ['--model-error', study['model_error']['file']]
+    if isinstance(study.get('merge'), dict):
+        arguments += ['--merge-behind', *(str(value) for value in study['merge']['behind']),
+                      '--merge-shares', *(str(value) for value in study['merge']['shares']),
+                      *(['--merge-own-history'] if study['merge'].get('own_history') else [])]
+    if isinstance(study.get('increment_prior'), dict):
+        student = study['increment_prior']
+        arguments += ['--student-weights', student['weights'], '--student-rounds', str(student['rounds']),
+                      '--student-dof', str(student['dof']),
+                      '--student-scales', *(str(value) for value in student['scales']),
+                      '--student-anchor', *(str(value) for value in student['anchor'])]
     if study.get('directional_sigma_floor'):
         arguments += ['--directional-sigma-floor', *(str(value) for value in study['directional_sigma_floor'])]
     if study.get('likelihood_weight', 1.) != 1.:
@@ -221,6 +251,14 @@ def select_member(run_dir, count):
     return best
 
 
+
+def solve_dir(label, index, suffix=''):
+    """Local working folder of one 2D solve: runs/2d-solves/<label>/idx<index><suffix>."""
+    folder = ROOT / 'runs' / '2d-solves' / str(label)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f'idx{index:03d}{suffix}'
+
+
 def map_stage(args, chain, index, problem=None, suffix='', compare=False):
     """MAP on HPC for an exported problem, then the Laplace resampling.
 
@@ -231,7 +269,7 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
     members) and the lowest objective is resampled (``selected-member.json``).
     """
     problem = problem or f'laplace-problem-{index:03d}.npz'
-    run_dir = ROOT / 'runs' / f'chain-laplace-idx{index:03d}-{args.label}{suffix}'
+    run_dir = solve_dir(args.label, index, suffix)
     remote = f'{args.hpc_root}/chain-laplace-idx{index:03d}-{args.label}{suffix}'
     starts = getattr(args, 'map_starts', 0)
     node = getattr(args, 'executor', 'slurm') == 'node'
@@ -258,7 +296,10 @@ def map_stage(args, chain, index, problem=None, suffix='', compare=False):
                      *(['--node-solver', str(args.node_threads), str(args.node_concurrency)] if node else []),
                      *(item for setting in (getattr(args, 'optimizer_setting', None) or [])
                        for item in ('--optimizer-setting', setting)),
-                     *(['--hdfql', args.node_hdfql] if node and args.node_hdfql else [])]
+                     *(['--hdfql', args.node_hdfql] if node and args.node_hdfql else []),
+                     *(['--oneapi', args.oneapi] if node and args.oneapi else []),
+                     *(item for option in ('partition', 'account', 'qos') if getattr(args, option, None) is not None
+                       for item in (f'--{option}', getattr(args, option)))]
         run([PYTHON, '-B', ROOT / 'pilot_rml_index45.py', 'prepare-laplace', '--problem',
              chain / problem, '--source', args.source, '--run-dir', run_dir, *overrides])
         run([PYTHON, '-B', ROOT / 'pilot_rml_index45.py', 'bundle', '--run-dir', run_dir])
@@ -344,6 +385,9 @@ def main(argv=None):
                         help='slurm: sbatch arrays on --host; node: background processes on a plain node')
     parser.add_argument('--node-threads', type=int, default=3, help='node: threads per single-rank solve')
     parser.add_argument('--node-concurrency', type=int, default=4, help='node: candidate solves at once per member')
+    for option in ('partition', 'account', 'qos'):
+        parser.add_argument(f'--{option}', default=None, help=f'slurm: {option} of the MAP array job (default: study)')
+    parser.add_argument('--oneapi', default=None, help='node: oneAPI environment script for the solver')
     parser.add_argument('--node-hdfql', default=None, help='node: directory with libHDFql.so')
     parser.add_argument('--map-starts', type=int, default=0,
                         help='Extra MAP starts from carried members (besides the prior mean); the lowest '
@@ -373,7 +417,7 @@ def main(argv=None):
                 return 0
         log(f'index {gate}: gate open, running the Laplace 2D stage')
         record = json.loads((chain / f'gate-{gate:03d}.json').read_text())
-        side = ROOT / 'runs' / f'chain-laplace-idx{gate:03d}-{args.label}-revert' / 'compare' / 'summary.json'
+        side = solve_dir(args.label, gate, '-revert') / 'compare' / 'summary.json'
         if record.get('revert_problem') and not side.exists():
             # Side-by-side check (first cascade gate): the same point with the 1D update reverted.
             try:

@@ -18,8 +18,7 @@ import pandas as pd
 import ast
 import pickle
 import matplotlib.pyplot as plt
-from pipt.update_schemes.update_methods_ns.approx_update import approx_update
-from pipt.misc_tools.cov_regularization import localization
+from pet_compat import ApproxUpdater as approx_update
 
 ## setup the model
 for folder in os.listdir('.'):

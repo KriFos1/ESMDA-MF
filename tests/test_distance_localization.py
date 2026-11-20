@@ -36,7 +36,7 @@ def test_pet_distance_update_preserves_collar_and_updates_correlated_interior(tm
     state = np.ones((5280, 100)) * (.5 + .05 * latent)
     predicted = np.vstack([latent, 2 * latent])
     updater = updater_for(state, 2640, None, loc)
-    assert 'autoadaloc' not in updater.localization.loc_info
+    assert updater.localization.name == 'distance_loc'
     assert 'dist_loc' in updater.keys_da['localization']
     result = update(state, predicted, np.array([2., 4.]), np.ones(2) * .1,
                     1., rng, 2640, None, loc)
